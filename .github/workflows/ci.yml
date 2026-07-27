@@ -1,0 +1,84 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push to the same branch makes the first run pointless; cancel it
+# rather than queue behind it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l ./cmd ./internal)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: shellcheck install.sh
+        run: |
+          sudo apt-get install -y --no-install-recommends shellcheck > /dev/null
+          shellcheck install.sh
+          sh -n install.sh
+
+      - name: test
+        run: go test -race ./...
+
+      # The helper is cross-compiled and embedded into the CLI, so this is the
+      # only step that proves go:embed resolves and both target architectures
+      # still build. A unit test cannot catch a broken embed.
+      - name: build
+        run: make build
+
+      # Exercises the binary end to end without a host. Exit codes are asserted
+      # explicitly: `shunt init` once wrote a correct manifest and *then* exited
+      # 2, which no unit test noticed.
+      - name: smoke
+        run: |
+          set -euo pipefail
+          shunt="$GITHUB_WORKSPACE/shunt"
+
+          "$shunt" version
+          "$shunt" help > /dev/null
+
+          mkdir -p /tmp/smoke && cd /tmp/smoke
+          printf 'FROM scratch\nEXPOSE 8080\n' > Dockerfile
+          "$shunt" init --host deploy@example.com
+          grep -q '8080' shunt.toml
+
+          # Re-running without --force must fail rather than clobber.
+          if "$shunt" init --host deploy@example.com 2> /dev/null; then
+            echo "init overwrote an existing manifest"; exit 1
+          fi
+
+          # An unknown command must be rejected, not silently ignored.
+          if "$shunt" definitely-not-a-command > /dev/null 2>&1; then
+            echo "unknown command was accepted"; exit 1
+          fi
+
+          # Piped output must carry no ANSI escape sequences.
+          if "$shunt" help | grep -q "$(printf '\033')"; then
+            echo "escape sequences leaked into piped output"; exit 1
+          fi

@@ -1,0 +1,211 @@
+// Package release defines the wire contract between the shunt CLI and the
+// shunt-helper binary that runs on the host. The CLI resolves a manifest plus
+// secrets into a Spec, streams it over stdin (never argv, never a temp file),
+// and the helper applies it and emits Events on stdout as NDJSON.
+package release
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"time"
+)
+
+// Protocol is bumped when Spec or Event change shape incompatibly. The helper
+// refuses a Spec whose protocol it does not understand, which turns a silent
+// version-skew misdeploy into a clean error.
+const Protocol = 1
+
+// Spec is a complete, self-contained description of one release. Everything the
+// helper needs is here; it never reads the manifest and never phones home.
+type Spec struct {
+	Protocol int    `json:"protocol"`
+	Project  string `json:"project"`
+	ID       string `json:"id"` // release id, e.g. 20260726-175612-a1b2c3
+	Network  string `json:"network"`
+	Retain   int    `json:"retain"`
+
+	// StorePath is the OCI layout directory on the host that the CLI rsync'd
+	// into before invoking the helper.
+	StorePath string `json:"store_path"`
+
+	// Images maps a manifest image name to the digest that must be present after
+	// load. The helper verifies this rather than trusting the transfer.
+	Images map[string]ImageRef `json:"images"`
+
+	// Accessories are ensured (created only if absent) before stages run, so a
+	// migration has its database available. They are never recreated by a normal
+	// deploy — see `shunt boot`.
+	Accessories    map[string]Service `json:"accessories,omitempty"`
+	AccessoryOrder []string           `json:"accessory_order,omitempty"`
+
+	// Artifacts have already been transferred to their staged path by the time
+	// the helper runs; it validates and swaps them.
+	Artifacts []Artifact `json:"artifacts,omitempty"`
+
+	Stages   []Stage            `json:"stages"`
+	Services map[string]Service `json:"services"`
+	Order    []string           `json:"order"` // service start order, precomputed by the CLI
+
+	// Secrets are applied to every service and stage via an --env-file written
+	// 0600 on the host. Values never appear in argv or in `docker inspect`.
+	Secrets map[string]string `json:"secrets,omitempty"`
+}
+
+type ImageRef struct {
+	// Ref is the tag the helper applies locally after load, e.g. shunt/latent-app:20260726-175612.
+	Ref string `json:"ref"`
+	// Digest is the OCI manifest digest exported by buildx.
+	Digest string `json:"digest"`
+	// External images are pulled on the host instead of loaded from the store.
+	External bool `json:"external"`
+}
+
+type Service struct {
+	Image    string            `json:"image"`
+	Command  []string          `json:"command,omitempty"`
+	Env      map[string]string `json:"env,omitempty"`
+	Publish  []string          `json:"publish,omitempty"`
+	Volumes  []string          `json:"volumes,omitempty"`
+	Restart  string            `json:"restart"`
+	Health   *Health           `json:"health,omitempty"`
+	Requires []string          `json:"requires,omitempty"`
+
+	Expose int    `json:"expose,omitempty"`
+	Drain  string `json:"drain,omitempty"`
+	Proxy  *Proxy `json:"proxy,omitempty"`
+}
+
+// Proxy carries what the helper needs to emit discovery labels for an external
+// reverse proxy.
+type Proxy struct {
+	Kind        string   `json:"kind"`
+	Host        string   `json:"host"`
+	Path        string   `json:"path,omitempty"`
+	Port        int      `json:"port"`
+	EntryPoints []string `json:"entrypoints,omitempty"`
+	Retry       int      `json:"retry,omitempty"`
+}
+
+// Proxied services run blue/green: a new release starts alongside the old one
+// under its own container name, and the old one is retired only after the new
+// one is healthy.
+func (s Service) Proxied() bool { return s.Proxy != nil }
+
+type Health struct {
+	URL      string   `json:"url,omitempty"`
+	Command  []string `json:"command,omitempty"`
+	Retries  int      `json:"retries"`
+	Interval string   `json:"interval"`
+	Grace    string   `json:"grace,omitempty"`
+	Follow   bool     `json:"follow,omitempty"`
+}
+
+// Artifact is one file to swap into place on the host.
+type Artifact struct {
+	Name   string `json:"name"`
+	Dest   string `json:"dest"`
+	Staged string `json:"staged"` // where the CLI rsync'd it; renamed onto Dest
+	Magic  string `json:"magic,omitempty"`
+	Retain int    `json:"retain"`
+	Bytes  int64  `json:"bytes"`
+	MTime  int64  `json:"mtime"` // unix seconds; rsync --times preserves it
+}
+
+type Stage struct {
+	Name            string            `json:"name"`
+	Image           string            `json:"image"`
+	Command         []string          `json:"command"`
+	Env             map[string]string `json:"env,omitempty"`
+	Capture         string            `json:"capture,omitempty"`
+	RequireNonEmpty bool              `json:"require_nonempty,omitempty"`
+	Retain          int               `json:"retain,omitempty"`
+}
+
+// Ledger is the host-side record of what has been deployed. It lives at
+// <root>/<project>/releases.json and is the authority for status and rollback.
+type Ledger struct {
+	Project  string  `json:"project"`
+	Current  string  `json:"current"`
+	Releases []Entry `json:"releases"`
+}
+
+// Release statuses recorded in the ledger.
+const (
+	StatusActive     = "active"     // currently serving
+	StatusSuperseded = "superseded" // replaced by a later release
+	StatusFailed     = "failed"     // did not reach a healthy state
+)
+
+type Entry struct {
+	ID         string              `json:"id"`
+	Status     string              `json:"status"`
+	StartedAt  time.Time           `json:"started_at"`
+	FinishedAt time.Time           `json:"finished_at,omitempty"`
+	Images     map[string]ImageRef `json:"images"`
+	Services   []string            `json:"services"`
+	Error      string              `json:"error,omitempty"`
+
+	// Spec is retained so a rollback can re-apply the exact previous release
+	// without needing the manifest that produced it.
+	Spec *Spec `json:"spec,omitempty"`
+}
+
+// HashSecret is the one-way form a secret value takes once it is written to the
+// host's ledger. Both ends use it: the helper redacts with it before persisting,
+// and the CLI applies it to freshly-resolved values so `shunt plan` can compare
+// like with like without a plaintext secret ever crossing back.
+func HashSecret(v string) string {
+	sum := sha256.Sum256([]byte(v))
+	return "h:" + hex.EncodeToString(sum[:])[:16]
+}
+
+// Find returns the entry with the given id, or nil.
+func (l *Ledger) Find(id string) *Entry {
+	for i := range l.Releases {
+		if l.Releases[i].ID == id {
+			return &l.Releases[i]
+		}
+	}
+	return nil
+}
+
+// Previous returns the most recent successfully-activated release before the
+// current one — the target of `shunt rollback` with no argument.
+func (l *Ledger) Previous() *Entry {
+	seenCurrent := false
+	for i := len(l.Releases) - 1; i >= 0; i-- {
+		e := &l.Releases[i]
+		if e.ID == l.Current {
+			seenCurrent = true
+			continue
+		}
+		if !seenCurrent || e.Status == StatusFailed {
+			continue
+		}
+		return e
+	}
+	return nil
+}
+
+// Event kinds. Constants rather than bare strings so the two binaries cannot
+// drift on a typo that would silently stop rendering a whole class of event.
+const (
+	KindStep   = "step"   // work starting; shown only in verbose mode
+	KindOK     = "ok"     // work completed
+	KindInfo   = "info"   // noteworthy but not a step outcome
+	KindLog    = "log"    // passthrough output from a container
+	KindFail   = "fail"   // the operation failed; message explains why
+	KindResult = "result" // terminal summary of a successful operation
+)
+
+// Event is one NDJSON line emitted by the helper on stdout. The CLI renders
+// these; anything the helper writes to stderr is passed through as raw output.
+type Event struct {
+	Kind    string `json:"kind"`
+	Step    string `json:"step,omitempty"`
+	Message string `json:"message,omitempty"`
+
+	// Result payload, set when Kind == KindResult.
+	Release string `json:"release,omitempty"`
+	Status  string `json:"status,omitempty"`
+}

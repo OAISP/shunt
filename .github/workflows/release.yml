@@ -1,0 +1,61 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write # required to create the release and upload assets
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags and history, so release notes can reference them
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: test
+        run: go test ./...
+
+      # The host-side helper is always linux; only the CLI is cross-built below.
+      # Building it once here means every artifact embeds the same helper.
+      - name: build helpers
+        run: make helpers
+
+      - name: build release binaries
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # No Windows target: shunt drives the system ssh and rsync binaries.
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os=${target%/*}
+            arch=${target#*/}
+            echo "building $os/$arch"
+            GOOS=$os GOARCH=$arch CGO_ENABLED=0 go build \
+              -trimpath \
+              -ldflags "-s -w -X main.version=${VERSION#v}" \
+              -o "dist/shunt" ./cmd/shunt
+            # Unversioned asset names so the download URL is stable:
+            #   releases/latest/download/shunt_linux_amd64.tar.gz
+            tar -czf "dist/shunt_${os}_${arch}.tar.gz" -C dist shunt
+            rm dist/shunt
+          done
+          cd dist && sha256sum *.tar.gz > checksums.txt
+          cat checksums.txt
+          # Shipped as an asset as well as living in the repo, so both
+          # raw.githubusercontent.com and releases/latest/download work.
+          cp ../install.sh .
+
+      - name: publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
