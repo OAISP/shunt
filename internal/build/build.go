@@ -185,3 +185,103 @@ func dirSize(dir string) int64 {
 func sortedKeys(m map[string]string) []string {
 	return slices.Sorted(maps.Keys(m))
 }
+
+// dockerArchiveEntry is one element of the manifest.json that `docker save`
+// writes alongside the OCI layout.
+type dockerArchiveEntry struct {
+	Config   string   `json:"Config"`
+	RepoTags []string `json:"RepoTags"`
+	Layers   []string `json:"Layers"`
+}
+
+// ociManifest is the subset of an OCI image manifest we need.
+type ociManifest struct {
+	MediaType string `json:"mediaType"`
+	Config    struct {
+		Digest string `json:"digest"`
+	} `json:"config"`
+	Layers []struct {
+		Digest string `json:"digest"`
+	} `json:"layers"`
+	// Present when this blob is an index rather than a manifest.
+	Manifests []struct {
+		Digest    string `json:"digest"`
+		MediaType string `json:"mediaType"`
+		Platform  struct {
+			OS           string `json:"os"`
+			Architecture string `json:"architecture"`
+		} `json:"platform"`
+	} `json:"manifests"`
+}
+
+// WriteDockerArchiveManifest adds the manifest.json that a Docker daemon without
+// the containerd image store needs in order to load this layout.
+//
+// Such a daemon only understands the docker-archive format. Handed a bare OCI
+// layout it falls back to the legacy importer, treats blobs/ as a layer
+// directory and fails on a missing blobs/json — which is most servers, since the
+// containerd snapshotter is increasingly the default locally while hosts
+// overwhelmingly still run the classic store.
+//
+// `docker save` solves this by emitting both formats at once: the OCI layout
+// plus a manifest.json whose Config and Layers point at the very same blobs by
+// path. Doing the same here costs one small JSON file and no additional
+// transfer, so layer deduplication is untouched and both loaders are satisfied
+// without shunt having to probe the host or care which one it is talking to.
+func WriteDockerArchiveManifest(dir, ref string) error {
+	idxDigest, err := readIndexDigest(dir)
+	if err != nil {
+		return err
+	}
+	man, err := resolveManifest(dir, idxDigest, 0)
+	if err != nil {
+		return err
+	}
+
+	entry := dockerArchiveEntry{
+		Config:   blobPath(man.Config.Digest),
+		RepoTags: []string{ref},
+		Layers:   make([]string, 0, len(man.Layers)),
+	}
+	for _, l := range man.Layers {
+		entry.Layers = append(entry.Layers, blobPath(l.Digest))
+	}
+
+	out, err := json.Marshal([]dockerArchiveEntry{entry})
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, "manifest.json"), out, 0o644)
+}
+
+// resolveManifest walks from a descriptor to the image manifest, descending
+// through an index when the export nested one.
+func resolveManifest(dir, digest string, depth int) (*ociManifest, error) {
+	if depth > 4 {
+		return nil, fmt.Errorf("image index nests more than 4 levels deep")
+	}
+	b, err := os.ReadFile(filepath.Join(dir, blobPath(digest)))
+	if err != nil {
+		return nil, fmt.Errorf("read blob %s: %w", digest, err)
+	}
+	var m ociManifest
+	if err := json.Unmarshal(b, &m); err != nil {
+		return nil, fmt.Errorf("parse blob %s: %w", digest, err)
+	}
+	if m.Config.Digest != "" {
+		return &m, nil
+	}
+	if len(m.Manifests) == 0 {
+		return nil, fmt.Errorf("blob %s is neither an image manifest nor an index", digest)
+	}
+	// A single-platform build exports one entry; anything else is ambiguous, and
+	// guessing which platform the host wants would be worse than saying so.
+	if len(m.Manifests) > 1 {
+		return nil, fmt.Errorf("layout holds %d platforms; set `platform` in [images.*] to build one", len(m.Manifests))
+	}
+	return resolveManifest(dir, m.Manifests[0].Digest, depth+1)
+}
+
+func blobPath(digest string) string {
+	return filepath.Join("blobs", strings.ReplaceAll(digest, ":", string(filepath.Separator)))
+}

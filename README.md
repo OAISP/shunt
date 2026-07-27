@@ -100,6 +100,11 @@ Requirements — **your machine:** docker (with buildx), rsync, ssh.
 **The server:** docker, rsync, and an ssh account that can reach the docker
 socket. Nothing else; shunt uploads its own helper.
 
+Either image store works on either end. shunt writes a layout that both the
+containerd snapshotter and the classic overlay2 store can load, so a laptop
+running the newer store can deploy to a server running the older one without any
+daemon configuration.
+
 ## Quick start
 
 ```sh

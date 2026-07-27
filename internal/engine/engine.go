@@ -141,7 +141,13 @@ func (e *Engine) Build(ctx context.Context, id string, o BuildOptions) (map[stri
 		if err != nil {
 			return nil, err
 		}
-		if err := build.Retag(r.Dir, e.ImageRef(name, id)); err != nil {
+		ref := e.ImageRef(name, id)
+		if err := build.Retag(r.Dir, ref); err != nil {
+			return nil, fmt.Errorf("image %s: %w", name, err)
+		}
+		// Makes the layout loadable by hosts without the containerd image store,
+		// which is most of them.
+		if err := build.WriteDockerArchiveManifest(r.Dir, ref); err != nil {
 			return nil, fmt.Errorf("image %s: %w", name, err)
 		}
 		res[name] = r
