@@ -97,8 +97,15 @@ make install          # builds ./shunt with helpers embedded, installs to ~/.loc
 ```
 
 Requirements — **your machine:** docker (with buildx), rsync, ssh.
-**The server:** docker, rsync, and an ssh account that can reach the docker
-socket. Nothing else; shunt uploads its own helper.
+**The server:** docker, rsync, `tar`, `curl`, and an ssh account that can reach
+the docker socket. Nothing else; shunt uploads its own helper. `tar` streams the
+image layout into `docker load`; `curl` runs url health checks. Both are present
+on essentially every distro image, but not on some minimal ones — `shunt doctor`
+checks for them, and so does every command that connects.
+
+rsync 3.2 or newer on **both** ends gets zstd transfer compression. Older
+versions (Ubuntu 20.04 ships 3.1.3; macOS ships 2.6.9 as `/usr/bin/rsync`) still
+work — shunt detects them and falls back rather than failing.
 
 Either image store works on either end. shunt writes a layout that both the
 containerd snapshotter and the classic overlay2 store can load, so a laptop
@@ -433,9 +440,29 @@ deliberately broken build — it passed with `follow = false` and failed with
 
 Secrets are resolved **on your machine**, streamed to the host inside the release
 spec over the ssh channel, and written to a `0600` env-file there. They are never
-baked into an image, never passed as process arguments, and never written to a
-local temp file — so they cannot leak through `ps`, shell history,
-`docker inspect`, or a published layer.
+baked into an image, never written to a local temp file, and never passed as
+arguments to the helper — so they cannot leak through your shell history, a
+stray file in `/tmp`, `ps` on either machine, or a published image layer.
+
+**The boundary is the host's Docker socket.** Docker expands `--env-file` into
+the container's own configuration, so anyone who can reach the Docker API on that
+host can read the values back with `docker inspect`. That is not a gap shunt can
+close: as the [Security](#security) section notes, socket access is already root
+on that host, and a process that can read the container config can equally read
+the `0600` env-file or the container's memory. Treat "can talk to the Docker
+socket" as "can read every secret in this project", and scope your deploy user
+accordingly.
+
+Two things follow from that, worth knowing before you rely on either:
+
+- **`[secrets]` is the only path that gets the env-file treatment.** A value
+  written into a service's `env` block — including via `${env:...}` — is passed
+  to `docker run` as `-e KEY=value` on the host, so it is briefly visible in `ps`
+  there. Use `env` for configuration and `[secrets]` for anything you would not
+  commit.
+- **A rollback needs the old release's env-file.** It is the only plaintext copy
+  of that release's secrets — the ledger holds hashes — so retention bounds how
+  far back you can roll back. See [Rollback](#rollback).
 
 | provider | source |
 |:--|:--|
