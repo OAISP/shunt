@@ -1,12 +1,15 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/OAISP/shunt/internal/release"
 )
@@ -542,6 +545,127 @@ func TestSwapArtifactsClearsStaleStagedFiles(t *testing.T) {
 		if _, err := os.Stat(p); !os.IsNotExist(err) {
 			t.Fatalf("stale fragment %s survived", filepath.Base(p))
 		}
+	}
+}
+
+// blobLayout writes an OCI-shaped blobs/sha256 directory whose filenames are
+// the real digests of their contents.
+func blobLayout(t *testing.T, contents ...string) string {
+	t.Helper()
+	dir := t.TempDir()
+	blobs := filepath.Join(dir, "blobs", "sha256")
+	if err := os.MkdirAll(blobs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range contents {
+		sum := sha256.Sum256([]byte(c))
+		if err := os.WriteFile(filepath.Join(blobs, hex.EncodeToString(sum[:])), []byte(c), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
+// The saving the whole design exists to produce was being handed back on the
+// host: shipping 5 KB and then re-hashing the entire image. A blob is
+// content-addressed and immutable, so verifying it twice proves nothing.
+func TestVerifyLayoutOnlyHashesBlobsItHasNotSeen(t *testing.T) {
+	dir := blobLayout(t, "layer-one", "layer-two")
+
+	if err := verifyLayout(dir); err != nil {
+		t.Fatal(err)
+	}
+	first := loadVerified(dir)
+	if len(first) != 2 {
+		t.Fatalf("sidecar recorded %d blobs, want 2", len(first))
+	}
+
+	// A second pass over an untouched layout must find everything already known.
+	if err := verifyLayout(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	// Corrupt a blob keeping both its size and its mtime. This documents the
+	// trade the cache makes: such a rewrite is trusted and slips through.
+	// Nothing rsync does produces it — writing a file always moves the mtime —
+	// so the exposure is silent on-disk corruption between deploys, against a
+	// full-image rehash on every deploy forever. SHUNT_NO_VERIFY_CACHE=1 buys
+	// the old behaviour back.
+	blobs := filepath.Join(dir, "blobs", "sha256")
+	ents, _ := os.ReadDir(blobs)
+	victim := filepath.Join(blobs, ents[0].Name())
+	fi, err := os.Stat(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt := strings.Repeat("x", int(fi.Size())) // same length, different bytes
+	if err := os.WriteFile(victim, []byte(corrupt), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	os.Chtimes(victim, fi.ModTime(), fi.ModTime())
+	if err := verifyLayout(dir); err != nil {
+		t.Fatalf("a same-size same-mtime rewrite is deliberately trusted: %v", err)
+	}
+
+	// Touch it the way rsync would, and the corruption must surface.
+	later := fi.ModTime().Add(time.Second)
+	os.Chtimes(victim, later, later)
+	if err := verifyLayout(dir); err == nil {
+		t.Fatal("verifyLayout accepted a corrupt blob after its mtime moved")
+	}
+}
+
+// The cache can be turned off for anyone who would rather pay the full hash.
+func TestVerifyCacheCanBeDisabled(t *testing.T) {
+	dir := blobLayout(t, "layer-one")
+	if err := verifyLayout(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	blobs := filepath.Join(dir, "blobs", "sha256")
+	ents, _ := os.ReadDir(blobs)
+	victim := filepath.Join(blobs, ents[0].Name())
+	fi, _ := os.Stat(victim)
+	if err := os.WriteFile(victim, []byte(strings.Repeat("x", int(fi.Size()))), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	os.Chtimes(victim, fi.ModTime(), fi.ModTime())
+
+	t.Setenv("SHUNT_NO_VERIFY_CACHE", "1")
+	if err := verifyLayout(dir); err == nil {
+		t.Fatal("SHUNT_NO_VERIFY_CACHE=1 must rehash every blob and catch the corruption")
+	}
+}
+
+// The sidecar mirrors the blobs present now, so a store that turns over does
+// not accumulate records for blobs that are long gone.
+func TestVerifiedSidecarDoesNotGrowUnbounded(t *testing.T) {
+	dir := blobLayout(t, "a", "b", "c")
+	if err := verifyLayout(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	blobs := filepath.Join(dir, "blobs", "sha256")
+	ents, _ := os.ReadDir(blobs)
+	os.Remove(filepath.Join(blobs, ents[0].Name()))
+
+	if err := verifyLayout(dir); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(loadVerified(dir)); got != 2 {
+		t.Fatalf("sidecar holds %d records, want 2 — it is not tracking the live set", got)
+	}
+}
+
+func TestVerifyLayoutCatchesCorruptionOnFirstSight(t *testing.T) {
+	dir := blobLayout(t, "genuine")
+	blobs := filepath.Join(dir, "blobs", "sha256")
+	ents, _ := os.ReadDir(blobs)
+	if err := os.WriteFile(filepath.Join(blobs, ents[0].Name()), []byte("tampered"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyLayout(dir); err == nil {
+		t.Fatal("verifyLayout accepted a blob that does not hash to its name")
 	}
 }
 

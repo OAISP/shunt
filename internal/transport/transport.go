@@ -23,6 +23,11 @@ import (
 	"github.com/OAISP/shunt/internal/sshx"
 )
 
+// VerifiedSidecar is the host-side record of which blobs have already been
+// integrity-checked. It lives inside the layout but is never transferred, so
+// both the mirror and the helper have to agree on the name.
+const VerifiedSidecar = ".shunt-verified.json*"
+
 type Stats struct {
 	Sent    int64 // bytes actually put on the wire
 	Total   int64 // logical size of the layout
@@ -88,6 +93,12 @@ func Push(ctx context.Context, o Options) (*Stats, error) {
 		"--partial",
 		// Deliberately NOT --human-readable: that abbreviates the stats to
 		// "85.38M" and the byte counts below would be parsed wrong.
+		//
+		// The verification sidecar is written by the host and has no local
+		// counterpart, so --delete would remove it on every push and the host
+		// would rehash the whole image every time. Excluding it also protects it
+		// from deletion, since --delete skips excluded files.
+		"--exclude", VerifiedSidecar,
 	}
 	args = append(args, compressArgs(o.RemoteZstd)...)
 	args = append(args,

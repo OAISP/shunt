@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 )
 
 type Result struct {
@@ -91,7 +92,40 @@ func Build(ctx context.Context, o Options) (*Result, error) {
 	// the layout and must not be shipped.
 	os.RemoveAll(filepath.Join(o.OutDir, "ingest"))
 
+	if err := normalizeBlobTimes(o.OutDir); err != nil {
+		return nil, fmt.Errorf("build image %q: %w", o.Name, err)
+	}
+
 	return &Result{Name: o.Name, Dir: o.OutDir, Digest: dg, Bytes: dirSize(o.OutDir)}, nil
+}
+
+// blobEpoch is the fixed timestamp every blob is stamped with. The value is
+// arbitrary; only its stability matters.
+var blobEpoch = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+
+// normalizeBlobTimes gives every blob the same modification time.
+//
+// A blob's filename is its content hash, so its mtime carries no information
+// whatsoever — but rsync's quick check compares size *and* mtime, and this
+// directory is deleted and re-exported on every build. Fresh mtimes on
+// byte-identical blobs therefore made rsync consider all of them changed: it
+// delta'd the entire image every deploy to transfer almost nothing, and rewrote
+// every file on the host in the process.
+//
+// Pinning the mtime lets the quick check do its job — unchanged blobs are
+// skipped outright rather than delta'd — and keeps the host's mtimes stable,
+// which is what makes the host-side verification cache able to hit at all.
+func normalizeBlobTimes(dir string) error {
+	blobs := filepath.Join(dir, "blobs")
+	if _, err := os.Stat(blobs); err != nil {
+		return nil // no blobs directory is not this function's problem
+	}
+	return filepath.WalkDir(blobs, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		return os.Chtimes(path, blobEpoch, blobEpoch)
+	})
 }
 
 // ociIndex is the subset of the OCI image index we care about.

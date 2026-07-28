@@ -94,6 +94,7 @@ func cmdUp(ctx context.Context, args []string) error {
 
 	s := c.err()
 	fmt.Fprintf(os.Stderr, "\n%s\n", s.Bold("applying"))
+	applyStart := time.Now()
 	r := c.renderer()
 	if err := run(func(r engine.EventRenderer) error {
 		return b.engine.Apply(ctx, b.spec, r)
@@ -101,9 +102,23 @@ func cmdUp(ctx context.Context, args []string) error {
 		return err
 	}
 	if !c.asJSON {
-		fmt.Fprintf(os.Stderr, "  %s\n", s.Dim(fmt.Sprintf("done in %s", time.Since(start).Round(time.Second))))
+		// Broken down rather than one total. The wire cost is the number shunt
+		// advertises, but the host still has to load the image and swap
+		// containers, and an operator wondering where twelve seconds went should
+		// not have to guess which phase owns them.
+		fmt.Fprintf(os.Stderr, "  %s\n", s.Dim(fmt.Sprintf(
+			"done in %s  ·  build %s · ship %s · apply %s",
+			round(time.Since(start)), round(b.buildTook), round(b.shipTook), round(time.Since(applyStart)))))
 	}
 	return nil
+}
+
+// round keeps sub-second phases legible instead of collapsing them all to 0s.
+func round(d time.Duration) time.Duration {
+	if d < time.Second {
+		return d.Round(10 * time.Millisecond)
+	}
+	return d.Round(100 * time.Millisecond)
 }
 
 // ship mirrors the built layouts to the host and reports what actually crossed
@@ -111,6 +126,8 @@ func cmdUp(ctx context.Context, args []string) error {
 func ship(ctx context.Context, b *buildOut, c *commonFlags) error {
 	s := c.err()
 	fmt.Fprintf(os.Stderr, "\n%s\n", s.Bold("shipping"))
+	shipStart := time.Now()
+	defer func() { b.shipTook = time.Since(shipStart) }()
 
 	stats, err := b.engine.Push(ctx, b.built, c.verbose)
 	if err != nil {

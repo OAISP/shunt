@@ -10,6 +10,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/OAISP/shunt/internal/build"
 	"github.com/OAISP/shunt/internal/engine"
@@ -142,6 +143,11 @@ type buildOut struct {
 	spec   *release.Spec
 	built  map[string]*build.Result
 	state  *engine.RemoteState
+
+	// Phase timings, so `up` can report where the wall clock actually went
+	// rather than one opaque total.
+	buildTook time.Duration
+	shipTook  time.Duration
 }
 
 // prepare connects, builds every image, assembles the release spec and reads the
@@ -170,10 +176,12 @@ func prepare(ctx context.Context, c *commonFlags, noCache bool) (*buildOut, erro
 
 	id := engine.NewReleaseID()
 	fmt.Fprintf(os.Stderr, "\n%s\n", s.Bold("building"))
+	buildStart := time.Now()
 	built, err := e.Build(ctx, id, engine.BuildOptions{NoCache: noCache, Verbose: c.verbose})
 	if err != nil {
 		return fail(err)
 	}
+	buildTook := time.Since(buildStart)
 	for _, name := range slices.Sorted(maps.Keys(built)) {
 		fmt.Fprintf(os.Stderr, "  %s %s %s (%s)\n", s.Tick(), name,
 			ui.ShortDigest(built[name].Digest), ui.Bytes(built[name].Bytes))
@@ -191,7 +199,7 @@ func prepare(ctx context.Context, c *commonFlags, noCache bool) (*buildOut, erro
 	if err != nil {
 		return fail(err)
 	}
-	return &buildOut{engine: e, spec: spec, built: built, state: state}, nil
+	return &buildOut{engine: e, spec: spec, built: built, state: state, buildTook: buildTook}, nil
 }
 
 // confirm asks a yes/no question. Callers must only reach it when stdin is a
