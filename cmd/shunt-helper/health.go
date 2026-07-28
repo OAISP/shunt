@@ -61,8 +61,8 @@ func waitHealthy(spec *release.Spec, order []string, set map[string]release.Serv
 			last = err.Error()
 			// Surface a container that already died rather than burning the full
 			// retry budget waiting for a process that will never listen.
-			if state, _ := exec.Command("docker", "inspect", "-f", "{{.State.Status}}", container).Output(); len(state) > 0 {
-				if s := strings.TrimSpace(string(state)); s == "exited" || s == "dead" {
+			if state, _ := docker.Run("docker", "inspect", "-f", "{{.State.Status}}", container); len(state) > 0 {
+				if s := strings.TrimSpace(state); s == "exited" || s == "dead" {
 					return fmt.Errorf("%s exited during startup:\n%s", container, tailLogs(container, 20))
 				}
 			}
@@ -119,11 +119,11 @@ func probe(spec *release.Spec, container string, svc release.Service, h *release
 		return "", fmt.Errorf("HTTP %s from %s", code, target)
 	}
 	args := append([]string{"exec", container}, h.Command...)
-	out, err := exec.Command("docker", args...).CombinedOutput()
+	out, err := docker.Run("docker", args...)
 	if err != nil {
-		return "", fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+		return "", fmt.Errorf("%v: %s", err, strings.TrimSpace(out))
 	}
-	return strings.TrimSpace(string(out)), nil
+	return strings.TrimSpace(out), nil
 }
 
 // probeBase turns a service into the origin a bare health path is resolved
@@ -183,8 +183,8 @@ func publishedHostPort(svc release.Service) (host, port string, ok bool) {
 }
 
 func tailLogs(container string, n int) string {
-	out, _ := exec.Command("docker", "logs", "--tail", fmt.Sprint(n), container).CombinedOutput()
-	s := strings.TrimSpace(string(out))
+	out, _ := docker.Run("docker", "logs", "--tail", fmt.Sprint(n), container)
+	s := strings.TrimSpace(out)
 	if s == "" {
 		return "  (no container logs)"
 	}

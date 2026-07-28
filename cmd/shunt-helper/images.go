@@ -21,18 +21,18 @@ func ensureNetwork(name string) error {
 		return nil
 	}
 	step("network", "ensuring network "+name)
-	if err := exec.Command("docker", "network", "inspect", name).Run(); err == nil {
+	if docker.Ok("docker", "network", "inspect", name) {
 		ok("network", name+" exists")
 		return nil
 	}
-	out, err := exec.Command("docker", "network", "create", name).CombinedOutput()
+	out, err := docker.Run("docker", "network", "create", name)
 	if err != nil {
 		// A concurrent create is fine; anything else is not.
-		if strings.Contains(string(out), "already exists") {
+		if strings.Contains(out, "already exists") {
 			ok("network", name+" exists")
 			return nil
 		}
-		return fmt.Errorf("create network %s: %s", name, strings.TrimSpace(string(out)))
+		return fmt.Errorf("create network %s: %s", name, strings.TrimSpace(out))
 	}
 	ok("network", "created "+name)
 	return nil
@@ -44,8 +44,8 @@ func loadImages(spec *release.Spec) error {
 		img := spec.Images[name]
 		if img.External {
 			step("pull", "pulling "+img.Ref)
-			if out, err := exec.Command("docker", "pull", "--quiet", img.Ref).CombinedOutput(); err != nil {
-				return fmt.Errorf("pull %s: %s", img.Ref, strings.TrimSpace(string(out)))
+			if out, err := docker.Run("docker", "pull", "--quiet", img.Ref); err != nil {
+				return fmt.Errorf("pull %s: %s", img.Ref, strings.TrimSpace(out))
 			}
 			ok("pull", img.Ref)
 			continue
@@ -54,7 +54,7 @@ func loadImages(spec *release.Spec) error {
 		dir := filepath.Join(spec.StorePath, name)
 		// Retrying a release whose image is already loaded — after a failed stage,
 		// say — need not re-read and re-import the whole layout.
-		if exec.Command("docker", "image", "inspect", img.Ref).Run() == nil {
+		if docker.Ok("docker", "image", "inspect", img.Ref) {
 			ok("load", img.Ref+" already present")
 			continue
 		}
@@ -65,7 +65,7 @@ func loadImages(spec *release.Spec) error {
 		if err := dockerLoadDir(dir); err != nil {
 			return fmt.Errorf("image %s: %w", name, err)
 		}
-		if err := exec.Command("docker", "image", "inspect", img.Ref).Run(); err != nil {
+		if !docker.Ok("docker", "image", "inspect", img.Ref) {
 			return fmt.Errorf("image %s: %s is not present after load — the layout may be tagged differently", name, img.Ref)
 		}
 		ok("load", img.Ref)

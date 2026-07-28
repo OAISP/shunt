@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"strings"
 
 	"github.com/OAISP/shunt/internal/release"
@@ -42,7 +41,7 @@ func cmdRollback(args []string) error {
 		// only ever holds the newest build, so this is the real constraint on how
 		// far back a rollback can go.
 		for _, img := range target.Images {
-			if err := exec.Command("docker", "image", "inspect", img.Ref).Run(); err != nil {
+			if !docker.Ok("docker", "image", "inspect", img.Ref) {
 				return fmt.Errorf("image %s for release %s is no longer on this host (pruned) — redeploy that commit instead",
 					img.Ref, target.ID)
 			}
@@ -105,26 +104,9 @@ func cmdRetire(args []string) error {
 	}
 	project, service := args[0], args[1]
 	return withLock(project, func() error {
-		out, err := exec.Command("docker", "ps", "-a",
-			"--filter", "label=shunt.project="+project,
-			"--filter", "label=shunt.service="+service,
-			"--format", "{{.Names}}").Output()
-		if err != nil {
-			return fmt.Errorf("list containers for %s: %w", service, err)
+		if err := retireContainers(project, service); err != nil {
+			return err
 		}
-		names := splitLines(string(out))
-		if len(names) == 0 {
-			ok("retire:"+service, "nothing running for "+service)
-			return nil
-		}
-		for _, n := range names {
-			step("retire:"+service, "stopping "+n)
-			// A drain of 10s rather than an immediate kill: an orphan is still
-			// serving something until it stops.
-			stopAndRemove(n, 10)
-			ok("retire:"+service, n+" stopped and removed")
-		}
-
 		// Drop the applied-accessory record too, so a service that comes back
 		// later is not compared against state that no longer exists.
 		ledger, err := loadLedger(project)
@@ -137,6 +119,30 @@ func cmdRetire(args []string) error {
 		}
 		return nil
 	})
+}
+
+// retireContainers stops and removes every container belonging to one service.
+func retireContainers(project, service string) error {
+	out, err := docker.Run("docker", "ps", "-a",
+		"--filter", "label=shunt.project="+project,
+		"--filter", "label=shunt.service="+service,
+		"--format", "{{.Names}}")
+	if err != nil {
+		return fmt.Errorf("list containers for %s: %w", service, err)
+	}
+	names := splitLines(out)
+	if len(names) == 0 {
+		ok("retire:"+service, "nothing running for "+service)
+		return nil
+	}
+	for _, n := range names {
+		step("retire:"+service, "stopping "+n)
+		// A drain rather than an immediate kill: an orphan is still serving
+		// something until it stops.
+		stopAndRemove(n, 10)
+		ok("retire:"+service, n+" stopped and removed")
+	}
+	return nil
 }
 
 // cmdBoot force-recreates one accessory from a spec supplied on stdin. It is a
@@ -168,8 +174,8 @@ func cmdBoot(in io.Reader, args []string) error {
 		}
 		if img, present := spec.Images[acc.Image]; present && img.External {
 			step("pull", "pulling "+img.Ref)
-			if out, err := exec.Command("docker", "pull", "--quiet", img.Ref).CombinedOutput(); err != nil {
-				return fmt.Errorf("pull %s: %s", img.Ref, strings.TrimSpace(string(out)))
+			if out, err := docker.Run("docker", "pull", "--quiet", img.Ref); err != nil {
+				return fmt.Errorf("pull %s: %s", img.Ref, strings.TrimSpace(out))
 			}
 		}
 		envFile, err := writeEnvFile(&spec)

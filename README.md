@@ -286,6 +286,18 @@ required = true                            # absent locally fails the deploy
 volumes = ["/opt/acme/data:/data:ro"]
 ```
 
+An artifact may be a **directory** rather than a file — model weights, a
+prebuilt index, an asset tree. Point `src` at the directory and `dest` at where
+it should live; the whole tree is mirrored and swapped in as a unit. Unchanged
+files inside it are not re-sent.
+
+```toml
+[[artifacts]]
+name = "weights"
+src  = "models/embed"                  # a directory
+dest = "/opt/acme/models/embed"
+```
+
 `magic` is a literal prefix the file must start with. It is worth setting for any
 format that has one, because it is what turns a truncated upload into a failed
 deploy instead of an outage.
@@ -315,6 +327,52 @@ Silently rolling a database back as a side effect of rolling code back is the
 kind of helpfulness that loses data — the `.prev` copy and the exact command are
 right there instead.
 
+### Deploy targets
+
+Only if you deploy the same project to more than one server — staging and
+production, typically.
+
+```toml
+project = "acme"
+host    = "deploy@prod.example.com"
+
+[targets.staging]
+host = "deploy@staging.example.com"
+# project = "acme-stg"          # defaults to "acme-staging"
+# [targets.staging.secrets]     # staging should not hold production credentials
+# provider = "file"
+# path     = "secrets/staging.env"
+```
+
+```sh
+shunt up                 # the host at the top of the file
+shunt up -t staging      # the staging target
+```
+
+A target changes **where** a release goes, never **what** it contains: the
+images, services, stages and artifacts are the ones declared above, whichever
+target you select. That keeps the rule that no deploy-time flag alters what gets
+deployed.
+
+The project name is namespaced per target by default (`acme` → `acme-staging`),
+so two targets can share one machine without colliding on container names, the
+network, or the ledger.
+
+### Scoping secrets to a service
+
+By default every service and stage receives every resolved secret. A service can
+narrow that:
+
+```toml
+[services.worker]
+image   = "app"
+command = ["npm", "run", "worker"]
+secrets = ["DATABASE_URL"]        # not STRIPE_KEY
+```
+
+Each distinct scope gets its own `0600` env-file on the host, so the narrowing
+holds against `docker inspect` too, not just against the process environment.
+
 ### Accessories vs services
 
 A **service** is stateless and replaced on every release. An **accessory** is
@@ -323,6 +381,22 @@ alone. Shipping a one-line CSS fix must not restart Postgres.
 
 Change an accessory's definition and `shunt plan` reports the drift without
 acting on it. Applying it is the explicit, destructive `shunt boot db`.
+
+### Getting data back
+
+rsync does not care which end is the source, so the transport works in both
+directions:
+
+```sh
+shunt fetch                       # list what can be fetched
+shunt fetch index                 # pull the artifact back over its local source
+shunt fetch index -o /tmp/prod.db # ...or somewhere else
+shunt fetch /opt/acme/backups/pre-migrate-20260728.sql
+```
+
+Incrementally, like everything else: refreshing a stale local copy of a 500 MB
+database moves only the blocks that changed. Useful for working against real
+data, and for retrieving the pre-migration dump a `capture` stage produced.
 
 ## Commands
 
@@ -517,8 +591,11 @@ the second just declares more.
 cmd/shunt/           the CLI you run
   cli.go               flags, arg parsing, shared setup
   deploy.go            plan, up
-  lifecycle.go         rollback, boot
+  lifecycle.go         rollback, boot, retire
   inspect.go           status, logs, prune
+  audit.go             audit, validate
+  exec.go              exec, run
+  fetch.go             pulling artifacts and captures back down
   init.go              scaffolding
 
 cmd/shunt-helper/    uploaded to the host, driven over ssh, emits NDJSON events
@@ -528,7 +605,8 @@ cmd/shunt-helper/    uploaded to the host, driven over ssh, emits NDJSON events
   proxy.go             discovery labels for Traefik / caddy-docker-proxy
   stages.go            one-shot containers, captures
   health.go            probes and gating
-  ledger.go            release history, secret redaction
+  ledger.go            release history, outcome classification, redaction
+  runner.go            the seam that makes the deploy path testable
   inspect.go           status, logs, pruning
 
 internal/manifest    shunt.toml types, loading, validation
@@ -582,9 +660,20 @@ Issues and pull requests welcome. CI runs `gofmt`, `go vet`, `go test -race`,
 a cross-compiled build of the embedded helper, and a smoke test of the binary —
 `make test && make build` locally covers all but the last.
 
-Changes to the deploy path are hard to prove correct with unit tests alone. If
-you touch container swapping, health gating or the transport, please say in the
-PR what you exercised against a real host.
+Changes to the deploy path are hard to prove correct with unit tests alone, so
+CI runs `test/e2e.sh` against a real Docker daemon over real ssh: containers
+swap, health checks probe, and a failing stage has to leave the running release
+untouched. Run it yourself against any host you can ssh to:
+
+```sh
+make build && test/e2e.sh deploy@vps.example.com
+```
+
+Host-side logic reaches docker through the `runner` seam in
+`cmd/shunt-helper/runner.go`, so swap, health and rollback failures are
+assertable without a daemon. If you touch container swapping, health gating or
+the transport, add a case there as well as saying in the PR what you exercised
+against a real host.
 
 ## License
 

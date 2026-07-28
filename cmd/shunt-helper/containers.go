@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"maps"
-	"os/exec"
 	"slices"
 	"strings"
 	"time"
@@ -44,8 +43,8 @@ func stopAndRemove(container string, drain int) {
 	if !containerExists(container) {
 		return
 	}
-	exec.Command("docker", "stop", "--timeout", fmt.Sprint(drain), container).Run()
-	exec.Command("docker", "rm", "-f", container).Run()
+	docker.Ok("docker", "stop", "--timeout", fmt.Sprint(drain), container)
+	docker.Ok("docker", "rm", "-f", container)
 }
 
 // containerIP resolves a container's address on the deploy network. It lets
@@ -56,11 +55,11 @@ func containerIP(container, network string) (string, error) {
 	if network != "" {
 		format = fmt.Sprintf(`{{with index .NetworkSettings.Networks %q}}{{.IPAddress}}{{end}}`, network)
 	}
-	out, err := exec.Command("docker", "inspect", "-f", format, container).Output()
+	out, err := docker.Run("docker", "inspect", "-f", format, container)
 	if err != nil {
 		return "", fmt.Errorf("inspect %s: %w", container, err)
 	}
-	ip := strings.TrimSpace(string(out))
+	ip := strings.TrimSpace(out)
 	if ip == "" {
 		return "", fmt.Errorf("%s has no address on network %s", container, network)
 	}
@@ -71,16 +70,16 @@ func containerIP(container, network string) (string, error) {
 // other than the current one. This is what completes a blue/green swap, and it
 // also cleans up leftovers from a deploy that failed midway.
 func retireOldContainers(spec *release.Spec, name string, svc release.Service) {
-	out, err := exec.Command("docker", "ps", "-a",
+	out, err := docker.Run("docker", "ps", "-a",
 		"--filter", "label=shunt.project="+spec.Project,
 		"--filter", "label=shunt.service="+name,
-		"--format", "{{.Names}}\t{{.Label \"shunt.release\"}}").Output()
+		"--format", "{{.Names}}\t{{.Label \"shunt.release\"}}")
 	if err != nil {
 		return
 	}
 	keep := serviceContainer(spec, name, svc)
 	drain := drainSeconds(svc)
-	for _, ln := range splitLines(string(out)) {
+	for _, ln := range splitLines(out) {
 		f := strings.SplitN(ln, "\t", 2)
 		if len(f) < 2 || f[0] == keep {
 			continue
@@ -93,8 +92,8 @@ func retireOldContainers(spec *release.Spec, name string, svc release.Service) {
 // containerExists reports whether a container of that name is present in any
 // state, running or stopped.
 func containerExists(name string) bool {
-	out, err := exec.Command("docker", "ps", "-aq", "--filter", "name=^/"+name+"$").Output()
-	return err == nil && strings.TrimSpace(string(out)) != ""
+	out, err := docker.Run("docker", "ps", "-aq", "--filter", "name=^/"+name+"$")
+	return err == nil && strings.TrimSpace(out) != ""
 }
 
 // startContainer removes any container of the same name and runs a fresh one.
@@ -153,8 +152,8 @@ func startContainer(spec *release.Spec, name string, svc release.Service, envFil
 	args = append(args, ref)
 	args = append(args, svc.Command...)
 
-	if out, err := exec.Command("docker", args...).CombinedOutput(); err != nil {
-		return fmt.Errorf("start %s: %s", container, strings.TrimSpace(string(out)))
+	if out, err := docker.Run("docker", args...); err != nil {
+		return fmt.Errorf("start %s: %s", container, strings.TrimSpace(out))
 	}
 	return nil
 }
@@ -174,7 +173,7 @@ func ensureAccessories(spec *release.Spec, ledger *release.Ledger, envFile strin
 		container := containerName(spec.Project, name)
 		if containerExists(container) {
 			// It may be stopped after a host reboot; start it, but do not replace it.
-			exec.Command("docker", "start", container).Run()
+			docker.Ok("docker", "start", container)
 			ok("accessory:"+name, container+" already present")
 			continue
 		}
