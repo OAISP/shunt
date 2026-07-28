@@ -115,3 +115,22 @@ jobs:
 
       - name: e2e
         run: test/e2e.sh localhost
+
+  # The host-compatibility paths, against hosts that actually have the problem.
+  # A healthy runner cannot reproduce either: it has curl and tar, and an rsync
+  # new enough for zstd. Both cases are ones a real VPS hits.
+  compat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build
+        run: make build
+
+      - name: compat
+        run: test/compat.sh
