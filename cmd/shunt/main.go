@@ -54,7 +54,10 @@ const usage = `usage:
   shunt boot <accessory>     (re)create a stateful accessory — destructive
   shunt retire <service>     stop a service you removed from shunt.toml
   shunt bundle               build a release into a portable file
+  shunt bundle inspect <f>   show what a bundle contains, without applying it
+  shunt bundle verify <f>    rehash a bundle's blobs; needs no host
   shunt apply <bundle>       deploy a bundle, no build toolchain needed
+  shunt apply --plan <f>     show what applying a bundle would change
   shunt fetch [name|path]    pull an artifact or capture back down
   shunt logs [service]       tail logs from the host
   shunt prune                drop superseded images on the host

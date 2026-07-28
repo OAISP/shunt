@@ -407,10 +407,31 @@ should run it — an air-gapped network, a change-approval queue, a laptop with
 the source but no VPN.
 
 ```sh
-shunt bundle                       # writes <project>-<release>.shuntpkg
-scp acme-20260728-….shuntpkg ops:  # or a USB stick, or an approval queue
-shunt apply acme-20260728-….shuntpkg
+shunt bundle                          # writes <project>-<release>.shuntpkg
+scp acme-….shuntpkg ops:              # or a USB stick, or an approval queue
+
+shunt bundle inspect acme-….shuntpkg  # what is in it — instant, whatever the size
+shunt bundle verify  acme-….shuntpkg  # rehash every blob; needs no host
+shunt apply --plan   acme-….shuntpkg  # what applying would change
+shunt apply          acme-….shuntpkg
 ```
+
+`shunt bundle inspect` is the command for someone handed a bundle to approve:
+which release, from which commit and whose build, for which host, running what,
+and which secrets it will want. It reads only the description — that is the
+first entry in the archive — so it answers immediately on a bundle of any size,
+and it says so loudly when the build came from a modified working tree, since
+that is precisely when the commit id describes nothing.
+
+`shunt bundle verify` rehashes every blob against its own filename. That is the
+same check the host performs on load, run without a host, so a bundle can be
+proven intact before being carried somewhere retrying is expensive. It proves
+the bytes are intact and nothing more.
+
+`shunt apply --plan` answers "what will this do to my host" before it does it,
+with the same output and the same exit codes as `shunt plan`. It works even
+where the secrets are not reachable — it says the secret diff was skipped rather
+than reporting every key as removed.
 
 `shunt bundle` does everything `shunt up` does up to the transfer and writes the
 result to a file instead of a host. It never connects, so it works with the

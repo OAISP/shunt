@@ -13,6 +13,8 @@ package bundle
 
 import (
 	"archive/tar"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,6 +22,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/OAISP/shunt/internal/manifest"
 	"github.com/OAISP/shunt/internal/release"
@@ -47,6 +50,12 @@ type Meta struct {
 	// production credentials would be the worst possible thing to leave on a
 	// USB stick, and encrypting them into it only moves the key problem.
 	Secrets *manifest.Secrets `json:"secrets,omitempty"`
+
+	// SecretKeys names the secrets this release needs, without their values.
+	// It is what lets someone decide whether to approve a bundle — "this wants
+	// production database credentials" is the question, and the key names are
+	// metadata the ledger already keeps anyway.
+	SecretKeys []string `json:"secret_keys,omitempty"`
 
 	// Spec is the release, with secret values stripped. Its Images point at
 	// layouts inside the archive.
@@ -88,6 +97,127 @@ func Write(w io.Writer, c Contents) error {
 		}
 	}
 	return tw.Close()
+}
+
+// ReadMeta reads only a bundle's description.
+//
+// bundle.json is written first precisely so this can stop after one entry: an
+// operator asking what a 700 MB file contains should not wait for 700 MB to be
+// unpacked to find out.
+func ReadMeta(r io.Reader) (Meta, error) {
+	tr := tar.NewReader(r)
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return Meta{}, fmt.Errorf("read bundle: %w", err)
+		}
+		if h.Name != metaName {
+			continue
+		}
+		var m Meta
+		if err := json.NewDecoder(tr).Decode(&m); err != nil {
+			return Meta{}, fmt.Errorf("%s: %w", metaName, err)
+		}
+		if m.Version != Version {
+			return Meta{}, fmt.Errorf("this bundle is format v%d and this shunt speaks v%d — use a matching version",
+				m.Version, Version)
+		}
+		return m, nil
+	}
+	return Meta{}, fmt.Errorf("not a shunt bundle: no %s inside", metaName)
+}
+
+// Report is what a verification pass found.
+type Report struct {
+	Blobs     int
+	Bytes     int64
+	Images    []string
+	Artifacts []string
+}
+
+// Verify unpacks a bundle and rehashes every blob against its own filename.
+//
+// It duplicates a check `shunt apply` already performs on the host, and that is
+// the point: it can be run *before* carrying a bundle somewhere retrying is
+// expensive, and it needs no host at all. It proves the bytes are intact and
+// nothing more — a bundle can verify perfectly and still contain a release that
+// does not work.
+func Verify(r io.Reader, dir string) (*Extracted, *Report, error) {
+	ex, err := Read(r, dir)
+	if err != nil {
+		return nil, nil, err
+	}
+	rep := &Report{}
+
+	for _, name := range sortedKeys(ex.ImageDirs) {
+		rep.Images = append(rep.Images, name)
+		blobs := filepath.Join(ex.ImageDirs[name], "blobs", "sha256")
+		ents, err := os.ReadDir(blobs)
+		if err != nil {
+			return nil, nil, fmt.Errorf("image %s has no blobs directory: %w", name, err)
+		}
+		for _, e := range ents {
+			if e.IsDir() {
+				continue
+			}
+			n, err := hashBlob(filepath.Join(blobs, e.Name()), e.Name())
+			if err != nil {
+				return nil, nil, fmt.Errorf("image %s: %w", name, err)
+			}
+			rep.Blobs++
+			rep.Bytes += n
+		}
+	}
+	for _, name := range sortedKeys(ex.ArtifactPaths) {
+		rep.Artifacts = append(rep.Artifacts, name)
+	}
+
+	// A spec referring to a layout the archive does not hold would fail only at
+	// apply time, on the host, after a transfer.
+	for name, ref := range ex.Meta.Spec.Images {
+		if ref.External {
+			continue
+		}
+		if _, ok := ex.ImageDirs[name]; !ok {
+			return nil, nil, fmt.Errorf("the release needs image %q but the bundle does not contain it", name)
+		}
+	}
+	for _, a := range ex.Meta.Spec.Artifacts {
+		if _, ok := ex.ArtifactPaths[a.Name]; !ok {
+			return nil, nil, fmt.Errorf("the release needs artifact %q but the bundle does not contain it", a.Name)
+		}
+	}
+	return ex, rep, nil
+}
+
+// hashBlob checks one content-addressed file against its name and returns its
+// size.
+func hashBlob(path, want string) (int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	n, err := io.Copy(h, f)
+	if err != nil {
+		return 0, err
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); got != want {
+		return 0, fmt.Errorf("blob %s is corrupt (hashes to %s)", short(want), short(got))
+	}
+	return n, nil
+}
+
+func short(s string) string {
+	if len(s) > 16 {
+		return s[:16]
+	}
+	return s
 }
 
 // Extracted is an opened bundle: its description, plus where its payload was
@@ -143,6 +273,9 @@ func Read(r io.Reader, dir string) (*Extracted, error) {
 			return nil, err
 		}
 		f.Close()
+		if !h.ModTime.IsZero() {
+			os.Chtimes(clean, h.ModTime, h.ModTime)
+		}
 
 		if h.Name == metaName {
 			b, err := os.ReadFile(clean)
@@ -197,12 +330,17 @@ func safeJoin(dir, name string) (string, error) {
 func writeFile(tw *tar.Writer, name string, b []byte, mode int64) error {
 	if err := tw.WriteHeader(&tar.Header{
 		Name: name, Mode: mode, Size: int64(len(b)), Typeflag: tar.TypeReg,
+		ModTime: epoch,
 	}); err != nil {
 		return err
 	}
 	_, err := tw.Write(b)
 	return err
 }
+
+// epoch stamps entries that have no meaningful modification time of their own,
+// so the same release produces a byte-identical archive.
+var epoch = time.Unix(0, 0).UTC()
 
 // writeTree adds a file, or every regular file under a directory, at prefix.
 func writeTree(tw *tar.Writer, prefix, src string) error {
@@ -239,8 +377,14 @@ func copyInto(tw *tar.Writer, name, src string, fi os.FileInfo) error {
 	}
 	defer f.Close()
 
+	// Modification times are carried through deliberately. shunt decides whether
+	// an artifact needs transferring from its size and mtime — the same test
+	// rsync applies — so an extraction that stamped files with the current time
+	// would make every artifact in a bundle look changed on every apply, and
+	// would defeat the blob dedup the build normalises mtimes to enable.
 	if err := tw.WriteHeader(&tar.Header{
 		Name: name, Mode: int64(fi.Mode().Perm()), Size: fi.Size(), Typeflag: tar.TypeReg,
+		ModTime: fi.ModTime(),
 	}); err != nil {
 		return err
 	}

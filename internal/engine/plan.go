@@ -40,6 +40,12 @@ type Plan struct {
 	// Changed is materialised into the document so a consumer does not have to
 	// re-derive shunt's own notion of "is there work to do".
 	HasChanges bool `json:"has_changes"`
+
+	// SecretsUnknown means the values could not be resolved here, so the secret
+	// diff is absent rather than empty. Applying a bundle on a machine without
+	// the provider is the case: reporting every key as removed would be worse
+	// than admitting the comparison did not happen.
+	SecretsUnknown bool `json:"secrets_unknown,omitempty"`
 }
 
 type ImageChange struct {

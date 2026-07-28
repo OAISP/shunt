@@ -154,6 +154,11 @@ func (p *Plan) renderServices(w io.Writer, s ui.Style) {
 }
 
 func (p *Plan) renderSecrets(w io.Writer, s ui.Style) {
+	if p.SecretsUnknown {
+		fmt.Fprintf(w, "\n%s %s\n", s.Bold("secrets"),
+			s.Amber("not compared — the values are not reachable from here"))
+		return
+	}
 	sc := p.Secrets
 	fmt.Fprintf(w, "\n%s %d key(s)", s.Bold("secrets"), sc.Total)
 	if len(sc.Added)+len(sc.Removed)+len(sc.Changed) == 0 {

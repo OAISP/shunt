@@ -233,8 +233,23 @@ mkdir -p "$BUNDLE_DIR"
 echo "v5" > index.html
 succeeds "bundle builds a release into a file" "$SHUNT" bundle -o "$BUNDLE_DIR/rel.shuntpkg"
 
+succeeds "inspect reads a bundle without applying it" \
+  "$SHUNT" bundle inspect "$BUNDLE_DIR/rel.shuntpkg"
+succeeds "verify rehashes its blobs" \
+  "$SHUNT" bundle verify "$BUNDLE_DIR/rel.shuntpkg"
+
+# --plan must answer without touching anything.
+BEFORE_PLAN="$(current)"
+exits "apply --plan reports changes with exit 2" 2 \
+  "$SHUNT" apply --plan "$BUNDLE_DIR/rel.shuntpkg"
+eq "apply --plan changed nothing" "$(current)" "$BEFORE_PLAN"
+
 ( cd "$BUNDLE_DIR" && "$SHUNT" apply rel.shuntpkg -y ) >/dev/null 2>&1 || true
 eq "the bundle deployed" "$(served)" "v5"
+
+# Re-planning an applied bundle must be a clean no-op, which only holds if
+# mtimes survived the archive.
+exits "apply --plan is clean once applied" 0 "$SHUNT" apply --plan "$BUNDLE_DIR/rel.shuntpkg"
 
 # Immutable release ids mean the host has already recorded this one.
 if ( cd "$BUNDLE_DIR" && "$SHUNT" apply rel.shuntpkg -y ) >/dev/null 2>&1; then
