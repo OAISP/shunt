@@ -110,7 +110,29 @@ func (p *Plan) renderStages(w io.Writer, s ui.Style) {
 		return
 	}
 	fmt.Fprintf(w, "\n%s %s\n", s.Bold("stages"), s.Dim("(run before any service is replaced)"))
-	fmt.Fprintf(w, "    %s\n", strings.Join(p.Stages, " → "))
+
+	// The pipeline reads as a sequence, so keep it on one line and mark the
+	// entries the manifest changed rather than breaking it into a list.
+	names := make([]string, 0, len(p.Stages))
+	var notes []string
+	for _, st := range p.Stages {
+		switch st.Action {
+		case "remove":
+			notes = append(notes, fmt.Sprintf("%s %s no longer in shunt.toml — it will not run again", s.Remove(), st.Name))
+			continue
+		case "create":
+			notes = append(notes, fmt.Sprintf("%s %s added", s.Add(), st.Name))
+		case "update":
+			notes = append(notes, fmt.Sprintf("%s %s changed", s.Change(), st.Name))
+		}
+		names = append(names, st.Name)
+	}
+	if len(names) > 0 {
+		fmt.Fprintf(w, "    %s\n", strings.Join(names, " → "))
+	}
+	for _, n := range notes {
+		fmt.Fprintf(w, "  %s\n", n)
+	}
 }
 
 func (p *Plan) renderServices(w io.Writer, s ui.Style) {

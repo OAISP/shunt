@@ -98,6 +98,63 @@ func TestAccessoryIsUnchangedOnceApplied(t *testing.T) {
 	}
 }
 
+// Found by deploying for real: adding a migration stage to the manifest moved
+// nothing else, so Changed() returned false, `shunt up` reported "nothing to
+// do", and the migration silently never ran.
+func TestAddingAStageCountsAsWork(t *testing.T) {
+	old := &release.Spec{Stages: []release.Stage{}}
+	nw := &release.Spec{Stages: []release.Stage{
+		{Name: "migrate", Image: "app", Command: []string{"npm", "run", "migrate"}},
+	}}
+
+	p := &Plan{
+		Current: &release.Entry{ID: "r1", Status: release.StatusActive},
+		Stages:  diffStages(old, nw),
+	}
+	if p.Stages[0].Action != "create" {
+		t.Fatalf("stage action = %q, want create", p.Stages[0].Action)
+	}
+	if !p.Changed() {
+		t.Fatal("adding a stage was not treated as work — the migration would never run")
+	}
+}
+
+func TestChangingAStageCommandCountsAsWork(t *testing.T) {
+	old := &release.Spec{Stages: []release.Stage{{Name: "migrate", Command: []string{"old"}}}}
+	nw := &release.Spec{Stages: []release.Stage{{Name: "migrate", Command: []string{"new"}}}}
+
+	got := diffStages(old, nw)
+	if got[0].Action != "update" {
+		t.Fatalf("stage action = %q, want update", got[0].Action)
+	}
+}
+
+// An unchanged pipeline is not itself a reason to deploy; it just runs when
+// something else triggers one.
+func TestAnUnchangedStagePipelineIsNotWork(t *testing.T) {
+	st := []release.Stage{{Name: "migrate", Command: []string{"same"}}}
+	p := &Plan{
+		Current: &release.Entry{ID: "r1", Status: release.StatusActive},
+		Stages:  diffStages(&release.Spec{Stages: st}, &release.Spec{Stages: st}),
+	}
+	if p.Stages[0].Action != "run" {
+		t.Fatalf("stage action = %q, want run", p.Stages[0].Action)
+	}
+	if p.Changed() {
+		t.Fatal("an unchanged stage pipeline should not force a deploy")
+	}
+}
+
+func TestRemovedStageIsReported(t *testing.T) {
+	old := &release.Spec{Stages: []release.Stage{{Name: "migrate"}, {Name: "backup"}}}
+	nw := &release.Spec{Stages: []release.Stage{{Name: "migrate"}}}
+
+	got := diffStages(old, nw)
+	if len(got) != 2 || got[1].Name != "backup" || got[1].Action != "remove" {
+		t.Fatalf("diffStages = %+v, want backup marked removed", got)
+	}
+}
+
 // A failed release leaves the host in an unknown state, so an identical
 // manifest is still work to do — otherwise `shunt up` refuses to retry.
 func TestChangedTreatsFailedCurrentAsWork(t *testing.T) {

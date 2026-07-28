@@ -24,7 +24,7 @@ type Plan struct {
 	Accessories []ServiceChange
 	Services    []ServiceChange
 	Artifacts   []ArtifactChange
-	Stages      []string
+	Stages      []StageChange
 	Secrets     SecretChange
 	Transfer    TransferEstimate
 }
@@ -45,6 +45,53 @@ type ServiceChange struct {
 	// ZeroDowntime is true for proxied services, which start alongside the
 	// running release instead of replacing it in place.
 	ZeroDowntime bool
+}
+
+// StageChange is one one-shot container the deploy would run, and whether the
+// manifest changed it.
+type StageChange struct {
+	Name   string
+	Action string // run | create | update | remove
+}
+
+// diffStages compares the stage pipeline against the one last deployed.
+//
+// Stages have to participate in change detection or adding a migration to the
+// manifest is a silent no-op: nothing else moved, so `shunt up` reported
+// "nothing to do" and the migration never ran.
+func diffStages(old, nw *release.Spec) []StageChange {
+	prev := map[string]release.Stage{}
+	if old != nil {
+		for _, st := range old.Stages {
+			prev[st.Name] = st
+		}
+	}
+	seen := map[string]bool{}
+	out := make([]StageChange, 0, len(nw.Stages))
+	for _, st := range nw.Stages {
+		seen[st.Name] = true
+		sc := StageChange{Name: st.Name, Action: "create"}
+		if was, ok := prev[st.Name]; ok {
+			sc.Action = "run"
+			if !reflect.DeepEqual(was, st) {
+				sc.Action = "update"
+			}
+		} else if old == nil {
+			// Nothing to compare against on a first deploy; every stage simply runs.
+			sc.Action = "run"
+		}
+		out = append(out, sc)
+	}
+	// A stage dropped from the manifest will not run again, which is a change
+	// worth showing even though there is nothing on the host to clean up.
+	if old != nil {
+		for _, st := range old.Stages {
+			if !seen[st.Name] {
+				out = append(out, StageChange{Name: st.Name, Action: "remove"})
+			}
+		}
+	}
+	return out
 }
 
 type SecretChange struct {
@@ -128,6 +175,14 @@ func (p *Plan) Changed() bool {
 	// new database is a deploy, even though no image or service changed.
 	for _, a := range p.Artifacts {
 		if a.Differs() {
+			return true
+		}
+	}
+	// Adding a migration to the manifest is a deploy. Without this the stage was
+	// invisible to change detection, `shunt up` said "nothing to do", and the
+	// migration silently never ran.
+	for _, st := range p.Stages {
+		if st.Action != "run" {
 			return true
 		}
 	}
@@ -218,9 +273,7 @@ func (e *Engine) BuildPlan(ctx context.Context, spec *release.Spec, built map[st
 		})
 	}
 
-	for _, st := range spec.Stages {
-		p.Stages = append(p.Stages, st.Name)
-	}
+	p.Stages = diffStages(oldSpec, spec)
 
 	var salt string
 	if state != nil && state.Ledger != nil {
