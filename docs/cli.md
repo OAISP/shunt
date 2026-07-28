@@ -94,6 +94,10 @@ deploy network and with that release's secrets, and removes it when it exits.
 A migration, a rake task or a console that should not share a process table with
 production belongs here.
 
+The secrets are the ones that service actually runs with, including its own
+`secrets = [...]` narrowing — a console on a worker sees what the worker sees,
+not the whole set.
+
 ```sh
 shunt exec app -- sh
 shunt run app -- bin/rails console

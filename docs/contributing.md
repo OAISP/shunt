@@ -30,9 +30,10 @@ Two further jobs exercise what unit tests cannot:
 
 - **e2e** runs a real deploy over real ssh against a real daemon, with the
   runner deploying to itself. It covers first deploy, no-op, code change,
-  rollback, drift detection after a hand-deleted container, exec, multi-service
-  logs, bundles, orphan detection and retire — and the invariant the whole tool
-  rests on, that a failing stage leaves the running release serving.
+  rollback, secrets surviving a rollback, drift detection after a hand-deleted
+  container, exec, multi-service logs, bundles, orphan detection and retire —
+  and the invariant the whole tool rests on, that a failing stage leaves the
+  running release serving.
 - **compat** builds hosts that actually have the compatibility problems a
   healthy runner cannot reproduce: rsync 3.1.3 with no `--compress-choice`, and
   a host with neither `curl` nor `tar`.

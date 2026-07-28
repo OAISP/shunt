@@ -41,17 +41,25 @@ dropping or the CLI being killed. There is no lease to expire and no stale
 lockfile to clean up.
 
 The plan is computed before the lock is taken, because a build can take minutes.
-The spec therefore carries the release the host was serving at plan time, and
-the helper refuses to apply a plan whose premise has expired:
+The spec therefore carries the release the host was serving at plan time, and a
+plan whose premise has expired is refused rather than applied:
 
 ```
 ✗ this plan was built when 20260728-014515 was serving, but 20260728-015902 is
-  serving now — another deploy or rollback landed in between
+  serving now — another deploy or rollback landed while this one waited for the
+  lock
   rerun `shunt up` to plan against the current state
 ```
 
 That is what stops a deploy that waited on the lock from silently reverting the
 one it waited for.
+
+It is checked twice, in two different places, for two different reasons. The
+helper checks it under its own lock and is the authority — that is the check
+that makes the guarantee. The CLI checks it as soon as it takes the lock and
+before it ships anything, because the helper only sees the spec *after* the
+transfer, and spending minutes uploading an image to be told the plan expired is
+a bad way to find out.
 
 ## Outcomes
 

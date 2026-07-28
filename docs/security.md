@@ -34,7 +34,10 @@ appear in `docker inspect` and therefore in anything that captures it;
 - **No secrets in images.** Nothing is baked into a layer.
 - **No secrets in the ledger.** The on-host release history stores a salted hash
   of each value, which is enough for `shunt plan` to report which secrets
-  changed without plaintext crossing back.
+  changed without plaintext crossing back. The cost is that a rollback cannot
+  replay a release from the ledger alone — it reads the values back from that
+  release's retained `0600` copy, which is what makes retention bound how far
+  back you can go.
 
 ## Integrity
 

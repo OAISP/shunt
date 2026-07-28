@@ -78,10 +78,12 @@ as `-e KEY=value` on the host, so it is briefly visible in `ps` there. Use `env`
 for configuration and `[secrets]` for anything you would not commit.
 
 **A rollback needs the old release's secrets.** They are the only plaintext copy
-of that release's values, since the ledger holds only hashes. Retention
-therefore bounds how far back you can roll back. Images and secrets expire
-together on the same keep set, so a release never looks restorable when it is
-not.
+of that release's values, since the ledger holds only hashes — so a rollback
+reads them back off the host rather than from the release description it is
+replaying. Retention therefore bounds how far back you can roll back. Images and
+secrets expire together on the same keep set, so a release never looks
+restorable when it is not. See
+[Rollback]({% link deploying/rollback.md %}#where-the-restored-secrets-come-from).
 
 ## What the plan shows
 

@@ -57,6 +57,34 @@ layout, so this is an optimisation and never a requirement.
 The archive is built in Go rather than shelled out to `tar`, which is how the
 filtering is expressed and why the host does not need `tar` at all.
 
+## A replayed release is not the spec the ledger holds
+
+Rollback re-applies a previous release from its stored description, and two
+things in that description are true only of the deploy that produced it.
+
+Its images are marked external because that is how they were obtained
+originally; on a replay they are already on this host, so a replay clears the
+flag and goes straight to the swap. And its secret values are salted hashes,
+because the ledger is a file on the host and must never hold plaintext.
+
+The second one is the trap. Every path that creates a container writes the
+secrets out from the spec it is handed — an env-file, or a directory of files
+under `/run/secrets`. Handed the stored spec verbatim, those paths do exactly
+what they are told: containers come up holding `h:3f2a…` where the password
+should be, and file mode clears and rewrites the retained plaintext with the
+hashes on the way past, losing it. Only one shape escaped it — `mode = "env"`
+with no per-service scoping, where the retained env-file is passed through
+untouched, which is the default and is why it went unseen.
+
+So a replay reconstructs the spec rather than reusing it: values are read back
+from the env-file or from the union of that release's secrets directories, and
+a release missing any of them is refused by name. The union is not incidental —
+a manifest whose services all narrow their secrets has no unscoped directory at
+all, so looking for one reported such a release as pruned when nothing had been.
+
+The correction is made on a copy. The ledger entry is a pointer into the record
+about to be saved, and neither adjustment belongs in the permanent history.
+
 ## mtimes are load-bearing
 
 rsync's quick check compares size *and* modification time, and shunt's own

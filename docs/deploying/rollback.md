@@ -36,6 +36,23 @@ history
     20260727-224510  superseded   2026-07-27 22:45  (beyond retention — images pruned)
 ```
 
+## Where the restored secrets come from
+
+The ledger stores a salted hash of every secret, never the value — so the release
+description a rollback replays cannot start a container on its own. The values
+come back from the retained `0600` env-file, or in `mode = "file"` from that
+release's secrets directories, which is the only plaintext copy on the host.
+Per-service `secrets = [...]` scoping is preserved: each service is restored with
+the same narrowed set it was deployed with.
+
+That is the mechanism behind the retention rule above, and it fails by name
+rather than by starting something broken:
+
+```
+✗ the secrets for release 20260727-224510 are no longer on this host
+  (DATABASE_URL, STRIPE_KEY); roll back to a newer release, or redeploy that commit
+```
+
 ## Recovering from a partial failure
 
 A deploy that fails *after* replacing a container leaves the host running a mix
