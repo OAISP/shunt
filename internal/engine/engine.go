@@ -232,7 +232,7 @@ func (e *Engine) Spec(ctx context.Context, id string, built map[string]*build.Re
 		})
 	}
 
-	arts, err := e.artifacts()
+	arts, err := e.artifacts(id)
 	if err != nil {
 		return nil, err
 	}
@@ -257,13 +257,21 @@ func (e *Engine) Spec(ctx context.Context, id string, built map[string]*build.Re
 }
 
 // StagedPath is where an artifact is transferred to before being swapped into
-// place. Keeping it beside the destination guarantees the final rename is on the
-// same filesystem, and therefore atomic.
-func StagedPath(dest string) string { return dest + ".new" }
+// place.
+//
+// Beside the destination, so the final rename is on the same filesystem and
+// therefore atomic. Scoped by release id, so two deploys cannot land on each
+// other's half-transferred file — and so a fragment left by an abandoned deploy
+// can never be mistaken for this one's.
+//
+// The suffix does not cost anything at transfer time: rsync's --fuzzy still
+// finds the current copy next door as its delta basis, because the destination
+// name is still the staged name's longest common prefix.
+func StagedPath(dest, releaseID string) string { return dest + ".new." + releaseID }
 
 // artifacts resolves the manifest's artifact list, dropping any whose local file
 // is missing unless it is marked required.
-func (e *Engine) artifacts() ([]release.Artifact, error) {
+func (e *Engine) artifacts(releaseID string) ([]release.Artifact, error) {
 	out := make([]release.Artifact, 0, len(e.M.Artifacts))
 	for _, a := range e.M.Artifacts {
 		src := e.M.Abs(a.Src)
@@ -283,7 +291,7 @@ func (e *Engine) artifacts() ([]release.Artifact, error) {
 		out = append(out, release.Artifact{
 			Name:   a.Name,
 			Dest:   a.Dest,
-			Staged: StagedPath(a.Dest),
+			Staged: StagedPath(a.Dest, releaseID),
 			Magic:  a.Magic,
 			Retain: a.Retain,
 			Bytes:  fi.Size(),

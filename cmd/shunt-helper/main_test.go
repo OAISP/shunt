@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -191,6 +192,276 @@ func TestRetireKeepsOnlyTheCurrentContainer(t *testing.T) {
 // Every SQLite database starts with this string. A truncated or half-written
 // upload almost never does, and promoting one takes the app down with a database
 // it cannot open — the single most valuable check in the artifact path.
+// Retention used to derive its prefix from the *rendered* filename by cutting at
+// the last dash, which yielded a prefix unique to the file just written — so
+// `retain` matched one file, deleted nothing, and dumps grew until the disk did.
+func TestPruneCapturesKeepsNewestAcrossReleases(t *testing.T) {
+	dir := t.TempDir()
+	template := filepath.Join(dir, "pre-migrate-{{.Release}}.sql")
+
+	// Release ids carry their own dashes, which is what broke the old prefix.
+	for _, id := range []string{
+		"20260720-100000-aaa111", "20260721-100000-bbb222",
+		"20260722-100000-ccc333", "20260723-100000-ddd444",
+	} {
+		if err := os.WriteFile(expandCapture(template, id), []byte("dump"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// An unrelated capture from a different stage must survive untouched.
+	other := filepath.Join(dir, "backup-20260720-100000-aaa111.sql")
+	if err := os.WriteFile(other, []byte("dump"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	pruneCaptures(template, 2)
+
+	got := lsNames(t, dir)
+	want := []string{
+		"backup-20260720-100000-aaa111.sql",
+		"pre-migrate-20260722-100000-ccc333.sql",
+		"pre-migrate-20260723-100000-ddd444.sql",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("after prune = %v, want %v", got, want)
+	}
+}
+
+// A template with no placeholder names one fixed path that each release
+// overwrites. There are no generations to prune, and a prefix match would sweep
+// up every sibling file in the directory.
+func TestPruneCapturesIgnoresATemplateWithoutAPlaceholder(t *testing.T) {
+	dir := t.TempDir()
+	for _, n := range []string{"dump.sql", "dump.sql.old", "unrelated.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pruneCaptures(filepath.Join(dir, "dump.sql"), 1)
+	if got := lsNames(t, dir); len(got) != 3 {
+		t.Fatalf("prune touched files it should not have: %v", got)
+	}
+}
+
+// A pg_dump is every row of production. os.Create's 0644 left it readable by
+// every other user and container on the host.
+func TestCapturesAreWrittenPrivate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dump.sql")
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
+		t.Fatalf("capture mode = %04o, want no group/other access", perm)
+	}
+}
+
+func lsNames(t *testing.T, dir string) []string {
+	t.Helper()
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := make([]string, 0, len(ents))
+	for _, e := range ents {
+		out = append(out, e.Name())
+	}
+	slices.Sort(out)
+	return out
+}
+
+// artifactFixture writes a destination with `old` contents and a staged file
+// with `staged` contents, and returns the release.Artifact describing them.
+func artifactFixture(t *testing.T, dir, name, old, staged string) release.Artifact {
+	t.Helper()
+	dest := filepath.Join(dir, name+".db")
+	if old != "" {
+		if err := os.WriteFile(dest, []byte(old), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a := release.Artifact{
+		Name:   name,
+		Dest:   dest,
+		Staged: dest + ".new." + testRelease,
+		Bytes:  int64(len(staged)),
+		Retain: 1,
+	}
+	if err := os.WriteFile(a.Staged, []byte(staged), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return a
+}
+
+const testRelease = "20260727-120000-abc123"
+
+func readFile(t *testing.T, p string) string {
+	t.Helper()
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// unpromotable returns an artifact whose staged file is valid but whose
+// destination directory does not exist, so the final rename fails — after any
+// earlier artifact in the same release has already been swapped.
+func unpromotable(t *testing.T, dir, name string) release.Artifact {
+	t.Helper()
+	const contents = "NEW"
+	a := release.Artifact{
+		Name:   name,
+		Dest:   filepath.Join(dir, "no-such-dir", name+".db"),
+		Staged: filepath.Join(dir, name+".db.new."+testRelease),
+		Bytes:  int64(len(contents)),
+		Retain: 1,
+	}
+	if err := os.WriteFile(a.Staged, []byte(contents), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return a
+}
+
+// The core guarantee: if the second artifact cannot be promoted, the first must
+// not be left swapped. Otherwise "production is untouched" is false for data.
+func TestSwapArtifactsRestoresEarlierPromotionsOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	a := artifactFixture(t, dir, "first", "OLD-FIRST", "NEW-FIRST")
+	b := unpromotable(t, dir, "second")
+
+	spec := &release.Spec{ID: testRelease, Artifacts: []release.Artifact{a, b}}
+	err := swapArtifacts(spec)
+	if err == nil {
+		t.Fatal("swapArtifacts succeeded despite an unpromotable artifact")
+	}
+	if got := readFile(t, a.Dest); got != "OLD-FIRST" {
+		t.Fatalf("first artifact = %q, want it restored to %q", got, "OLD-FIRST")
+	}
+	if !strings.Contains(err.Error(), "restored") {
+		t.Fatalf("error does not mention the restore: %v", err)
+	}
+}
+
+// When a destination did not exist before this release, restoring it means
+// removing what was just written — not leaving a file the operator never had.
+func TestSwapArtifactsRemovesFirstTimeFilesOnRollback(t *testing.T) {
+	dir := t.TempDir()
+	a := artifactFixture(t, dir, "first", "", "NEW-FIRST") // no prior copy
+	b := unpromotable(t, dir, "second")
+
+	spec := &release.Spec{ID: testRelease, Artifacts: []release.Artifact{a, b}}
+	if err := swapArtifacts(spec); err == nil {
+		t.Fatal("swapArtifacts succeeded despite an unpromotable artifact")
+	}
+	if _, err := os.Stat(a.Dest); !os.IsNotExist(err) {
+		t.Fatalf("first artifact should have been removed on rollback, stat err = %v", err)
+	}
+}
+
+// Validation covers every artifact before any is promoted, so a bad third file
+// must leave the first two alone rather than swapping them and then failing.
+func TestSwapArtifactsValidatesAllBeforePromotingAny(t *testing.T) {
+	dir := t.TempDir()
+	a := artifactFixture(t, dir, "first", "OLD-FIRST", "NEW-FIRST")
+	b := artifactFixture(t, dir, "second", "OLD-SECOND", "NEW-SECOND")
+	c := artifactFixture(t, dir, "third", "OLD-THIRD", "NEW-THIRD")
+	c.Bytes = 9999 // as if the transfer had been cut short
+
+	spec := &release.Spec{ID: testRelease, Artifacts: []release.Artifact{a, b, c}}
+	if err := swapArtifacts(spec); err == nil {
+		t.Fatal("swapArtifacts accepted a truncated artifact")
+	}
+	for _, want := range []struct{ path, contents string }{
+		{a.Dest, "OLD-FIRST"}, {b.Dest, "OLD-SECOND"}, {c.Dest, "OLD-THIRD"},
+	} {
+		if got := readFile(t, want.path); got != want.contents {
+			t.Fatalf("%s = %q, want untouched %q", filepath.Base(want.path), got, want.contents)
+		}
+	}
+}
+
+// A truncated transfer must be kept, not deleted: --partial exists so the next
+// run resumes rather than re-sending hundreds of megabytes.
+func TestValidateStagedKeepsATruncatedTransferForResume(t *testing.T) {
+	dir := t.TempDir()
+	a := artifactFixture(t, dir, "data", "OLD", "PARTIAL")
+	a.Bytes = 500000
+
+	err := validateStaged(a)
+	if err == nil {
+		t.Fatal("validateStaged accepted a short file")
+	}
+	if !strings.Contains(err.Error(), "resume") {
+		t.Fatalf("error should point at resuming, got: %v", err)
+	}
+	if _, err := os.Stat(a.Staged); err != nil {
+		t.Fatalf("staged fragment was deleted, defeating --partial: %v", err)
+	}
+}
+
+// A magic mismatch is the wrong file rather than a partial one, so it is removed
+// — leaving it would give the next run's --fuzzy a bogus delta basis.
+func TestValidateStagedRemovesAFileOfTheWrongType(t *testing.T) {
+	dir := t.TempDir()
+	a := artifactFixture(t, dir, "data", "OLD", "not-a-database")
+	a.Magic = "SQLite format 3"
+
+	if err := validateStaged(a); err == nil {
+		t.Fatal("validateStaged accepted a file failing its magic check")
+	}
+	if _, err := os.Stat(a.Staged); !os.IsNotExist(err) {
+		t.Fatalf("staged file of the wrong type was kept, stat err = %v", err)
+	}
+}
+
+// The destination must never be absent, even momentarily: the backup is a hard
+// link, so the old contents are reachable from two names before the rename.
+func TestPromoteBacksUpByHardLink(t *testing.T) {
+	dir := t.TempDir()
+	a := artifactFixture(t, dir, "data", "OLD", "NEW")
+
+	spec := &release.Spec{ID: testRelease}
+	p, err := promote(spec, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, a.Dest); got != "NEW" {
+		t.Fatalf("dest = %q, want NEW", got)
+	}
+	if got := readFile(t, p.prev); got != "OLD" {
+		t.Fatalf("backup = %q, want OLD", got)
+	}
+}
+
+// Fragments from abandoned deploys must not accumulate beside the destination.
+func TestSwapArtifactsClearsStaleStagedFiles(t *testing.T) {
+	dir := t.TempDir()
+	a := artifactFixture(t, dir, "data", "OLD", "NEW")
+	stale := a.Dest + ".new.20260101-000000-old999"
+	legacy := a.Dest + ".new"
+	for _, p := range []string{stale, legacy} {
+		if err := os.WriteFile(p, []byte("fragment"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	spec := &release.Spec{ID: testRelease, Artifacts: []release.Artifact{a}}
+	if err := swapArtifacts(spec); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{stale, legacy} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Fatalf("stale fragment %s survived", filepath.Base(p))
+		}
+	}
+}
+
 func TestCheckMagic(t *testing.T) {
 	dir := t.TempDir()
 	good := filepath.Join(dir, "good.db")
