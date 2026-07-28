@@ -100,7 +100,7 @@ Requirements — **your machine:** docker (with buildx), rsync, ssh.
 **The server:** docker, rsync, `tar`, `curl`, and an ssh account that can reach
 the docker socket. Nothing else; shunt uploads its own helper. `tar` streams the
 image layout into `docker load`; `curl` runs url health checks. Both are present
-on essentially every distro image, but not on some minimal ones — `shunt doctor`
+on essentially every distro image, but not on some minimal ones — `shunt audit`
 checks for them, and so does every command that connects.
 
 rsync 3.2 or newer on **both** ends gets zstd transfer compression. Older
@@ -329,12 +329,17 @@ acting on it. Applying it is the explicit, destructive `shunt boot db`.
 | command | |
 |:--|:--|
 | `shunt init` | scaffold a `shunt.toml`, guessing the port from `EXPOSE` |
+| `shunt validate` | check the manifest offline — no ssh, no build |
+| `shunt audit` | check everything a deploy needs, and change nothing |
 | `shunt plan` | build, then diff the manifest against the host |
 | `shunt up` | apply — the full pipeline above |
 | `shunt status` | what's running, and the release history |
 | `shunt rollback [id]` | restore the previous, or a named, release |
 | `shunt boot <accessory>` | recreate a stateful accessory — destructive |
-| `shunt logs [service]` | tail container logs |
+| `shunt exec <service> -- <cmd>` | run a command in the running container |
+| `shunt run <service> -- <cmd>` | run a one-off command in a fresh container |
+| `shunt retire <service>` | stop a service you removed from the manifest |
+| `shunt logs [service]` | tail container logs, prefixed when there are several |
 | `shunt prune` | drop superseded images on the host |
 
 `--json` on any command gives machine-readable output; `-v` adds build output and

@@ -41,9 +41,13 @@ func init() {
 
 const usage = `usage:
   shunt init                 scaffold a shunt.toml for this project
+  shunt validate             check shunt.toml without touching the network
+  shunt audit                check everything a deploy needs, and change nothing
   shunt plan                 build, then show what a deploy would change
   shunt up                   build, ship, run stages, swap containers, health-check
   shunt status               what the host is running right now
+  shunt exec <service> ...   run a command in the running container
+  shunt run <service> ...    run a one-off command in a fresh container
   shunt rollback [release]   restore the previous (or a named) release
   shunt boot <accessory>     (re)create a stateful accessory — destructive
   shunt retire <service>     stop a service you removed from shunt.toml
@@ -68,10 +72,16 @@ var commands = map[string]func(context.Context, []string) error{
 	// forgets to return, which is exactly the bug this shape makes impossible.
 	"init": func(_ context.Context, args []string) error { return cmdInit(args, os.Stdout) },
 
+	// validate needs no host either, for the same reason as init.
+	"validate": cmdValidate,
+
+	"audit":    cmdAudit,
 	"plan":     cmdPlan,
 	"up":       cmdUp,
 	"deploy":   cmdUp, // alias
 	"status":   cmdStatus,
+	"exec":     cmdExec,
+	"run":      cmdRun,
 	"rollback": cmdRollback,
 	"boot":     cmdBoot,
 	"retire":   cmdRetire,

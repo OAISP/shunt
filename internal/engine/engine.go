@@ -600,6 +600,50 @@ func (e *Engine) Rollback(ctx context.Context, id string, r EventRenderer) error
 	return e.stream(ctx, nil, r, args...)
 }
 
+// Exec runs a command inside an existing container, wired to the local
+// terminal so an interactive shell or console works.
+func (e *Engine) Exec(ctx context.Context, container string, command []string) error {
+	argv := append([]string{"docker", "exec"}, execTTYFlags()...)
+	argv = append(argv, container)
+	argv = append(argv, command...)
+	return e.Client.Interactive(ctx, argv...)
+}
+
+// RunOneOff starts a throwaway container from a release's image, on the deploy
+// network and with that release's secrets, and removes it when it exits.
+//
+// The env-file is the release's own, which is the only plaintext copy of its
+// secrets on the host — so a console started this way sees exactly what the
+// running service sees, without secrets being re-sent or re-resolved.
+func (e *Engine) RunOneOff(ctx context.Context, releaseID, imageRef string, command []string) error {
+	envFile := filepath.Join(e.root, e.M.Project, "env", releaseID+".env")
+	argv := []string{"sh", "-c", oneOffScript()}
+	argv = append(argv, "--", e.M.Network, envFile, imageRef)
+	argv = append(argv, command...)
+	return e.Client.Interactive(ctx, argv...)
+}
+
+// oneOffScript exists because the env-file may have been pruned, and docker
+// refuses to start at all when --env-file names a missing path. Deciding that
+// on the host keeps it to a single round trip.
+func oneOffScript() string {
+	return `net="$1"; env="$2"; img="$3"; shift 3
+args="--rm -i"
+[ -t 0 ] && args="$args -t"
+[ -n "$net" ] && args="$args --network $net"
+[ -f "$env" ] && args="$args --env-file $env"
+exec docker run $args "$img" "$@"`
+}
+
+// execTTYFlags asks for a tty only when there is one to attach, so piping into
+// `shunt exec` still works.
+func execTTYFlags() []string {
+	if ui.IsTerminal(os.Stdin) {
+		return []string{"-it"}
+	}
+	return []string{"-i"}
+}
+
 func (e *Engine) Logs(ctx context.Context, service string, follow bool, tail string) error {
 	args := []string{e.helperPath, "logs", e.M.Project}
 	if service != "" {

@@ -18,6 +18,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/OAISP/shunt/internal/ui"
 )
 
 type Client struct {
@@ -139,6 +141,27 @@ func (c *Client) StartSession(ctx context.Context, argv ...string) (*exec.Cmd, i
 		return nil, nil, nil, err
 	}
 	return cmd, stdin, stdout, nil
+}
+
+// Interactive runs argv on the host with the local terminal attached,
+// allocating a remote tty when there is a local one.
+//
+// This is what makes `shunt exec app -- sh` behave like a shell rather than a
+// pipe: without -t the remote side has no tty, so readline, colour and Ctrl-C
+// all misbehave.
+func (c *Client) Interactive(ctx context.Context, argv ...string) error {
+	args := c.baseArgs()
+	if ui.IsTerminal(os.Stdin) {
+		args = append(args, "-t")
+	} else {
+		args = append(args, "-T")
+	}
+	args = append(args, c.Host, "--")
+	args = append(args, quoteAll(argv)...)
+
+	cmd := exec.CommandContext(ctx, "ssh", args...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	return cmd.Run()
 }
 
 // Upload copies a local file to the host with the given mode, via a single

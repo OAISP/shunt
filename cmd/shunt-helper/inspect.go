@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 
 	"github.com/OAISP/shunt/internal/release"
 )
@@ -51,24 +55,34 @@ func cmdStatus(args []string) error {
 	return json.NewEncoder(os.Stdout).Encode(map[string]any{"ledger": ledger, "containers": cs})
 }
 
+// cmdLogs tails every container of a project, or of one service.
+//
+// It used to run `docker logs` against whichever container docker listed first
+// and print it unlabelled — so a project with a web service and a worker showed
+// one of them, arbitrarily, with nothing to say which. During a blue/green
+// overlap it could equally well be the release being retired.
 func cmdLogs(args []string) error {
 	if len(args) < 1 {
 		return errors.New("usage: shunt-helper logs <project> [service] [--follow] [--tail N]")
 	}
 	project := args[0]
-	filter := "label=shunt.project=" + project
+
+	filters := []string{"--filter", "label=shunt.project=" + project}
 	if len(args) > 1 && !strings.HasPrefix(args[1], "-") {
-		filter = "label=shunt.service=" + args[1]
+		filters = append(filters, "--filter", "label=shunt.service="+args[1])
 	}
-	out, err := exec.Command("docker", "ps", "-q", "--filter", filter,
-		"--filter", "label=shunt.project="+project).Output()
+	psArgs := append([]string{"ps"}, filters...)
+	psArgs = append(psArgs, "--format", "{{.Names}}")
+	out, err := exec.Command("docker", psArgs...).Output()
 	if err != nil {
 		return err
 	}
-	ids := splitLines(string(out))
-	if len(ids) == 0 {
+	names := splitLines(string(out))
+	if len(names) == 0 {
 		return fmt.Errorf("no running containers for project %s", project)
 	}
+	sort.Strings(names) // stable order, so two runs are comparable
+
 	tail := "100"
 	follow := false
 	for i, a := range args {
@@ -79,15 +93,77 @@ func cmdLogs(args []string) error {
 			tail = args[i+1]
 		}
 	}
+
+	// One container needs no prefix; more than one does, or the output is an
+	// unattributable interleaving.
+	if len(names) == 1 {
+		return streamLogs(names[0], tail, follow, "")
+	}
+	if !follow {
+		for _, n := range names {
+			streamLogs(n, tail, false, n+" | ")
+		}
+		return nil
+	}
+
+	var wg sync.WaitGroup
+	for _, n := range names {
+		wg.Add(1)
+		go func(n string) {
+			defer wg.Done()
+			streamLogs(n, tail, true, n+" | ")
+		}(n)
+	}
+	wg.Wait()
+	return nil
+}
+
+// streamLogs pipes one container's logs out, optionally prefixed with its name.
+func streamLogs(container, tail string, follow bool, prefix string) error {
 	dargs := []string{"logs", "--tail", tail}
 	if follow {
 		dargs = append(dargs, "--follow")
 	}
-	dargs = append(dargs, ids[0])
+	dargs = append(dargs, container)
 	cmd := exec.Command("docker", dargs...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	if prefix == "" {
+		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+		return cmd.Run()
+	}
+	cmd.Stdout = &prefixWriter{w: os.Stdout, prefix: prefix}
+	cmd.Stderr = &prefixWriter{w: os.Stderr, prefix: prefix}
 	return cmd.Run()
+}
+
+// prefixWriter tags each line with its container name. Writes are serialised
+// globally so two containers logging at once cannot interleave mid-line.
+type prefixWriter struct {
+	w      io.Writer
+	prefix string
+	buf    []byte
+}
+
+var logMu sync.Mutex
+
+func (p *prefixWriter) Write(b []byte) (int, error) {
+	logMu.Lock()
+	defer logMu.Unlock()
+	p.buf = append(p.buf, b...)
+	for {
+		i := bytes.IndexByte(p.buf, '\n')
+		if i < 0 {
+			break
+		}
+		line := p.buf[:i+1]
+		p.buf = p.buf[i+1:]
+		if _, err := io.WriteString(p.w, p.prefix); err != nil {
+			return 0, err
+		}
+		if _, err := p.w.Write(line); err != nil {
+			return 0, err
+		}
+	}
+	return len(b), nil
 }
 
 func cmdPrune(args []string) error {
