@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -330,10 +331,9 @@ type Entry struct {
 	// without needing the manifest that produced it.
 	Spec *Spec `json:"spec,omitempty"`
 
-	// Provenance and the transfer cost are lifted out of the spec so `status`
-	// and the JSON contract can read them without unpacking a whole release.
+	// Provenance is lifted out of the spec so `status` and the JSON contract can
+	// read it without unpacking a whole release.
 	Provenance Provenance `json:"provenance,omitzero"`
-	Bytes      int64      `json:"bytes,omitempty"`
 }
 
 // HashSecret is the one-way form a secret value takes once it is written to the
@@ -350,6 +350,20 @@ func HashSecret(salt, v string) string {
 	m := hmac.New(sha256.New, []byte(salt))
 	m.Write([]byte(v))
 	return "h:" + hex.EncodeToString(m.Sum(nil))[:16]
+}
+
+// ScopeDigest names the subset of a release's secrets a service asked for.
+//
+// Both ends derive host paths from it — the helper to write a scoped env-file
+// or secrets directory, the CLI to point `shunt run` at the same one — so it
+// has to be one function. Two implementations that disagreed by a sort order
+// would send a console session to a directory that does not exist, and it would
+// simply start with no secrets rather than fail.
+func ScopeDigest(scope []string) string {
+	keys := append([]string(nil), scope...)
+	sort.Strings(keys)
+	sum := sha256.Sum256([]byte(strings.Join(keys, "\x00")))
+	return hex.EncodeToString(sum[:])[:8]
 }
 
 // NewSalt generates a project's secret-hash salt.

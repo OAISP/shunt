@@ -55,11 +55,7 @@ func (e *Engine) Connect(ctx context.Context) error {
 	}
 	e.facts = facts
 
-	out, err := e.Client.Run(ctx, "sh", "-c", `echo "${SHUNT_ROOT:-$HOME/.shunt}"`)
-	if err != nil {
-		return err
-	}
-	e.root = strings.TrimSpace(out)
+	e.root = strings.TrimSpace(facts.Root)
 	if e.root == "" || e.root == "/.shunt" {
 		return fmt.Errorf("could not resolve a home directory on %s; set SHUNT_ROOT there", e.M.Host)
 	}

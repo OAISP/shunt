@@ -113,6 +113,14 @@ func cmdUp(ctx context.Context, args []string) error {
 	// Another deploy may have landed while we waited for the lock, so the plan's
 	// premise is re-stated for the helper to check under its own lock.
 	b.spec.ExpectedCurrent = b.state.ExpectedCurrent()
+
+	// And checked here as well, because the helper only sees the spec after the
+	// transfer. Waiting behind another deploy and then uploading a whole image
+	// to be told the plan expired is minutes of wire time spent on a release
+	// that was never going to be applied; one round trip answers it first.
+	if err := confirmPremise(ctx, b); err != nil {
+		return err
+	}
 	b.engine.WithProvenance(b.spec, version)
 	b.spec.RollbackOnFailure = rollbackOnFail
 
@@ -139,6 +147,35 @@ func cmdUp(ctx context.Context, args []string) error {
 			round(time.Since(start)), round(b.buildTook), round(b.shipTook), round(time.Since(applyStart)))))
 	}
 	return nil
+}
+
+// confirmPremise rechecks, under the lock, that the release this plan was built
+// against is still the one serving.
+//
+// The helper makes the same check and is the authority — it holds the lock that
+// actually matters. This one exists only to make the failure cheap, and says
+// nothing when the host has not moved.
+func confirmPremise(ctx context.Context, b *buildOut) error {
+	now, err := b.engine.State(ctx)
+	if err != nil {
+		// Not a reason to refuse: the helper still checks, so the worst case is
+		// the slow failure this exists to avoid.
+		return nil
+	}
+	if got := now.ExpectedCurrent(); got != b.spec.ExpectedCurrent {
+		return fmt.Errorf("this plan was built when %s was serving, but %s is serving now — "+
+			"another deploy or rollback landed while this one waited for the lock\n"+
+			"  rerun `shunt up` to plan against the current state",
+			orNone(b.spec.ExpectedCurrent), orNone(got))
+	}
+	return nil
+}
+
+func orNone(id string) string {
+	if id == "" {
+		return "nothing"
+	}
+	return id
 }
 
 // round keeps sub-second phases legible instead of collapsing them all to 0s.

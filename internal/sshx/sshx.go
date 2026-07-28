@@ -195,6 +195,7 @@ func (c *Client) Upload(ctx context.Context, local, remote string, mode os.FileM
 // package. `tar` is still reported because a host that has it is worth knowing
 // about, but no longer required: the helper builds the load archive itself.
 const probeScript = `
+echo "root=${SHUNT_ROOT:-$HOME/.shunt}"
 echo "arch=$(uname -m)"
 echo "docker=$(docker version --format '{{.Server.Version}}' 2>&1 | head -1)"
 echo "rsync=$(rsync --version 2>/dev/null | head -1 | awk '{print $3}')"
@@ -224,6 +225,7 @@ func (c *Client) Probe(ctx context.Context) (Facts, error) {
 		return f, fmt.Errorf("unexpected probe output: %q", out)
 	}
 	f.Arch = kv["arch"]
+	f.Root = kv["root"]
 	f.DockerVersion = kv["docker"]
 	f.RsyncVersion = kv["rsync"]
 	f.HasRsync = f.RsyncVersion != ""
@@ -259,7 +261,14 @@ func (f Facts) Missing() []string {
 }
 
 type Facts struct {
-	Arch          string
+	Arch string
+
+	// Root is the resolved SHUNT_ROOT on the host — where the store, the ledger
+	// and the helper live. It comes back with the probe rather than as its own
+	// `echo`, because that was a whole ssh round trip before any command had
+	// started doing anything.
+	Root string
+
 	DockerVersion string
 
 	HasRsync     bool

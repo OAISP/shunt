@@ -10,13 +10,19 @@ import (
 	"github.com/OAISP/shunt/internal/release"
 )
 
-// healthCheck gates the release on every service reporting healthy. Proxied
-// services were already checked inline during the swap — re-probing them here
-// would just repeat work.
+// healthCheck gates the release on every service reporting healthy, skipping
+// the ones the swap already gated.
+//
+// Two kinds were checked inline: proxied services, which must be proven healthy
+// before the old container leaves rotation, and any service another one depends
+// on, which is checked before its dependents start. Re-probing those is not
+// merely redundant — a `grace` is a sleep, so a required service with a 30s
+// grace made the deploy wait a full minute for one container.
 func healthCheck(spec *release.Spec) error {
+	gated := dependedOn(spec)
 	var pending []string
 	for _, name := range spec.Order {
-		if svc, present := spec.Services[name]; present && !svc.Proxied() {
+		if svc, present := spec.Services[name]; present && !svc.Proxied() && !gated[name] {
 			pending = append(pending, name)
 		}
 	}

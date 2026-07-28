@@ -258,6 +258,54 @@ else
   ok "applying the same bundle twice is refused"
 fi
 
+# ---------------------------------------------------------------- secrets ----
+# Rollback replays the ledger's stored spec, whose secret values are hashes —
+# the ledger never holds plaintext. Every path that recreates a container
+# rewrites the secrets from the spec it is handed, so unless the real values are
+# read back off the host first, a rollback starts containers holding "h:3f2a…"
+# where the password should be, and in file mode overwrites the one good copy
+# with them on the way past. Nothing but a real deploy can catch that.
+step "secrets survive a rollback"
+TOKEN='s3cr3t=with=equals'
+printf 'APP_TOKEN=%s\n' "$TOKEN" > secrets.env
+chmod 600 secrets.env
+cp shunt.toml shunt.toml.bak
+cat >> shunt.toml <<'TOML'
+
+[secrets]
+provider = "file"
+path     = "secrets.env"
+mode     = "file"
+TOML
+# Both services narrow their scope, so the host writes only scoped directories
+# and no unscoped one — the shape a rollback used to report as pruned.
+python3 - <<'PY'
+import pathlib
+p = pathlib.Path("shunt.toml")
+s = p.read_text()
+s = s.replace("[services.app]\n", '[services.app]\nsecrets = ["APP_TOKEN"]\n')
+s = s.replace("[services.worker]\n", '[services.worker]\nsecrets = ["APP_TOKEN"]\n')
+p.write_text(s)
+PY
+
+secret_seen() { "$SHUNT" exec app -- cat /run/secrets/APP_TOKEN </dev/null 2>/dev/null; }
+
+echo "v6" > index.html
+"$SHUNT" up -y </dev/null >/dev/null
+R_SEC="$(current)"
+eq "the container reads its secret as a file" "$(secret_seen)" "$TOKEN"
+
+echo "v7" > index.html
+"$SHUNT" up -y </dev/null >/dev/null
+
+succeeds "rollback accepts a release whose services all scoped their secrets" \
+  "$SHUNT" rollback "$R_SEC" -y
+eq "the restored release serves its own content" "$(served)" "v6"
+eq "the restored container still holds the real secret" "$(secret_seen)" "$TOKEN"
+
+mv shunt.toml.bak shunt.toml
+rm -f secrets.env
+
 # ----------------------------------------------------------------- retire ----
 step "retire"
 python3 - <<'PY'

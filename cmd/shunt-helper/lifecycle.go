@@ -48,38 +48,24 @@ func cmdRollback(args []string) error {
 		}
 
 		info("rolling back to " + target.ID)
-		spec := *target.Spec
-		spec.ID = target.ID
-		// Images are already present; skip load and go straight to the swap.
-		for n, img := range spec.Images {
-			img.External = false
-			spec.Images[n] = img
-		}
-		// The retained 0600 env-file is the only plaintext copy of that release's
-		// secrets — the ledger holds hashes — so it cannot be reconstructed here.
-		// If retention already dropped it, say so instead of silently starting
-		// containers with no environment at all.
-		envFile := envFilePath(project, target.ID)
-		if spec.SecretsAsFiles() {
-			// File mode writes a directory per release; the containers are
-			// recreated from it, so it has to still be there.
-			if len(spec.Secrets) > 0 {
-				if _, err := os.Stat(secretsDir(project, target.ID, nil)); err != nil {
-					return fmt.Errorf("the secrets for release %s have been pruned; roll back to a newer release or redeploy that commit", target.ID)
-				}
-			}
-			envFile = ""
-		} else if len(spec.Secrets) > 0 {
-			if _, err := os.Stat(envFile); err != nil {
-				return fmt.Errorf("the env-file for release %s has been pruned; roll back to a newer release or redeploy that commit", target.ID)
-			}
-		} else if _, err := os.Stat(envFile); err != nil {
-			envFile = ""
-		}
-		if _, _, err := swapServices(&spec, previousSpec(ledger), envFile); err != nil {
+		spec, err := replaySpec(target)
+		if err != nil {
 			return err
 		}
-		if err := healthCheck(&spec); err != nil {
+		// The unscoped env-file is what a service that did not narrow its secrets
+		// is started with. A missing one is not fatal here: replaySpec has already
+		// established that every value this release needs is still on the host, and
+		// a release with no secrets never had a file to begin with.
+		envFile := ""
+		if !spec.SecretsAsFiles() {
+			if p := envFilePath(project, target.ID); fileExists(p) {
+				envFile = p
+			}
+		}
+		if _, _, err := swapServices(spec, previousSpec(ledger), envFile); err != nil {
+			return err
+		}
+		if err := healthCheck(spec); err != nil {
 			return err
 		}
 		for i := range ledger.Releases {
@@ -185,9 +171,15 @@ func cmdBoot(in io.Reader, args []string) error {
 				return fmt.Errorf("pull %s: %s", img.Ref, strings.TrimSpace(out))
 			}
 		}
-		envFile, err := writeEnvFile(&spec)
-		if err != nil {
-			return err
+		// Matching apply: in file mode the per-service directories are written as
+		// the container starts, so writing an env-file here would only leave an
+		// unread plaintext copy behind under a release id the ledger never records.
+		envFile := ""
+		if !spec.SecretsAsFiles() {
+			var err error
+			if envFile, err = writeEnvFile(&spec); err != nil {
+				return err
+			}
 		}
 		step("boot:"+name, "recreating "+containerName(spec.Project, name))
 		if err := startContainer(&spec, name, acc, envFile, "accessory"); err != nil {
@@ -203,6 +195,41 @@ func cmdBoot(in io.Reader, args []string) error {
 		ledger.RecordAccessory(name, acc)
 		return saveLedger(ledger)
 	})
+}
+
+// replaySpec turns a ledger entry back into a spec that can be re-applied.
+//
+// Two things have to be undone. The stored spec's images are marked external
+// only because that is how they were described at build time; they are already
+// on this host, so a replay skips the load and goes straight to the swap. And
+// its secret values are hashes — the ledger never holds plaintext — so they are
+// restored from the retained env-file or secrets directory, which is the one
+// copy on the host. Without that, every path that recreates a container would
+// faithfully rewrite the hashes: the containers would come up holding "h:3f2a…"
+// where the password should be, and in file mode the good copy would be
+// overwritten with them on the way past.
+//
+// The entry is copied rather than adjusted in place. It is a pointer into the
+// ledger about to be saved, and neither of those corrections belongs in the
+// permanent record.
+func replaySpec(entry *release.Entry) (*release.Spec, error) {
+	spec := *entry.Spec
+	spec.ID = entry.ID
+
+	spec.Images = make(map[string]release.ImageRef, len(entry.Spec.Images))
+	for n, img := range entry.Spec.Images {
+		img.External = false
+		spec.Images[n] = img
+	}
+	if err := recoverSecrets(&spec); err != nil {
+		return nil, err
+	}
+	return &spec, nil
+}
+
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
 }
 
 // autoRollback restores the previous release after a deploy has already
@@ -239,25 +266,22 @@ func autoRollback(spec *release.Spec, ledger *release.Ledger) error {
 	}
 
 	info("restoring " + target.ID)
-	prev := *target.Spec
-	prev.ID = target.ID
-	for n, img := range prev.Images {
-		img.External = false
-		prev.Images[n] = img
+	prev, err := replaySpec(target)
+	if err != nil {
+		return err
 	}
 	// That release's own env-file, not this one's: its containers expect the
 	// environment they were deployed with.
-	prevEnv := envFilePath(spec.Project, target.ID)
-	if _, err := os.Stat(prevEnv); err != nil {
-		if len(prev.Secrets) > 0 {
-			return fmt.Errorf("the env-file for %s has been pruned", target.ID)
+	prevEnv := ""
+	if !prev.SecretsAsFiles() {
+		if p := envFilePath(spec.Project, target.ID); fileExists(p) {
+			prevEnv = p
 		}
-		prevEnv = ""
 	}
-	if _, _, err := swapServices(&prev, spec, prevEnv); err != nil {
+	if _, _, err := swapServices(prev, spec, prevEnv); err != nil {
 		return err
 	}
-	if err := healthCheck(&prev); err != nil {
+	if err := healthCheck(prev); err != nil {
 		return err
 	}
 	for i := range ledger.Releases {

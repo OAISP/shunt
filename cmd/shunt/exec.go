@@ -98,7 +98,18 @@ func cmdRun(ctx context.Context, args []string) error {
 		return fmt.Errorf("release %s did not record an image named %q", cur.ID, image)
 	}
 
-	return e.RunOneOff(ctx, cur.ID, ref.Ref, command)
+	// The scope that release deployed with, not the one shunt.toml describes
+	// today: the secrets on the host were written for the former, and a manifest
+	// edited since would point at a file nothing ever wrote.
+	scope := svc.Secrets
+	if cur.Spec != nil {
+		if deployed, present := cur.Spec.Services[service]; present {
+			scope = deployed.Secrets
+		} else if deployed, present := cur.Spec.Accessories[service]; present {
+			scope = deployed.Secrets
+		}
+	}
+	return e.RunOneOff(ctx, cur.ID, ref.Ref, scope, command)
 }
 
 // resolveContainer finds the container currently serving a service.

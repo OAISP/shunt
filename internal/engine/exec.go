@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/OAISP/shunt/internal/release"
 	"github.com/OAISP/shunt/internal/ui"
 )
 
@@ -25,9 +26,19 @@ func (e *Engine) Exec(ctx context.Context, container string, command []string) e
 // The env-file is the release's own, which is the only plaintext copy of its
 // secrets on the host — so a console started this way sees exactly what the
 // running service sees, without secrets being re-sent or re-resolved.
-func (e *Engine) RunOneOff(ctx context.Context, releaseID, imageRef string, command []string) error {
-	envFile := filepath.Join(e.root, e.M.Project, "env", releaseID+".env")
-	secretsDir := filepath.Join(e.root, e.M.Project, "secrets", releaseID)
+//
+// scope is the service's own `secrets = [...]` narrowing, which decides which
+// of that release's files to point at. It has to be honoured: the host writes
+// one file per distinct scope, so a project whose services all narrow their
+// secrets has no unscoped copy at all, and a console aimed at it would start
+// with an empty environment rather than fail.
+func (e *Engine) RunOneOff(ctx context.Context, releaseID, imageRef string, scope, command []string) error {
+	name := releaseID
+	if len(scope) > 0 {
+		name = releaseID + "." + release.ScopeDigest(scope)
+	}
+	envFile := filepath.Join(e.root, e.M.Project, "env", name+".env")
+	secretsDir := filepath.Join(e.root, e.M.Project, "secrets", name)
 	argv := []string{"sh", "-c", oneOffScript()}
 	argv = append(argv, "--", e.M.Network, envFile, secretsDir, imageRef)
 	argv = append(argv, command...)

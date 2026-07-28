@@ -61,7 +61,7 @@ func shortSHA(sha string) string {
 	return sha
 }
 
-// WithProvenance stamps a spec with where it came from and what it cost.
+// WithProvenance stamps a spec with where it came from.
 func (e *Engine) WithProvenance(spec *release.Spec, cliVersion string) {
 	spec.Provenance = collectProvenance(e.M, cliVersion)
 }

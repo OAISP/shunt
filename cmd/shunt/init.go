@@ -49,8 +49,8 @@ func cmdInit(args []string, out io.Writer) error {
 #   shunt plan   see what would change
 #   shunt up     apply it
 
-project = "%s"
-host    = "%s"
+project = "%[1]s"
+host    = "%[2]s"
 
 [images.app]
 context    = "."
@@ -78,11 +78,11 @@ dockerfile = "Dockerfile"
 # [[artifacts]]
 # name = "index"
 # src  = "data/index.db"
-# dest = "/opt/PROJECT/data/index.db"
+# dest = "/opt/%[1]s/data/index.db"
 
 [services.app]
 image   = "app"
-publish = ["127.0.0.1:%d:%d"]
+publish = ["127.0.0.1:%[3]d:%[3]d"]
 restart = "unless-stopped"
 
 [services.app.health]
@@ -92,7 +92,7 @@ retries  = 10
 interval = "3s"
 # follow = true   # chase redirects and require a 2xx at the end
 `
-	content := fmt.Sprintf(tmpl, project, h, port, port)
+	content := fmt.Sprintf(tmpl, project, h, port)
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		return err
 	}

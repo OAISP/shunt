@@ -1,8 +1,6 @@
 package main
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"maps"
 	"os"
@@ -14,149 +12,8 @@ import (
 	"time"
 
 	"github.com/OAISP/shunt/internal/release"
-
 	"github.com/OAISP/shunt/internal/ui"
 )
-
-// writeEnvFileScoped materialises the release's secrets for a given scope,
-// 0600 and owned by the deploying user.
-//
-// scope names the subset a service asked for; empty means all of them. A
-// separate file per distinct scope is what keeps a worker from holding the
-// payment credentials merely because the web app needs them — docker copies
-// --env-file into the container config, so narrowing it at the file is the
-// only place the narrowing actually takes effect.
-func writeEnvFileScoped(spec *release.Spec, scope []string) (string, error) {
-	if len(scope) == 0 {
-		return writeEnvFile(spec)
-	}
-	sub := *spec
-	sub.Secrets = map[string]string{}
-	var missing []string
-	for _, k := range scope {
-		v, ok := spec.Secrets[k]
-		if !ok {
-			missing = append(missing, k)
-			continue
-		}
-		sub.Secrets[k] = v
-	}
-	if len(missing) > 0 {
-		return "", fmt.Errorf("secrets %s are not provided by this release", strings.Join(missing, ", "))
-	}
-	return writeEnvFileAt(&sub, envScopePath(spec.Project, spec.ID, scope))
-}
-
-// envScopePath names a scoped env-file after a digest of the keys it holds, so
-// two services asking for the same subset share one file and a third asking for
-// a different subset gets its own.
-func envScopePath(project, id string, scope []string) string {
-	keys := append([]string(nil), scope...)
-	sort.Strings(keys)
-	sum := sha256.Sum256([]byte(strings.Join(keys, "\x00")))
-	return filepath.Join(projectDir(project), "env", id+"."+hex.EncodeToString(sum[:])[:8]+".env")
-}
-
-func writeEnvFile(spec *release.Spec) (string, error) {
-	return writeEnvFileAt(spec, envFilePath(spec.Project, spec.ID))
-}
-
-// secretsDir is where a release's file-mode secrets live on the host.
-func secretsDir(project, id string, scope []string) string {
-	name := id
-	if len(scope) > 0 {
-		name = id + "." + scopeDigest(scope)
-	}
-	return filepath.Join(projectDir(project), "secrets", name)
-}
-
-func scopeDigest(scope []string) string {
-	keys := append([]string(nil), scope...)
-	sort.Strings(keys)
-	sum := sha256.Sum256([]byte(strings.Join(keys, "\x00")))
-	return hex.EncodeToString(sum[:])[:8]
-}
-
-// writeSecretFiles materialises secrets as one 0600 file per key in a 0700
-// directory, and returns the directory to mount.
-//
-// This is the alternative to --env-file. Docker copies an env-file into the
-// container's configuration, so those values come back out of `docker inspect`
-// and out of anything that captures it. A mount shows a path instead.
-//
-// It does not change who can read them: Docker socket access is root on the
-// host, and root can exec into the container or read the file directly. What it
-// removes is the copy that leaks by being printed.
-func writeSecretFiles(spec *release.Spec, scope []string) (string, error) {
-	values := spec.Secrets
-	if len(scope) > 0 {
-		values = map[string]string{}
-		var missing []string
-		for _, k := range scope {
-			v, ok := spec.Secrets[k]
-			if !ok {
-				missing = append(missing, k)
-				continue
-			}
-			values[k] = v
-		}
-		if len(missing) > 0 {
-			return "", fmt.Errorf("secrets %s are not provided by this release", strings.Join(missing, ", "))
-		}
-	}
-
-	dir := secretsDir(spec.Project, spec.ID, scope)
-	// Rewritten from scratch, so a key removed from the manifest does not linger
-	// as a file the app can still read.
-	if err := os.RemoveAll(dir); err != nil {
-		return "", err
-	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", err
-	}
-	for _, k := range sortedSecretKeys(values) {
-		// No trailing newline: a file secret is the value, and an app reading it
-		// whole should not have to strip anything.
-		if err := os.WriteFile(filepath.Join(dir, k), []byte(values[k]), 0o600); err != nil {
-			return "", err
-		}
-	}
-	return dir, nil
-}
-
-func sortedSecretKeys(m map[string]string) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
-}
-
-func writeEnvFileAt(spec *release.Spec, p string) (string, error) {
-	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
-		return "", err
-	}
-	var b strings.Builder
-	keys := make([]string, 0, len(spec.Secrets))
-	for k := range spec.Secrets {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		// docker --env-file takes the raw remainder of the line as the value and
-		// does no unquoting, so write values verbatim. A value containing a
-		// newline cannot be represented and is rejected rather than truncated.
-		if strings.ContainsAny(spec.Secrets[k], "\n\r") {
-			return "", fmt.Errorf("secret %s contains a newline, which --env-file cannot represent", k)
-		}
-		fmt.Fprintf(&b, "%s=%s\n", k, spec.Secrets[k])
-	}
-	if err := os.WriteFile(p, []byte(b.String()), 0o600); err != nil {
-		return "", err
-	}
-	return p, nil
-}
 
 func runStages(spec *release.Spec, envFile string) error {
 	for _, st := range spec.Stages {
@@ -174,7 +31,12 @@ func runStage(spec *release.Spec, st release.Stage, envFile string) error {
 	if err != nil {
 		return err
 	}
-	args := []string{"run", "--rm", "--network", spec.Network}
+	// Guarded the same way startContainer guards it: `--network ""` is not "no
+	// network" to docker, it is an error naming the empty string.
+	args := []string{"run", "--rm"}
+	if spec.Network != "" {
+		args = append(args, "--network", spec.Network)
+	}
 	if spec.SecretsAsFiles() {
 		if len(spec.Secrets) > 0 {
 			dir, err := writeSecretFiles(spec, nil)

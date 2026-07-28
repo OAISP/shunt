@@ -262,6 +262,43 @@ func TestSwapServicesDoesNotGateAServiceNothingRequires(t *testing.T) {
 	}
 }
 
+// The other half of that trade: a service the swap *did* gate must not be
+// probed a second time by the final gate. A `grace` is a sleep, so re-probing a
+// required service with a 30s grace cost the deploy a full extra minute waiting
+// on a container it had already proven healthy.
+func TestHealthCheckSkipsWhatTheSwapAlreadyGated(t *testing.T) {
+	f := newFake()
+	withFake(t, f)
+
+	probe := &release.Health{Command: []string{"pg_isready"}, Retries: 1, Interval: "1ms"}
+	spec := svcSpec(map[string]release.Service{
+		"db":  {Image: "app", Restart: "always", Health: probe},
+		"web": {Image: "app", Restart: "always", Requires: []string{"db"}, Health: probe},
+	}, "db", "web")
+
+	if _, _, err := swapServices(spec, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	during := len(f.calls)
+	if err := healthCheck(spec); err != nil {
+		t.Fatal(err)
+	}
+
+	// web is checked here for the first time; db was checked during the swap.
+	var reprobed int
+	for _, c := range f.calls[during:] {
+		if strings.Contains(c, "docker exec demo-db") {
+			reprobed++
+		}
+	}
+	if reprobed > 0 {
+		t.Fatalf("db was probed %d more time(s) after the swap had already gated it", reprobed)
+	}
+	if !f.did("docker exec demo-web") {
+		t.Fatal("web was never health-checked; the final gate must still cover it")
+	}
+}
+
 func TestDependedOnIgnoresAccessories(t *testing.T) {
 	spec := &release.Spec{
 		Services: map[string]release.Service{
