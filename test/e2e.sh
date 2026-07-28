@@ -57,6 +57,25 @@ neq() { # neq <description> <got> <unwanted>
   if [ "$2" != "$3" ]; then ok "$1"; else bad "$1 — got '$2', wanted anything else"; fi
 }
 
+# says <description> <pattern> <command...>
+#
+# Asserts on a command's stdout, and on nothing else. Deliberately not
+# `cmd | grep -q`: this script runs under `set -o pipefail`, which gives the
+# pipeline the command's exit status, and `shunt plan` exits 2 by design when it
+# finds changes. Piping therefore turned "the output says this" into "...and the
+# host had nothing else to apply" — a second, unrelated claim that silently
+# breaks as soon as an earlier test leaves the host and the manifest legitimately
+# out of step.
+says() {
+  local desc="$1" pattern="$2"; shift 2
+  local out
+  out="$("$@" </dev/null 2>/dev/null || true)"
+  case "$out" in
+    *"$pattern"*) ok "$desc" ;;
+    *) bad "$desc — nothing in the output mentioned '$pattern'" ;;
+  esac
+}
+
 # exits <description> <expected-code> <command...>
 exits() {
   local desc="$1" want="$2"; shift 2
@@ -315,11 +334,7 @@ s = p.read_text()
 s = s.split("[services.worker]")[0]
 p.write_text(s)
 PY
-if "$SHUNT" plan </dev/null 2>&1 | grep -q "orphaned"; then
-  ok "a dropped service is reported as orphaned"
-else
-  bad "a dropped service is reported as orphaned"
-fi
+says "a dropped service is reported as orphaned" "orphaned" "$SHUNT" plan
 "$SHUNT" retire worker -y </dev/null >/dev/null
 if ssh -o BatchMode=yes "$HOST" "docker ps -aq --filter name=$PROJECT-worker" | grep -q .; then
   bad "retire removed the orphan"

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -96,18 +97,50 @@ func writeSecretFiles(spec *release.Spec, scope []string) (string, error) {
 	}
 
 	dir := secretsDir(spec.Project, spec.ID, scope)
-	// Rewritten from scratch, so a key removed from the manifest does not linger
-	// as a file the app can still read.
-	if err := os.RemoveAll(dir); err != nil {
-		return "", err
-	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
+	// MkdirAll leaves an existing directory's mode alone, and this one is
+	// reachable by every container that mounts it.
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return "", err
+	}
+
+	// Updated in place rather than recreated. Every service sharing a scope
+	// shares this directory — and two services that both narrow to the same keys
+	// share it, as do any two that narrow to nothing at all, which is the
+	// default. Removing and recreating it unlinked the very inode an
+	// already-running container had bind-mounted, so the first service to start
+	// was left with an empty /run/secrets for the life of the release while the
+	// last one to start saw the files. Nothing failed: the container came up,
+	// passed its health check, and could not read its own credentials.
+	//
+	// Stale keys still have to go, which is what this loop is for: the property
+	// worth keeping is "a key removed from the manifest does not linger", not the
+	// unlink that used to deliver it.
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return "", err
+	}
+	for _, e := range ents {
+		if _, keep := values[e.Name()]; !keep {
+			if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
+				return "", err
+			}
+		}
+	}
+
 	for _, k := range sortedKeys(values) {
+		p := filepath.Join(dir, k)
 		// No trailing newline: a file secret is the value, and an app reading it
 		// whole should not have to strip anything.
-		if err := os.WriteFile(filepath.Join(dir, k), []byte(values[k]), 0o600); err != nil {
+		v := []byte(values[k])
+		// Skip an identical rewrite, so the second service to start does not
+		// truncate a file the first one's container may be reading right now.
+		if cur, err := os.ReadFile(p); err == nil && bytes.Equal(cur, v) {
+			continue
+		}
+		if err := os.WriteFile(p, v, 0o600); err != nil {
 			return "", err
 		}
 	}

@@ -1039,3 +1039,75 @@ func TestFullLoadFailureIsFatal(t *testing.T) {
 		t.Fatal("loadImages succeeded with no image loaded")
 	}
 }
+
+// Two services sharing a scope share a directory, and the second one to start
+// used to unlink the very inode the first one's container had already
+// bind-mounted — leaving that container with an empty /run/secrets for the life
+// of the release. It failed silently: the container came up, passed its health
+// check, and could not read its own credentials. Two unscoped services hit it
+// too, which is the default shape.
+func TestSecretDirSurvivesASecondServiceSharingItsScope(t *testing.T) {
+	t.Setenv("SHUNT_ROOT", t.TempDir())
+	spec := &release.Spec{
+		Project: "demo", ID: testRelease, SecretMode: "file",
+		Secrets: map[string]string{"APP_TOKEN": "s3cr3t=with=equals"},
+	}
+
+	dir, err := writeSecretFiles(spec, []string{"APP_TOKEN"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// What the first container's bind mount is pinned to.
+	mounted, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	again, err := writeSecretFiles(spec, []string{"APP_TOKEN"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again != dir {
+		t.Fatalf("the same scope resolved to %s then %s", dir, again)
+	}
+	now, err := os.Stat(again)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(mounted, now) {
+		t.Fatal("the secrets directory was recreated; every container already mounting it now sees an empty one")
+	}
+	if got := readFile(t, filepath.Join(dir, "APP_TOKEN")); got != "s3cr3t=with=equals" {
+		t.Fatalf("APP_TOKEN = %q after the second write", got)
+	}
+}
+
+// Removing the directory was how a dropped key stopped being readable. That
+// property has to survive updating in place.
+func TestSecretDirDropsKeysWithoutRecreatingItself(t *testing.T) {
+	t.Setenv("SHUNT_ROOT", t.TempDir())
+	spec := &release.Spec{
+		Project: "demo", ID: testRelease, SecretMode: "file",
+		Secrets: map[string]string{"OLD": "1", "KEEP": "2"},
+	}
+	dir, err := writeSecretFiles(spec, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mounted, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	spec.Secrets = map[string]string{"KEEP": "2"}
+	if _, err := writeSecretFiles(spec, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "OLD")); !os.IsNotExist(err) {
+		t.Fatal("a secret removed from the manifest survived as a readable file")
+	}
+	now, _ := os.Stat(dir)
+	if !os.SameFile(mounted, now) {
+		t.Fatal("dropping a key recreated the directory instead of removing the file")
+	}
+}
