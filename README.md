@@ -97,11 +97,11 @@ make install          # builds ./shunt with helpers embedded, installs to ~/.loc
 ```
 
 Requirements — **your machine:** docker (with buildx), rsync, ssh.
-**The server:** docker, rsync, `tar`, `curl`, and an ssh account that can reach
-the docker socket. Nothing else; shunt uploads its own helper. `tar` streams the
-image layout into `docker load`; `curl` runs url health checks. Both are present
-on essentially every distro image, but not on some minimal ones — `shunt audit`
-checks for them, and so does every command that connects.
+**The server:** docker, rsync, `curl`, and an ssh account that can reach the
+docker socket. Nothing else; shunt uploads its own helper. `curl` runs url
+health checks — it is present on essentially every distro image but not on some
+minimal ones, so `shunt audit` checks for it, and so does every command that
+connects.
 
 rsync 3.2 or newer on **both** ends gets zstd transfer compression. Older
 versions (Ubuntu 20.04 ships 3.1.3; macOS ships 2.6.9 as `/usr/bin/rsync`) still

@@ -572,7 +572,7 @@ func blobLayout(t *testing.T, contents ...string) string {
 func TestVerifyLayoutOnlyHashesBlobsItHasNotSeen(t *testing.T) {
 	dir := blobLayout(t, "layer-one", "layer-two")
 
-	if err := verifyLayout(dir); err != nil {
+	if _, err := verifyLayout(dir); err != nil {
 		t.Fatal(err)
 	}
 	first := loadVerified(dir)
@@ -581,7 +581,7 @@ func TestVerifyLayoutOnlyHashesBlobsItHasNotSeen(t *testing.T) {
 	}
 
 	// A second pass over an untouched layout must find everything already known.
-	if err := verifyLayout(dir); err != nil {
+	if _, err := verifyLayout(dir); err != nil {
 		t.Fatal(err)
 	}
 
@@ -603,14 +603,14 @@ func TestVerifyLayoutOnlyHashesBlobsItHasNotSeen(t *testing.T) {
 		t.Fatal(err)
 	}
 	os.Chtimes(victim, fi.ModTime(), fi.ModTime())
-	if err := verifyLayout(dir); err != nil {
+	if _, err := verifyLayout(dir); err != nil {
 		t.Fatalf("a same-size same-mtime rewrite is deliberately trusted: %v", err)
 	}
 
 	// Touch it the way rsync would, and the corruption must surface.
 	later := fi.ModTime().Add(time.Second)
 	os.Chtimes(victim, later, later)
-	if err := verifyLayout(dir); err == nil {
+	if _, err := verifyLayout(dir); err == nil {
 		t.Fatal("verifyLayout accepted a corrupt blob after its mtime moved")
 	}
 }
@@ -618,7 +618,7 @@ func TestVerifyLayoutOnlyHashesBlobsItHasNotSeen(t *testing.T) {
 // The cache can be turned off for anyone who would rather pay the full hash.
 func TestVerifyCacheCanBeDisabled(t *testing.T) {
 	dir := blobLayout(t, "layer-one")
-	if err := verifyLayout(dir); err != nil {
+	if _, err := verifyLayout(dir); err != nil {
 		t.Fatal(err)
 	}
 
@@ -632,7 +632,7 @@ func TestVerifyCacheCanBeDisabled(t *testing.T) {
 	os.Chtimes(victim, fi.ModTime(), fi.ModTime())
 
 	t.Setenv("SHUNT_NO_VERIFY_CACHE", "1")
-	if err := verifyLayout(dir); err == nil {
+	if _, err := verifyLayout(dir); err == nil {
 		t.Fatal("SHUNT_NO_VERIFY_CACHE=1 must rehash every blob and catch the corruption")
 	}
 }
@@ -641,7 +641,7 @@ func TestVerifyCacheCanBeDisabled(t *testing.T) {
 // not accumulate records for blobs that are long gone.
 func TestVerifiedSidecarDoesNotGrowUnbounded(t *testing.T) {
 	dir := blobLayout(t, "a", "b", "c")
-	if err := verifyLayout(dir); err != nil {
+	if _, err := verifyLayout(dir); err != nil {
 		t.Fatal(err)
 	}
 
@@ -649,7 +649,7 @@ func TestVerifiedSidecarDoesNotGrowUnbounded(t *testing.T) {
 	ents, _ := os.ReadDir(blobs)
 	os.Remove(filepath.Join(blobs, ents[0].Name()))
 
-	if err := verifyLayout(dir); err != nil {
+	if _, err := verifyLayout(dir); err != nil {
 		t.Fatal(err)
 	}
 	if got := len(loadVerified(dir)); got != 2 {
@@ -664,7 +664,7 @@ func TestVerifyLayoutCatchesCorruptionOnFirstSight(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(blobs, ents[0].Name()), []byte("tampered"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := verifyLayout(dir); err == nil {
+	if _, err := verifyLayout(dir); err == nil {
 		t.Fatal("verifyLayout accepted a blob that does not hash to its name")
 	}
 }

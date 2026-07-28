@@ -43,8 +43,20 @@ func stopAndRemove(container string, drain int) {
 	if !containerExists(container) {
 		return
 	}
+	start := time.Now()
 	docker.Ok("docker", "stop", "--timeout", fmt.Sprint(drain), container)
+	took := time.Since(start)
 	docker.Ok("docker", "rm", "-f", container)
+
+	// A container that burns the whole drain window did not exit on SIGTERM and
+	// was killed. That is the single largest cost in a typical deploy — far
+	// larger than loading the image — and it is invisible unless said out loud.
+	// It is also the app-side contract the zero-downtime section describes, so
+	// point at the fix rather than just reporting a number.
+	if drain > 0 && took >= time.Duration(drain)*time.Second {
+		info(fmt.Sprintf("%s ignored SIGTERM and was killed after %ds — handling it would cut that to near zero",
+			container, drain))
+	}
 }
 
 // containerIP resolves a container's address on the deploy network. It lets

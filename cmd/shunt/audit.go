@@ -119,12 +119,19 @@ func hostChecks(ctx context.Context, m *manifest.Manifest) []check {
 		{"host ssh", statusOK, "connected to " + m.Host, ""},
 		{"host docker", statusOK, f.DockerVersion + " on " + f.Arch, ""},
 		{"host rsync", statusOK, versionOr(f.RsyncVersion), ""},
-		{"host tar", statusOK, "present", ""},
 		{"host curl", statusOK, "present", ""},
 	}
-	// Connect fails outright when any of these are missing, so reaching here
+	// Connect fails outright when rsync or curl is missing, so reaching here
 	// means they are present; report them anyway so the list is a complete
 	// account rather than a list of things that happened to be checked.
+
+	// tar is not required — the helper writes the load archive itself — so its
+	// absence is worth noting and never a failure.
+	if f.HasTar {
+		out = append(out, check{"host tar", statusOK, "present (not required)", ""})
+	} else {
+		out = append(out, check{"host tar", statusOK, "absent — not needed; shunt builds the archive itself", ""})
+	}
 
 	if f.RsyncZstd {
 		out = append(out, check{"host rsync zstd", statusOK, "supported", ""})

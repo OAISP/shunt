@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/tar"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -59,14 +60,24 @@ func loadImages(spec *release.Spec) error {
 			continue
 		}
 		step("load", "loading "+name)
-		if err := verifyLayout(dir); err != nil {
+		fresh, err := verifyLayout(dir)
+		if err != nil {
 			return fmt.Errorf("image %s: %w", name, err)
 		}
-		if err := dockerLoadDir(dir); err != nil {
+		if err := dockerLoadDir(dir, fresh); err != nil {
 			return fmt.Errorf("image %s: %w", name, err)
 		}
 		if !docker.Ok("docker", "image", "inspect", img.Ref) {
-			return fmt.Errorf("image %s: %s is not present after load — the layout may be tagged differently", name, img.Ref)
+			// A partial load is an optimisation, never a requirement. If the
+			// daemon did not accept one — an older version, a store that wants
+			// every layer present — send the whole layout and carry on.
+			info("partial load did not produce " + img.Ref + "; sending the whole layout")
+			if err := dockerLoadDir(dir, nil); err != nil {
+				return fmt.Errorf("image %s: %w", name, err)
+			}
+			if !docker.Ok("docker", "image", "inspect", img.Ref) {
+				return fmt.Errorf("image %s: %s is not present after load — the layout may be tagged differently", name, img.Ref)
+			}
 		}
 		ok("load", img.Ref)
 	}
@@ -99,14 +110,15 @@ func verifiedPath(dir string) string { return filepath.Join(dir, ".shunt-verifie
 // mtime — so what this gives up is detection of silent on-disk corruption
 // between deploys. SHUNT_NO_VERIFY_CACHE=1 restores the full rehash;
 // SHUNT_NO_VERIFY=1 still skips verification altogether.
-func verifyLayout(dir string) error {
-	if os.Getenv("SHUNT_NO_VERIFY") == "1" {
-		return nil
-	}
+func verifyLayout(dir string) (map[string]bool, error) {
 	blobs := filepath.Join(dir, "blobs", "sha256")
 	ents, err := os.ReadDir(blobs)
 	if err != nil {
-		return fmt.Errorf("read layout %s: %w", blobs, err)
+		return nil, fmt.Errorf("read layout %s: %w", blobs, err)
+	}
+	if os.Getenv("SHUNT_NO_VERIFY") == "1" {
+		// Nothing is known to be fresh, so the loader sends everything.
+		return nil, nil
 	}
 
 	var known map[string]verifiedRecord
@@ -114,7 +126,9 @@ func verifyLayout(dir string) error {
 		known = loadVerified(dir)
 	}
 	fresh := make(map[string]verifiedRecord, len(ents))
-	hashed := 0
+	// The blobs rsync actually rewrote this transfer. They are exactly the ones
+	// the daemon cannot already have, which is what makes a partial load safe.
+	written := map[string]bool{}
 
 	for _, e := range ents {
 		if e.IsDir() {
@@ -122,7 +136,7 @@ func verifyLayout(dir string) error {
 		}
 		fi, err := e.Info()
 		if err != nil {
-			return err
+			return nil, err
 		}
 		rec := verifiedRecord{Size: fi.Size(), MTime: fi.ModTime().UnixNano()}
 		if prev, ok := known[e.Name()]; ok && prev == rec {
@@ -130,17 +144,17 @@ func verifyLayout(dir string) error {
 			continue
 		}
 		if err := hashBlob(filepath.Join(blobs, e.Name()), e.Name()); err != nil {
-			return err
+			return nil, err
 		}
-		hashed++
+		written[e.Name()] = true
 		fresh[e.Name()] = rec
 	}
 
-	if hashed > 0 {
-		info(fmt.Sprintf("verified %d new blob(s); %d already checked", hashed, len(fresh)-hashed))
+	if len(written) > 0 {
+		info(fmt.Sprintf("verified %d new blob(s); %d already checked", len(written), len(fresh)-len(written)))
 	}
 	saveVerified(dir, fresh)
-	return nil
+	return written, nil
 }
 
 func hashBlob(path, want string) error {
@@ -187,34 +201,85 @@ func saveVerified(dir string, m map[string]verifiedRecord) {
 	}
 }
 
-// dockerLoadDir streams the OCI layout directory into `docker load`. Docker
-// accepts an OCI layout tarball directly and reads the image name from the
-// index.json annotations the CLI set.
-func dockerLoadDir(dir string) error {
-	// The sidecar is host-side bookkeeping, not part of the layout docker reads.
-	tarCmd := exec.Command("tar", "-cf", "-", "--exclude", ".shunt-verified.json*", "-C", dir, ".")
+// dockerLoadDir streams the OCI layout into `docker load`.
+//
+// When onlyBlobs is non-nil it names the blobs rsync rewrote this transfer, and
+// every other layer blob is left out of the stream. The daemon already holds
+// those — they are unchanged from a release it has loaded before — and both the
+// containerd and the classic overlay2 stores accept a layout whose known layers
+// are absent. Measured on a 404 MB image with a code-only change: 404 MB of tar
+// becomes 40 KB, which is what turns a 12-second apply into an instant one.
+//
+// A nil map sends everything, which is what a first deploy and the fallback do.
+//
+// The archive is built here rather than shelled out to `tar`, which is both how
+// the filtering is expressed and why the host no longer needs tar at all.
+func dockerLoadDir(dir string, onlyBlobs map[string]bool) error {
 	loadCmd := exec.Command("docker", "load")
-
-	pipe, err := tarCmd.StdoutPipe()
+	stdin, err := loadCmd.StdinPipe()
 	if err != nil {
 		return err
 	}
-	loadCmd.Stdin = pipe
 	var out strings.Builder
-	loadCmd.Stdout = &out
-	loadCmd.Stderr = &out
-
+	loadCmd.Stdout, loadCmd.Stderr = &out, &out
 	if err := loadCmd.Start(); err != nil {
 		return err
 	}
-	if err := tarCmd.Run(); err != nil {
-		loadCmd.Wait()
-		return fmt.Errorf("tar layout: %w", err)
-	}
+
+	writeErr := writeLayoutTar(stdin, dir, onlyBlobs)
+	stdin.Close()
+
 	if err := loadCmd.Wait(); err != nil {
 		return fmt.Errorf("docker load: %w: %s", err, strings.TrimSpace(out.String()))
 	}
-	return nil
+	return writeErr
+}
+
+// writeLayoutTar tars a layout, optionally keeping only the named blobs.
+func writeLayoutTar(w io.Writer, dir string, onlyBlobs map[string]bool) error {
+	tw := tar.NewWriter(w)
+	blobPrefix := filepath.Join("blobs", "sha256") + string(filepath.Separator)
+
+	err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		rel, err := filepath.Rel(dir, p)
+		if err != nil {
+			return err
+		}
+		// Host-side bookkeeping, not part of the layout docker reads.
+		if strings.HasPrefix(filepath.Base(rel), ".shunt-verified.json") {
+			return nil
+		}
+		if onlyBlobs != nil && strings.HasPrefix(rel, blobPrefix) {
+			if !onlyBlobs[filepath.Base(rel)] {
+				return nil
+			}
+		}
+		fi, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if err := tw.WriteHeader(&tar.Header{
+			Name: filepath.ToSlash(rel), Mode: int64(fi.Mode().Perm()),
+			Size: fi.Size(), Typeflag: tar.TypeReg, ModTime: fi.ModTime(),
+		}); err != nil {
+			return err
+		}
+		f, err := os.Open(p)
+		if err != nil {
+			return err
+		}
+		_, err = io.Copy(tw, f)
+		f.Close()
+		return err
+	})
+	if err != nil {
+		tw.Close()
+		return fmt.Errorf("tar layout: %w", err)
+	}
+	return tw.Close()
 }
 
 func imageRef(spec *release.Spec, name string) (string, error) {

@@ -189,11 +189,11 @@ func (c *Client) Upload(ctx context.Context, local, remote string, mode os.FileM
 // trip, as key=value lines so a missing field cannot shift the meaning of the
 // others the way positional output can.
 //
-// It covers the tools shunt shells out to on the host — not just the obvious
-// ones. `tar` streams the image layout into `docker load` and `curl` runs url
-// health checks; when either was missing the deploy got all the way past the
-// container swap before failing, which is the worst possible moment to discover
-// a missing package.
+// It covers the tools shunt shells out to on the host. `curl` runs url health
+// checks, and when it was missing the deploy got all the way past the container
+// swap before failing — the worst possible moment to discover a missing
+// package. `tar` is still reported because a host that has it is worth knowing
+// about, but no longer required: the helper builds the load archive itself.
 const probeScript = `
 echo "arch=$(uname -m)"
 echo "docker=$(docker version --format '{{.Server.Version}}' 2>&1 | head -1)"
@@ -252,9 +252,6 @@ func (f Facts) Missing() []string {
 	if !f.HasRsync {
 		missing = append(missing, "rsync")
 	}
-	if !f.HasTar {
-		missing = append(missing, "tar")
-	}
 	if !f.HasCurl {
 		missing = append(missing, "curl")
 	}
@@ -273,7 +270,11 @@ type Facts struct {
 	RsyncZstd bool
 
 	HasCurl bool // url health checks shell out to it on the host
-	HasTar  bool // the image layout is streamed into `docker load` through it
+
+	// HasTar is informational. The helper writes the load archive itself, so a
+	// host without tar deploys fine; it is reported only because its absence
+	// usually means a very minimal image worth knowing about.
+	HasTar bool
 
 	// FreeBytes is free space where the store and ledger live. Running out
 	// mid-transfer leaves a partial layout and a confusing error.
