@@ -301,6 +301,10 @@ func quoteAll(argv []string) []string {
 	return out
 }
 
+// Quote makes a value safe for the remote shell that ssh always spawns. Callers
+// building a `sh -c` script for the host use it directly.
+func Quote(s string) string { return shellQuote(s) }
+
 // shellQuote single-quotes a value for the remote shell that ssh always spawns.
 func shellQuote(s string) string {
 	if s == "" {

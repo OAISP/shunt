@@ -77,7 +77,7 @@ func validateStaged(a release.Artifact) error {
 		// A tree has no single size, so compare the same summary the CLI computed:
 		// total bytes across the tree. A truncated transfer shows up as a smaller
 		// total, which is the failure worth catching.
-		bytes, files := treeSize(a.Staged)
+		bytes, files, _ := release.TreeSummary(a.Staged)
 		if files == 0 {
 			return fmt.Errorf("staged directory %s is empty — refusing to swap it in", a.Staged)
 		}
@@ -119,21 +119,6 @@ func kindOf(dir bool) string {
 	return "a file"
 }
 
-// treeSize totals a directory's file sizes and counts them.
-func treeSize(root string) (bytes int64, files int) {
-	filepath.WalkDir(root, func(_ string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return nil
-		}
-		if fi, err := d.Info(); err == nil {
-			bytes += fi.Size()
-			files++
-		}
-		return nil
-	})
-	return bytes, files
-}
-
 // promotion records what one swap did, so it can be undone if a later one fails.
 type promotion struct {
 	dest  string
@@ -160,7 +145,7 @@ func promote(spec *release.Spec, a release.Artifact) (promotion, error) {
 	}
 	p.bytes = fi.Size()
 	if a.Dir {
-		p.bytes, _ = treeSize(a.Staged)
+		p.bytes, _, _ = release.TreeSummary(a.Staged)
 	}
 
 	if _, err := os.Stat(a.Dest); err == nil {

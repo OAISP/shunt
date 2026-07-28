@@ -155,10 +155,9 @@ func probeBase(spec *release.Spec, container string, svc release.Service) (strin
 // from the first publish mapping, which takes the forms "port",
 // "host:container" or "ip:host:container".
 //
-// The bind address matters and used to be discarded. A service published as
-// "10.0.0.5:9090:3000" is not listening on 127.0.0.1, so probing there failed
-// the health check after the container had already been swapped in — a healthy
-// release reported broken because shunt looked in the wrong place.
+// The bind address matters: a service published as "10.0.0.5:9090:3000" is not
+// listening on 127.0.0.1, and probing the wrong address fails the health check
+// after the container has already been swapped in.
 func publishedHostPort(svc release.Service) (host, port string, ok bool) {
 	for _, p := range svc.Publish {
 		// Strip any /tcp or /udp suffix before splitting.

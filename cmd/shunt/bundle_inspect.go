@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/OAISP/shunt/internal/bundle"
@@ -63,7 +65,7 @@ func cmdBundleInspect(_ context.Context, args []string) error {
 	}
 
 	fmt.Printf("\n  %s\n", s.Bold("images"))
-	for _, name := range sortedKeys(spec.Images) {
+	for _, name := range slices.Sorted(maps.Keys(spec.Images)) {
 		img := spec.Images[name]
 		if img.External {
 			fmt.Printf("    %-14s %s\n", name, s.Dim("pulled on the host · "+img.Ref))
@@ -74,7 +76,7 @@ func cmdBundleInspect(_ context.Context, args []string) error {
 
 	if len(spec.Accessories) > 0 {
 		fmt.Printf("\n  %s %s\n", s.Bold("accessories"), s.Dim("(created only if absent)"))
-		for _, name := range sortedKeys(spec.Accessories) {
+		for _, name := range slices.Sorted(maps.Keys(spec.Accessories)) {
 			fmt.Printf("    %-14s %s\n", name, s.Dim(spec.Accessories[name].Image))
 		}
 	}
@@ -100,7 +102,7 @@ func cmdBundleInspect(_ context.Context, args []string) error {
 	}
 
 	fmt.Printf("\n  %s\n", s.Bold("services"))
-	for _, name := range sortedKeys(spec.Services) {
+	for _, name := range slices.Sorted(maps.Keys(spec.Services)) {
 		svc := spec.Services[name]
 		fmt.Printf("    %-14s %s\n", name, s.Dim(serviceSummary(svc)))
 	}

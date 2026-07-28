@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -68,7 +69,7 @@ func cmdBundle(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	for _, name := range sortedNames(built) {
+	for _, name := range slices.Sorted(maps.Keys(built)) {
 		fmt.Fprintf(os.Stderr, "  %s %s %s (%s)\n", s.Tick(), name,
 			ui.ShortDigest(built[name].Digest), ui.Bytes(built[name].Bytes))
 	}
@@ -229,7 +230,7 @@ func cmdApply(ctx context.Context, args []string) error {
 	built := map[string]*build.Result{}
 	for name, dir := range b.ImageDirs {
 		if ref, ok := spec.Images[name]; ok && !ref.External {
-			built[name] = &build.Result{Name: name, Dir: dir, Digest: ref.Digest, Bytes: dirBytes(dir)}
+			built[name] = &build.Result{Name: name, Dir: dir, Digest: ref.Digest, Bytes: build.DirSize(dir)}
 		}
 	}
 	e.SetArtifactSources(b.ArtifactPaths)
@@ -329,37 +330,4 @@ func missingKeys(want []string, have map[string]string) []string {
 		}
 	}
 	return missing
-}
-
-func sortedNames(built map[string]*build.Result) []string {
-	out := make([]string, 0, len(built))
-	for k := range built {
-		out = append(out, k)
-	}
-	slices.Sort(out)
-	return out
-}
-
-// sortedKeys orders any name-keyed map, so listings are stable between runs.
-func sortedKeys[T any](m map[string]T) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	slices.Sort(out)
-	return out
-}
-
-func dirBytes(dir string) int64 {
-	var n int64
-	filepath.WalkDir(dir, func(_ string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return nil
-		}
-		if fi, err := d.Info(); err == nil {
-			n += fi.Size()
-		}
-		return nil
-	})
-	return n
 }

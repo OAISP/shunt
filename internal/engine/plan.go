@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -10,7 +11,9 @@ import (
 	"strings"
 
 	"github.com/OAISP/shunt/internal/build"
+	"github.com/OAISP/shunt/internal/oci"
 	"github.com/OAISP/shunt/internal/release"
+	"github.com/OAISP/shunt/internal/sshx"
 	"github.com/OAISP/shunt/internal/transport"
 )
 
@@ -81,46 +84,6 @@ type ServiceChange struct {
 type StageChange struct {
 	Name   string `json:"name"`
 	Action string `json:"action"` // run | create | update | remove
-}
-
-// diffStages compares the stage pipeline against the one last deployed.
-//
-// Stages have to participate in change detection or adding a migration to the
-// manifest is a silent no-op: nothing else moved, so `shunt up` reported
-// "nothing to do" and the migration never ran.
-func diffStages(old, nw *release.Spec) []StageChange {
-	prev := map[string]release.Stage{}
-	if old != nil {
-		for _, st := range old.Stages {
-			prev[st.Name] = st
-		}
-	}
-	seen := map[string]bool{}
-	out := make([]StageChange, 0, len(nw.Stages))
-	for _, st := range nw.Stages {
-		seen[st.Name] = true
-		sc := StageChange{Name: st.Name, Action: "create"}
-		if was, ok := prev[st.Name]; ok {
-			sc.Action = "run"
-			if !reflect.DeepEqual(was, st) {
-				sc.Action = "update"
-			}
-		} else if old == nil {
-			// Nothing to compare against on a first deploy; every stage simply runs.
-			sc.Action = "run"
-		}
-		out = append(out, sc)
-	}
-	// A stage dropped from the manifest will not run again, which is a change
-	// worth showing even though there is nothing on the host to clean up.
-	if old != nil {
-		for _, st := range old.Stages {
-			if !seen[st.Name] {
-				out = append(out, StageChange{Name: st.Name, Action: "remove"})
-			}
-		}
-	}
-	return out
 }
 
 type SecretChange struct {
@@ -234,7 +197,7 @@ func (e *Engine) BuildPlan(ctx context.Context, spec *release.Spec, built map[st
 		p.Current = state.Ledger.Find(state.Ledger.Current)
 	}
 
-	for _, name := range sortedKeys(spec.Images) {
+	for _, name := range slices.Sorted(maps.Keys(spec.Images)) {
 		img := spec.Images[name]
 		if img.External {
 			p.Images = append(p.Images, ImageChange{Name: name, Action: "pull", External: true})
@@ -259,7 +222,7 @@ func (e *Engine) BuildPlan(ctx context.Context, spec *release.Spec, built map[st
 		oldSpec = p.Current.Spec
 	}
 
-	for _, name := range sortedKeys(spec.Services) {
+	for _, name := range slices.Sorted(maps.Keys(spec.Services)) {
 		svc := spec.Services[name]
 		sc := ServiceChange{
 			Name: name, Action: "create",
@@ -300,7 +263,7 @@ func (e *Engine) BuildPlan(ctx context.Context, spec *release.Spec, built map[st
 		p.Services = append(p.Services, sc)
 	}
 	if oldSpec != nil {
-		for _, name := range sortedKeys(oldSpec.Services) {
+		for _, name := range slices.Sorted(maps.Keys(oldSpec.Services)) {
 			if _, ok := spec.Services[name]; !ok {
 				p.Services = append(p.Services, orphanChange(state, name))
 			}
@@ -351,75 +314,6 @@ func (e *Engine) BuildPlan(ctx context.Context, spec *release.Spec, built map[st
 	return p, nil
 }
 
-// reconcileService compares the manifest against the containers actually on the
-// host, and explains any difference.
-//
-// A plan built purely from the ledger describes what shunt last did, not what
-// the host is doing. Delete a container by hand, stop one, or replace it with a
-// `docker run` of your own, and the plan happily reported "host already matches
-// this manifest" while the service was down.
-func reconcileService(state *RemoteState, name string, svc release.Service) []string {
-	if state == nil {
-		return nil
-	}
-	found := state.ServiceContainers(name)
-	if len(found) == 0 {
-		// Nothing deployed yet is not drift; the service diff already calls that
-		// a create.
-		if state.Ledger == nil || state.Ledger.Current == "" {
-			return nil
-		}
-		return []string{"no container on the host — it was removed outside shunt"}
-	}
-
-	want := release.HashService(svc)
-	for _, c := range found {
-		// An empty config label means the container predates this check. Treat it
-		// as satisfied rather than reporting drift on every pre-existing host.
-		if c.Running() && (c.Config == "" || c.Config == want) {
-			return nil
-		}
-	}
-
-	c := found[0]
-	switch {
-	case !c.Running():
-		return []string{fmt.Sprintf("container %s is %s, not running", c.Name, orUnknown(c.State))}
-	default:
-		return []string{fmt.Sprintf("container %s is running a different configuration than shunt.toml describes", c.Name)}
-	}
-}
-
-func orUnknown(s string) string {
-	if s == "" {
-		return "in an unknown state"
-	}
-	return s
-}
-
-// orphanChange describes a service the manifest dropped but the host may still
-// be running.
-//
-// Deliberately not counted as work: shunt will not stop a container it was not
-// asked to stop, so treating it as actionable left the plan permanently dirty
-// with a change no `shunt up` would ever make. `shunt retire` is the explicit
-// way to act on it.
-func orphanChange(state *RemoteState, name string) ServiceChange {
-	sc := ServiceChange{Name: name, Action: "orphaned"}
-	running := 0
-	for _, c := range state.ServiceContainers(name) {
-		if c.Running() {
-			running++
-		}
-	}
-	if running > 0 {
-		sc.Reasons = []string{fmt.Sprintf("no longer in shunt.toml, but %d container(s) still running — `shunt retire %s` stops them", running, name)}
-	} else {
-		sc.Reasons = []string{"no longer in shunt.toml; nothing is running for it"}
-	}
-	return sc
-}
-
 // planAccessories diffs the manifest's accessories against what the host
 // recorded as applied.
 //
@@ -438,7 +332,7 @@ func (e *Engine) planAccessories(p *Plan, spec *release.Spec, state *RemoteState
 	}
 
 	out := make([]ServiceChange, 0, len(spec.Accessories))
-	for _, name := range sortedKeys(spec.Accessories) {
+	for _, name := range slices.Sorted(maps.Keys(spec.Accessories)) {
 		acc := spec.Accessories[name]
 		ac := ServiceChange{Name: name, Action: "create"}
 		const hint = "not applied by `shunt up` — run `shunt boot "
@@ -466,138 +360,6 @@ func (e *Engine) planAccessories(p *Plan, spec *release.Spec, state *RemoteState
 	return out
 }
 
-// driftReasons explains an accessory drift in field-level terms when the last
-// recorded spec makes that possible. The hash proves *that* it drifted; this is
-// only there to say how, so a bare "drifted" is still correct without it.
-func driftReasons(oldSpec *release.Spec, name string, acc release.Service) []string {
-	if oldSpec == nil {
-		return nil
-	}
-	old, present := oldSpec.Accessories[name]
-	if !present {
-		return nil
-	}
-	return diffService(old, acc)
-}
-
-func imgChanged(imgs []ImageChange, name string) bool {
-	for _, i := range imgs {
-		if i.Name == name {
-			return i.Action == "update" || i.Action == "create"
-		}
-	}
-	return false
-}
-
-func diffService(old, nw release.Service) []string {
-	var r []string
-	if old.Image != nw.Image {
-		r = append(r, fmt.Sprintf("image %s → %s", old.Image, nw.Image))
-	}
-	if !reflect.DeepEqual(old.Command, nw.Command) {
-		r = append(r, "command changed")
-	}
-	if !reflect.DeepEqual(old.Publish, nw.Publish) {
-		r = append(r, fmt.Sprintf("publish %v → %v", old.Publish, nw.Publish))
-	}
-	if !reflect.DeepEqual(old.Volumes, nw.Volumes) {
-		r = append(r, "volumes changed")
-	}
-	if old.Expose != nw.Expose {
-		r = append(r, fmt.Sprintf("expose %d → %d", old.Expose, nw.Expose))
-	}
-	if old.Drain != nw.Drain {
-		r = append(r, fmt.Sprintf("drain %s → %s", old.Drain, nw.Drain))
-	}
-	if !reflect.DeepEqual(old.Proxy, nw.Proxy) {
-		switch {
-		case old.Proxy == nil:
-			r = append(r, "proxy added — this service becomes zero-downtime")
-		case nw.Proxy == nil:
-			r = append(r, "proxy removed — this service goes back to restart-in-place")
-		default:
-			r = append(r, fmt.Sprintf("proxy %s %s → %s %s",
-				old.Proxy.Kind, old.Proxy.Host, nw.Proxy.Kind, nw.Proxy.Host))
-		}
-	}
-	if old.Restart != nw.Restart {
-		r = append(r, fmt.Sprintf("restart %s → %s", old.Restart, nw.Restart))
-	}
-	for _, k := range mapKeys(old.Env, nw.Env) {
-		ov, oo := old.Env[k]
-		nv, no := nw.Env[k]
-		switch {
-		case oo && !no:
-			r = append(r, "- env "+k)
-		case !oo && no:
-			r = append(r, "+ env "+k+"="+nv)
-		case ov != nv:
-			r = append(r, fmt.Sprintf("~ env %s=%s → %s", k, ov, nv))
-		}
-	}
-	return r
-}
-
-// diffRelease reports settings that apply to the whole release rather than to
-// any one service.
-func diffRelease(old, nw *release.Spec) []string {
-	if old == nil {
-		return nil
-	}
-	var out []string
-	if old.Network != nw.Network {
-		out = append(out, fmt.Sprintf("network %s → %s", old.Network, nw.Network))
-	}
-	if old.SecretMode != nw.SecretMode {
-		out = append(out, fmt.Sprintf("secret delivery %s → %s",
-			secretModeName(old.SecretMode), secretModeName(nw.SecretMode)))
-	}
-	return out
-}
-
-func secretModeName(m string) string {
-	if m == "file" {
-		return "files under /run/secrets"
-	}
-	return "environment"
-}
-
-// diffSecrets compares key sets and whether values moved — never the values.
-//
-// salt comes back from the host with the ledger, because that is what its stored
-// hashes are keyed by. An empty salt only happens on a host that has never
-// deployed, where there is nothing to compare against anyway.
-func diffSecrets(old, nw *release.Spec, salt string) SecretChange {
-	sc := SecretChange{Total: len(nw.Secrets)}
-	// The ledger stores hashes, never values, so hash the freshly-resolved
-	// secrets before comparing — otherwise every key looks changed every time.
-	hashed := make(map[string]string, len(nw.Secrets))
-	for k, v := range nw.Secrets {
-		hashed[k] = release.HashSecret(salt, v)
-	}
-	nw = &release.Spec{Secrets: hashed}
-	if old == nil {
-		for k := range nw.Secrets {
-			sc.Added = append(sc.Added, k)
-		}
-		slices.Sort(sc.Added)
-		return sc
-	}
-	for _, k := range mapKeys(old.Secrets, nw.Secrets) {
-		ov, oo := old.Secrets[k]
-		nv, no := nw.Secrets[k]
-		switch {
-		case oo && !no:
-			sc.Removed = append(sc.Removed, k)
-		case !oo && no:
-			sc.Added = append(sc.Added, k)
-		case ov != nv:
-			sc.Changed = append(sc.Changed, k)
-		}
-	}
-	return sc
-}
-
 // estimate asks the host which blobs it already holds and sums the rest. This is
 // the number that makes the registry-free approach legible: it is the actual
 // wire cost of the deploy, before it happens.
@@ -610,13 +372,13 @@ func (e *Engine) estimate(ctx context.Context, built map[string]*build.Result) (
 	if len(built) == 0 {
 		return est, nil
 	}
-	names := sortedResultKeys(built)
+	names := slices.Sorted(maps.Keys(built))
 
 	var script strings.Builder
 	for _, name := range names {
 		dir := filepath.Join(e.StorePath(), name, "blobs", "sha256")
 		fmt.Fprintf(&script, "echo %s\nls -1 %s 2>/dev/null || true\n",
-			shellArg(blobFence+name), shellArg(dir))
+			sshx.Quote(blobFence+name), sshx.Quote(dir))
 	}
 	out, err := e.Client.Run(ctx, "sh", "-c", script.String())
 	if err != nil {
@@ -625,7 +387,7 @@ func (e *Engine) estimate(ctx context.Context, built map[string]*build.Result) (
 	have := parseBlobListing(out)
 
 	for _, name := range names {
-		local, err := layoutBlobs(built[name].Dir)
+		local, err := oci.Blobs(built[name].Dir)
 		if err != nil {
 			return nil, err
 		}
@@ -659,44 +421,4 @@ func parseBlobListing(out string) map[string]map[string]bool {
 		}
 	}
 	return have
-}
-
-func layoutBlobs(dir string) (map[string]int64, error) {
-	blobs := filepath.Join(dir, "blobs", "sha256")
-	ents, err := os.ReadDir(blobs)
-	if err != nil {
-		return nil, err
-	}
-	out := make(map[string]int64, len(ents))
-	for _, e := range ents {
-		if e.IsDir() {
-			continue
-		}
-		fi, err := e.Info()
-		if err != nil {
-			return nil, err
-		}
-		out[e.Name()] = fi.Size()
-	}
-	return out, nil
-}
-
-func mapKeys(a, b map[string]string) []string {
-	set := map[string]bool{}
-	for k := range a {
-		set[k] = true
-	}
-	for k := range b {
-		set[k] = true
-	}
-	out := make([]string, 0, len(set))
-	for k := range set {
-		out = append(out, k)
-	}
-	slices.Sort(out)
-	return out
-}
-
-func shellArg(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }

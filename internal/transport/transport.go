@@ -339,9 +339,6 @@ type FileStat struct {
 	MTime int64 // unix seconds
 }
 
-// RemoteFileStat reports a host file's size and modification time in one round
-// trip.
-//
 // Size and mtime together are exactly the heuristic rsync itself uses to decide
 // whether a file needs transferring, which makes it the right basis for deciding
 // whether an artifact counts as a change. Hashing would be exact but means
@@ -366,7 +363,7 @@ func RemoteFileStats(ctx context.Context, c *sshx.Client, paths []string) map[st
 
 	var script strings.Builder
 	for i, p := range paths {
-		q := shellArg(p)
+		q := sshx.Quote(p)
 		fmt.Fprintf(&script,
 			"if [ -d %s ]; then find %s -type f -exec stat -c '%%s %%Y' {} + 2>/dev/null | "+
 				"awk -v i=%d 'BEGIN{b=0;m=0} {b+=$1; if ($2>m) m=$2} END{print i, b, m}'; "+
@@ -390,18 +387,3 @@ func RemoteFileStats(ctx context.Context, c *sshx.Client, paths []string) map[st
 	}
 	return out
 }
-
-func RemoteFileStat(ctx context.Context, c *sshx.Client, path string) FileStat {
-	out, err := c.Run(ctx, "sh", "-c",
-		"if [ -f "+shellArg(path)+" ]; then stat -c '%s %Y' "+shellArg(path)+"; else echo '-1 0'; fi")
-	if err != nil {
-		return FileStat{Size: -1}
-	}
-	var st FileStat
-	if _, err := fmt.Sscanf(strings.TrimSpace(out), "%d %d", &st.Size, &st.MTime); err != nil {
-		return FileStat{Size: -1}
-	}
-	return st
-}
-
-func shellArg(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }

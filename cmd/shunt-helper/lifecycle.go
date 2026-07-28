@@ -103,10 +103,8 @@ func cmdRollback(args []string) error {
 
 // cmdRetire stops and removes every container belonging to one service.
 //
-// It exists because dropping a service from shunt.toml previously did nothing:
-// the plan reported it forever and the container ran forever. Retiring is a
-// separate verb rather than something `up` does, for the same reason booting an
-// accessory is — shunt does not stop containers it was not explicitly asked to.
+// A separate verb rather than something `up` does, for the same reason booting
+// an accessory is: shunt does not stop containers it was not asked to stop.
 func cmdRetire(args []string) error {
 	if len(args) < 2 {
 		return errors.New("usage: shunt-helper retire <project> <service>")

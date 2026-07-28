@@ -13,15 +13,10 @@ import (
 
 // cmdFetch copies an artifact or a stage capture back down from the host.
 //
-// The transport is symmetric — rsync does not care which end is the source — so
-// the direction that makes production data available locally costs almost
-// nothing on top of the direction that ships it up. It is the missing half of
-// the artifact story: you can send a SQLite database or a model directory to
-// production, so being able to pull the current one back for local work, or to
-// retrieve last night's pg_dump, follows directly.
-//
-// Nothing is overwritten without saying so, because the obvious mistake here is
-// pulling production data over the local copy you were about to deploy.
+// rsync does not care which end is the source, so the pull direction costs
+// almost nothing on top of the push. Nothing is overwritten without saying so:
+// the obvious mistake is pulling production data over the local copy you were
+// about to deploy.
 func cmdFetch(ctx context.Context, args []string) error {
 	var c commonFlags
 	var out string

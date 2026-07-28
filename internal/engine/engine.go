@@ -13,7 +13,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"sort"
 	"strings"
 	"time"
 
@@ -39,10 +38,6 @@ type Engine struct {
 	// them against.
 	artifactSrc map[string]string
 }
-
-// SetArtifactSources points artifact transfers at explicit local paths instead
-// of the manifest's src fields.
-func (e *Engine) SetArtifactSources(paths map[string]string) { e.artifactSrc = paths }
 
 func New(m *manifest.Manifest) *Engine {
 	return &Engine{M: m, Client: sshx.New(m.Host)}
@@ -107,7 +102,7 @@ func (e *Engine) ensureHelper(ctx context.Context) error {
 	}
 	// Old content-addressed helpers accumulate otherwise, one per CLI build.
 	e.Client.Run(ctx, "sh", "-c",
-		"ls -1t "+shellArg(filepath.Join(e.root, "bin"))+"/shunt-helper-* 2>/dev/null | tail -n +4 | xargs -r rm -f")
+		"ls -1t "+sshx.Quote(filepath.Join(e.root, "bin"))+"/shunt-helper-* 2>/dev/null | tail -n +4 | xargs -r rm -f")
 	return nil
 }
 
@@ -133,7 +128,7 @@ func (e *Engine) Build(ctx context.Context, id string, o BuildOptions) (map[stri
 	// Old export directories are dropped here rather than at the end, so a run
 	// that fails partway still tidies up after its predecessors.
 	e.pruneCacheDirs(3)
-	for _, name := range sortedKeys(e.M.Images) {
+	for _, name := range slices.Sorted(maps.Keys(e.M.Images)) {
 		img := e.M.Images[name]
 		args, err := secrets.InterpolateMap(img.Args)
 		if err != nil {
@@ -171,7 +166,7 @@ func (e *Engine) Build(ctx context.Context, id string, o BuildOptions) (map[stri
 // Push mirrors each built layout to the host's store.
 func (e *Engine) Push(ctx context.Context, built map[string]*build.Result, verbose bool) (map[string]*transport.Stats, error) {
 	stats := map[string]*transport.Stats{}
-	for _, name := range sortedResultKeys(built) {
+	for _, name := range slices.Sorted(maps.Keys(built)) {
 		st, err := transport.Push(ctx, transport.Options{
 			Client:     e.Client,
 			LocalDir:   built[name].Dir,
@@ -279,204 +274,6 @@ func secretMode(m *manifest.Manifest) string {
 	return ""
 }
 
-// StagedPath is where an artifact is transferred to before being swapped into
-// place.
-//
-// Beside the destination, so the final rename is on the same filesystem and
-// therefore atomic. Scoped by release id, so two deploys cannot land on each
-// other's half-transferred file — and so a fragment left by an abandoned deploy
-// can never be mistaken for this one's.
-//
-// The suffix does not cost anything at transfer time: rsync's --fuzzy still
-// finds the current copy next door as its delta basis, because the destination
-// name is still the staged name's longest common prefix.
-func StagedPath(dest, releaseID string) string { return dest + ".new." + releaseID }
-
-// artifacts resolves the manifest's artifact list, dropping any whose local file
-// is missing unless it is marked required.
-func (e *Engine) artifacts(releaseID string) ([]release.Artifact, error) {
-	out := make([]release.Artifact, 0, len(e.M.Artifacts))
-	for _, a := range e.M.Artifacts {
-		src := e.M.Abs(a.Src)
-		fi, err := os.Stat(src)
-		if err != nil {
-			if a.Required {
-				return nil, fmt.Errorf("artifact %q: %s is required but missing", a.Name, src)
-			}
-			// Not an error: the host keeps whatever it already has, which is the
-			// right default for a file produced by an occasional ETL run.
-			fmt.Fprintf(os.Stderr, "warning: artifact %q: %s not found, the host keeps its current copy\n", a.Name, src)
-			continue
-		}
-		size, mtime := fi.Size(), fi.ModTime().Unix()
-		if fi.IsDir() {
-			// A tree has no single size or mtime, so summarise it: the plan needs
-			// something to compare, and the helper needs something to validate
-			// the staged copy against.
-			size, mtime = treeSummary(src)
-			if a.Magic != "" {
-				return nil, fmt.Errorf("artifact %q: magic cannot apply to a directory", a.Name)
-			}
-		}
-		out = append(out, release.Artifact{
-			Name:   a.Name,
-			Dest:   a.Dest,
-			Staged: StagedPath(a.Dest, releaseID),
-			Magic:  a.Magic,
-			Retain: a.Retain,
-			Bytes:  size,
-			MTime:  mtime,
-			Dir:    fi.IsDir(),
-		})
-	}
-	return out, nil
-}
-
-// treeSummary totals a directory's file sizes and takes its newest mtime.
-//
-// Not a hash: hashing a directory of model weights means reading every byte on
-// both sides, which is most of the cost of simply shipping it. Size and mtime
-// are the same heuristic rsync itself uses to decide what to transfer, which
-// makes them the right basis for deciding whether the tree counts as changed.
-func treeSummary(root string) (bytes, mtime int64) {
-	filepath.WalkDir(root, func(_ string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return nil
-		}
-		fi, err := d.Info()
-		if err != nil {
-			return nil
-		}
-		bytes += fi.Size()
-		if m := fi.ModTime().Unix(); m > mtime {
-			mtime = m
-		}
-		return nil
-	})
-	return bytes, mtime
-}
-
-// linkDestFor names the live tree to reuse unchanged files from, or "" when the
-// host has nothing there yet.
-func linkDestFor(a release.Artifact, present map[string]transport.FileStat) string {
-	if !a.Dir {
-		return "" // single files use --fuzzy instead
-	}
-	if st, ok := present[a.Dest]; ok && st.Size >= 0 {
-		return a.Dest
-	}
-	return ""
-}
-
-// LocalArtifactPath is the source file for a named artifact.
-func (e *Engine) LocalArtifactPath(name string) string {
-	if p, ok := e.artifactSrc[name]; ok {
-		return p
-	}
-	for _, a := range e.M.Artifacts {
-		if a.Name == name {
-			return e.M.Abs(a.Src)
-		}
-	}
-	return ""
-}
-
-// PushArtifacts transfers each artifact to its staged path on the host.
-func (e *Engine) PushArtifacts(ctx context.Context, spec *release.Spec, verbose bool) (map[string]*transport.Stats, error) {
-	stats := map[string]*transport.Stats{}
-
-	// Which destinations already exist, in one round trip. A directory transfer
-	// reuses the live tree via --link-dest, and pointing that at a path the host
-	// does not have yet makes rsync print a warning on a first deploy — accurate
-	// but alarming, and avoidable now that stats come back batched.
-	dests := make([]string, 0, len(spec.Artifacts))
-	for _, a := range spec.Artifacts {
-		dests = append(dests, a.Dest)
-	}
-	present := transport.RemoteFileStats(ctx, e.Client, dests)
-
-	for _, a := range spec.Artifacts {
-		st, err := transport.PushFile(ctx, transport.FileOptions{
-			Client:     e.Client,
-			LocalPath:  e.LocalArtifactPath(a.Name),
-			RemotePath: a.Staged,
-			Verbose:    verbose,
-			RemoteZstd: e.facts.RsyncZstd,
-			// The live tree is what an unchanged file should be linked from
-			// rather than re-sent; ignored for single-file artifacts, and
-			// omitted entirely until the host actually has a tree to link from.
-			LinkDest: linkDestFor(a, present),
-		})
-		if err != nil {
-			return nil, err
-		}
-		stats[a.Name] = st
-	}
-	return stats, nil
-}
-
-// RemoteKind reports whether a host path is a directory and how large it is.
-func (e *Engine) RemoteKind(ctx context.Context, path string) (isDir bool, size int64, err error) {
-	out, err := e.Client.Run(ctx, "sh", "-c",
-		"p="+shellArg(path)+`; if [ -d "$p" ]; then echo -n "dir "; du -sb "$p" | cut -f1; `+
-			`elif [ -f "$p" ]; then echo -n "file "; stat -c %s "$p"; else echo "missing 0"; fi`)
-	if err != nil {
-		return false, 0, err
-	}
-	fields := strings.Fields(strings.TrimSpace(out))
-	if len(fields) < 2 {
-		return false, 0, fmt.Errorf("could not stat %s on %s", path, e.M.Host)
-	}
-	if fields[0] == "missing" {
-		return false, 0, fmt.Errorf("%s does not exist on %s", path, e.M.Host)
-	}
-	fmt.Sscanf(fields[1], "%d", &size)
-	return fields[0] == "dir", size, nil
-}
-
-// Fetch pulls a host path down to a local one.
-func (e *Engine) Fetch(ctx context.Context, remote, local string, isDir, verbose bool) (*transport.Stats, error) {
-	return transport.Fetch(ctx, transport.FileOptions{
-		Client:     e.Client,
-		LocalPath:  local,
-		RemotePath: remote,
-		Verbose:    verbose,
-		RemoteZstd: e.facts.RsyncZstd,
-	}, isDir)
-}
-
-// Captures lists stage capture files on the host, newest first.
-//
-// A pre-migration dump that cannot be retrieved is decorative, and working out
-// where the helper put it is not something an operator should have to do from
-// the manifest.
-func (e *Engine) Captures(ctx context.Context) ([]string, error) {
-	dirs := map[string]bool{}
-	for _, st := range e.M.Stages {
-		if st.Capture != "" {
-			dirs[filepath.Dir(st.Capture)] = true
-		}
-	}
-	if len(dirs) == 0 {
-		return nil, nil
-	}
-	var script strings.Builder
-	for _, d := range slices.Sorted(maps.Keys(dirs)) {
-		fmt.Fprintf(&script, "ls -1t %s/* 2>/dev/null | head -20\n", shellArg(d))
-	}
-	out, err := e.Client.Run(ctx, "sh", "-c", script.String())
-	if err != nil {
-		return nil, err
-	}
-	var found []string
-	for _, ln := range strings.Split(strings.TrimSpace(out), "\n") {
-		if ln = strings.TrimSpace(ln); ln != "" {
-			found = append(found, ln)
-		}
-	}
-	return found, nil
-}
-
 // PreflightSpace refuses a transfer the host has no room for.
 //
 // rsync running out of space partway leaves a truncated blob and an error about
@@ -502,72 +299,6 @@ func (e *Engine) PreflightSpace(built map[string]*build.Result) error {
 			e.M.Host, ui.Bytes(e.facts.FreeBytes), ui.Bytes(want), ui.Bytes(need))
 	}
 	return nil
-}
-
-// PreflightArtifacts checks the host can actually receive every artifact, before
-// anything expensive happens.
-//
-// Building and shipping a 400 MB image only to fail on mkdir wastes minutes and
-// tells the operator nothing useful, so every destination directory is probed in
-// a single round trip and each failure names its own fix.
-func (e *Engine) PreflightArtifacts(ctx context.Context) error {
-	dests := make([]string, 0, len(e.M.Artifacts))
-	for _, a := range e.M.Artifacts {
-		dests = append(dests, a.Dest)
-	}
-	return e.PreflightArtifactDests(ctx, dests)
-}
-
-// PreflightArtifactDests is the same check driven by explicit destinations,
-// which is what a bundle has: it carries a release, not a manifest, so the
-// paths come from the spec. Skipping this was why applying a bundle with an
-// artifact failed at rsync with a bare "No such file or directory".
-func (e *Engine) PreflightArtifactDests(ctx context.Context, dests []string) error {
-	if len(dests) == 0 {
-		return nil
-	}
-	dirs := map[string]bool{}
-	for _, d := range dests {
-		if d != "" {
-			dirs[filepath.Dir(d)] = true
-		}
-	}
-	var script strings.Builder
-	for _, d := range slices.Sorted(maps.Keys(dirs)) {
-		fmt.Fprintf(&script, "if ! mkdir -p %s 2>/dev/null; then echo \"NODIR %s\"; elif [ ! -w %s ]; then echo \"NOWRITE %s\"; fi\n",
-			shellArg(d), d, shellArg(d), d)
-	}
-	out, err := e.Client.Run(ctx, "sh", "-c", script.String())
-	if err != nil {
-		return err
-	}
-
-	var problems []string
-	for _, ln := range strings.Split(strings.TrimSpace(out), "\n") {
-		if ln == "" {
-			continue
-		}
-		kind, dir, _ := strings.Cut(ln, " ")
-		switch kind {
-		case "NODIR":
-			problems = append(problems, fmt.Sprintf("  %s could not be created", dir))
-		case "NOWRITE":
-			problems = append(problems, fmt.Sprintf("  %s is not writable", dir))
-		}
-	}
-	if len(problems) == 0 {
-		return nil
-	}
-
-	user := e.M.Host
-	if u, _, ok := strings.Cut(e.M.Host, "@"); ok {
-		user = u
-	}
-	return fmt.Errorf("artifact destinations are not usable on %s:\n%s\n\n"+
-		"  This is a one-time setup step — /opt is root-owned by default. On the host run:\n"+
-		"    sudo mkdir -p <dir> && sudo chown -R %s <dir>\n"+
-		"  Or point dest= somewhere you already own, e.g. $HOME.",
-		e.M.Host, strings.Join(problems, "\n"), user)
 }
 
 // BootSpec assembles a spec for `shunt boot`, which recreates an accessory
@@ -755,68 +486,7 @@ func (e *Engine) Rollback(ctx context.Context, id string, r EventRenderer) error
 	return e.stream(ctx, nil, r, args...)
 }
 
-// Exec runs a command inside an existing container, wired to the local
-// terminal so an interactive shell or console works.
-func (e *Engine) Exec(ctx context.Context, container string, command []string) error {
-	argv := append([]string{"docker", "exec"}, execTTYFlags()...)
-	argv = append(argv, container)
-	argv = append(argv, command...)
-	return e.Client.Interactive(ctx, argv...)
-}
-
-// RunOneOff starts a throwaway container from a release's image, on the deploy
-// network and with that release's secrets, and removes it when it exits.
-//
-// The env-file is the release's own, which is the only plaintext copy of its
-// secrets on the host — so a console started this way sees exactly what the
-// running service sees, without secrets being re-sent or re-resolved.
-func (e *Engine) RunOneOff(ctx context.Context, releaseID, imageRef string, command []string) error {
-	envFile := filepath.Join(e.root, e.M.Project, "env", releaseID+".env")
-	secretsDir := filepath.Join(e.root, e.M.Project, "secrets", releaseID)
-	argv := []string{"sh", "-c", oneOffScript()}
-	argv = append(argv, "--", e.M.Network, envFile, secretsDir, imageRef)
-	argv = append(argv, command...)
-	return e.Client.Interactive(ctx, argv...)
-}
-
-// oneOffScript exists because the env-file may have been pruned, and docker
-// refuses to start at all when --env-file names a missing path. Deciding that
-// on the host keeps it to a single round trip.
-func oneOffScript() string {
-	// Whichever form the release used is what a one-off gets, decided by what is
-	// actually on disk rather than by threading the mode through.
-	return `net="$1"; env="$2"; sec="$3"; img="$4"; shift 4
-args="--rm -i"
-[ -t 0 ] && args="$args -t"
-[ -n "$net" ] && args="$args --network $net"
-[ -f "$env" ] && args="$args --env-file $env"
-[ -d "$sec" ] && args="$args -v $sec:/run/secrets:ro"
-exec docker run $args "$img" "$@"`
-}
-
-// execTTYFlags asks for a tty only when there is one to attach, so piping into
-// `shunt exec` still works.
-func execTTYFlags() []string {
-	if ui.IsTerminal(os.Stdin) {
-		return []string{"-it"}
-	}
-	return []string{"-i"}
-}
-
-func (e *Engine) Logs(ctx context.Context, service string, follow bool, tail string) error {
-	args := []string{e.helperPath, "logs", e.M.Project}
-	if service != "" {
-		args = append(args, service)
-	}
-	if follow {
-		args = append(args, "--follow")
-	}
-	args = append(args, "--tail", tail)
-	return e.Client.Stream(ctx, nil, os.Stdout, os.Stderr, args...)
-}
-
-func (e *Engine) HelperPath() string { return e.helperPath }
-func (e *Engine) Facts() sshx.Facts  { return e.facts }
+func (e *Engine) Facts() sshx.Facts { return e.facts }
 
 // cacheDir is where this release's OCI layouts are exported.
 //
@@ -862,17 +532,6 @@ func (e *Engine) pruneCacheDirs(keep int) {
 		os.RemoveAll(filepath.Join(root, dirs[i]))
 	}
 }
-
-func sortedKeys[T any](m map[string]T) []string {
-	ks := make([]string, 0, len(m))
-	for k := range m {
-		ks = append(ks, k)
-	}
-	sort.Strings(ks)
-	return ks
-}
-
-func sortedResultKeys(m map[string]*build.Result) []string { return sortedKeys(m) }
 
 func truncate(s string, n int) string {
 	if len(s) <= n {

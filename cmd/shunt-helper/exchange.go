@@ -8,17 +8,13 @@ import (
 
 // renameExchange atomically swaps two existing paths.
 //
-// It is what closes the one gap a directory artifact otherwise has. A file can
-// be promoted with a hard link and a rename, so its destination always holds
-// either the old contents or the new ones. A directory cannot be hard-linked,
-// and rename refuses to replace a non-empty one, so the old tree had to be moved
-// aside first — leaving a window, one syscall wide, in which the destination did
-// not exist at all. An app that opened a path in that window got ENOENT.
+// A directory cannot be hard-linked and rename refuses to replace a non-empty
+// one, so promoting a directory artifact otherwise means moving the old tree
+// aside first — a window, one syscall wide, in which the destination does not
+// exist. RENAME_EXCHANGE swaps the two entries in a single step instead.
 //
-// RENAME_EXCHANGE swaps the two entries in a single atomic step instead: after
-// it, the destination holds the new tree and the staging path holds the old one,
-// with no moment in between. Linux 3.15 and later, and not every filesystem
-// implements it — callers fall back.
+// Linux 3.15 and later, and not every filesystem implements it; callers fall
+// back.
 func renameExchange(a, b string) error {
 	ap, err := syscall.BytePtrFromString(a)
 	if err != nil {

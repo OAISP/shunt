@@ -2,8 +2,6 @@ package main
 
 import (
 	"archive/tar"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,6 +12,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/OAISP/shunt/internal/oci"
 	"github.com/OAISP/shunt/internal/release"
 )
 
@@ -93,28 +92,18 @@ type verifiedRecord struct {
 // verifiedPath is where a layout records which blobs it has already validated.
 func verifiedPath(dir string) string { return filepath.Join(dir, ".shunt-verified.json") }
 
-// verifyLayout rehashes blobs and compares each to its filename. Blob names are
-// content hashes, so this is a complete end-to-end integrity check of the
-// transfer — rsync decides what to skip from size and mtime alone, which a
-// same-size corruption would slip past.
+// verifyLayout rehashes blobs whose size or mtime moved and returns the set it
+// rewrote, which is what the loader sends. A blob is immutable, so one that
+// verified once stays verified; hashing the whole image every deploy would cost
+// more than the transfer it is checking.
 //
-// Only *new or changed* blobs are hashed. A blob is content-addressed and
-// immutable, so one that verified once stays verified for as long as its size
-// and mtime are untouched; rsync rewrites exactly the blobs that changed, which
-// is precisely the set worth re-reading. Without this the host paid a full-image
-// sha256 on every deploy — shipping 5 KB and then hashing 1 GB, which quietly
-// undid the saving the whole design exists to produce.
-//
-// The trade, stated plainly: a blob rewritten with the same size *and* the same
-// mtime is trusted. Nothing rsync does produces that — writing a file moves its
-// mtime — so what this gives up is detection of silent on-disk corruption
-// between deploys. SHUNT_NO_VERIFY_CACHE=1 restores the full rehash;
-// SHUNT_NO_VERIFY=1 still skips verification altogether.
+// The trade: a blob rewritten with the same size *and* mtime is trusted.
+// Nothing rsync does produces that, so what this gives up is silent on-disk
+// corruption between deploys. SHUNT_NO_VERIFY_CACHE=1 restores the full rehash.
 func verifyLayout(dir string) (map[string]bool, error) {
-	blobs := filepath.Join(dir, "blobs", "sha256")
-	ents, err := os.ReadDir(blobs)
+	blobs, err := oci.Blobs(dir)
 	if err != nil {
-		return nil, fmt.Errorf("read layout %s: %w", blobs, err)
+		return nil, err
 	}
 	if os.Getenv("SHUNT_NO_VERIFY") == "1" {
 		// Nothing is known to be fresh, so the loader sends everything.
@@ -125,29 +114,27 @@ func verifyLayout(dir string) (map[string]bool, error) {
 	if os.Getenv("SHUNT_NO_VERIFY_CACHE") != "1" {
 		known = loadVerified(dir)
 	}
-	fresh := make(map[string]verifiedRecord, len(ents))
+	fresh := make(map[string]verifiedRecord, len(blobs))
 	// The blobs rsync actually rewrote this transfer. They are exactly the ones
 	// the daemon cannot already have, which is what makes a partial load safe.
 	written := map[string]bool{}
 
-	for _, e := range ents {
-		if e.IsDir() {
-			continue
-		}
-		fi, err := e.Info()
+	for digest := range blobs {
+		path := filepath.Join(oci.BlobDir(dir), digest)
+		fi, err := os.Stat(path)
 		if err != nil {
 			return nil, err
 		}
 		rec := verifiedRecord{Size: fi.Size(), MTime: fi.ModTime().UnixNano()}
-		if prev, ok := known[e.Name()]; ok && prev == rec {
-			fresh[e.Name()] = rec
+		if prev, ok := known[digest]; ok && prev == rec {
+			fresh[digest] = rec
 			continue
 		}
-		if err := hashBlob(filepath.Join(blobs, e.Name()), e.Name()); err != nil {
+		if _, err := oci.VerifyBlob(path, digest); err != nil {
 			return nil, err
 		}
-		written[e.Name()] = true
-		fresh[e.Name()] = rec
+		written[digest] = true
+		fresh[digest] = rec
 	}
 
 	if len(written) > 0 {
@@ -155,23 +142,6 @@ func verifyLayout(dir string) (map[string]bool, error) {
 	}
 	saveVerified(dir, fresh)
 	return written, nil
-}
-
-func hashBlob(path, want string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	h := sha256.New()
-	_, err = io.Copy(h, f)
-	f.Close()
-	if err != nil {
-		return err
-	}
-	if got := hex.EncodeToString(h.Sum(nil)); got != want {
-		return fmt.Errorf("blob %s is corrupt (hashes to %s) — rerun the deploy", want[:16], got[:16])
-	}
-	return nil
 }
 
 // loadVerified reads the sidecar. Any problem simply means everything gets
@@ -203,17 +173,14 @@ func saveVerified(dir string, m map[string]verifiedRecord) {
 
 // dockerLoadDir streams the OCI layout into `docker load`.
 //
-// When onlyBlobs is non-nil it names the blobs rsync rewrote this transfer, and
-// every other layer blob is left out of the stream. The daemon already holds
-// those — they are unchanged from a release it has loaded before — and both the
-// containerd and the classic overlay2 stores accept a layout whose known layers
-// are absent. Measured on a 404 MB image with a code-only change: 404 MB of tar
-// becomes 40 KB, which is what turns a 12-second apply into an instant one.
+// onlyBlobs names the blobs rsync rewrote this transfer; every other layer is
+// left out, because the daemon already holds it. Both the containerd and the
+// classic overlay2 store accept a layout whose known layers are absent —
+// measured at 404 MB of tar becoming 40 KB. A nil map sends everything, which is
+// what a first deploy and the fallback do.
 //
-// A nil map sends everything, which is what a first deploy and the fallback do.
-//
-// The archive is built here rather than shelled out to `tar`, which is both how
-// the filtering is expressed and why the host no longer needs tar at all.
+// Built here rather than shelled out to `tar`, which is how the filtering is
+// expressed and why the host no longer needs tar.
 func dockerLoadDir(dir string, onlyBlobs map[string]bool) error {
 	loadCmd := exec.Command("docker", "load")
 	stdin, err := loadCmd.StdinPipe()

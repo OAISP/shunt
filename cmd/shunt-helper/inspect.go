@@ -55,12 +55,9 @@ func cmdStatus(args []string) error {
 	return json.NewEncoder(os.Stdout).Encode(map[string]any{"ledger": ledger, "containers": cs})
 }
 
-// cmdLogs tails every container of a project, or of one service.
-//
-// It used to run `docker logs` against whichever container docker listed first
-// and print it unlabelled — so a project with a web service and a worker showed
-// one of them, arbitrarily, with nothing to say which. During a blue/green
-// overlap it could equally well be the release being retired.
+// cmdLogs tails every container of a project, or of one service. Every one,
+// prefixed: a project with a web service and a worker has two, and during a
+// blue/green overlap one of them is the release being retired.
 func cmdLogs(args []string) error {
 	if len(args) < 1 {
 		return errors.New("usage: shunt-helper logs <project> [service] [--follow] [--tail N]")

@@ -29,12 +29,10 @@ const (
 
 // cmdAudit checks everything a deploy depends on, before a deploy depends on it.
 //
-// Every one of these was already checked somewhere in the deploy path — but
-// spread across it, so the answer arrived at the worst possible moment: a
-// missing `curl` on the host surfaced after the container swap, and a builder
-// that cannot export OCI surfaced after waiting for a build. Collecting them
-// into one command that changes nothing is what makes them useful before the
-// first deploy rather than during it.
+// Every one of these is checked somewhere in the deploy path anyway, but spread
+// across it, so the answer arrives at the worst moment — a missing `curl`
+// surfaces after the container swap. Collected here they are answerable before
+// the first deploy rather than during it.
 func cmdAudit(ctx context.Context, args []string) error {
 	var c commonFlags
 	fs := newFlagSet("audit", &c)

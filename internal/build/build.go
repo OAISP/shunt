@@ -71,7 +71,7 @@ func Build(ctx context.Context, o Options) (*Result, error) {
 	if o.Progress != "" {
 		args = append(args, "--progress", o.Progress)
 	}
-	for _, k := range sortedKeys(o.Args) {
+	for _, k := range slices.Sorted(maps.Keys(o.Args)) {
 		args = append(args, "--build-arg", k+"="+o.Args[k])
 	}
 	args = append(args, o.Context)
@@ -96,7 +96,7 @@ func Build(ctx context.Context, o Options) (*Result, error) {
 		return nil, fmt.Errorf("build image %q: %w", o.Name, err)
 	}
 
-	return &Result{Name: o.Name, Dir: o.OutDir, Digest: dg, Bytes: dirSize(o.OutDir)}, nil
+	return &Result{Name: o.Name, Dir: o.OutDir, Digest: dg, Bytes: DirSize(o.OutDir)}, nil
 }
 
 // blobEpoch is the fixed timestamp every blob is stamped with. The value is
@@ -203,7 +203,8 @@ func buildxHint() string {
 	return ""
 }
 
-func dirSize(dir string) int64 {
+// DirSize totals the regular files under dir.
+func DirSize(dir string) int64 {
 	var n int64
 	filepath.Walk(dir, func(_ string, fi os.FileInfo, err error) error {
 		if err == nil && !fi.IsDir() {
@@ -212,12 +213,6 @@ func dirSize(dir string) int64 {
 		return nil
 	})
 	return n
-}
-
-// sortedKeys orders build args deterministically, so the same manifest always
-// produces the same buildx invocation and therefore the same cache key.
-func sortedKeys(m map[string]string) []string {
-	return slices.Sorted(maps.Keys(m))
 }
 
 // dockerArchiveEntry is one element of the manifest.json that `docker save`

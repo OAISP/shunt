@@ -11,6 +11,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -466,4 +468,30 @@ type Event struct {
 	// Result payload, set when Kind == KindResult.
 	Release string `json:"release,omitempty"`
 	Status  string `json:"status,omitempty"`
+}
+
+// TreeSummary totals a directory's regular files and reports the newest mtime
+// among them. It defines what an Artifact's Bytes and MTime mean, so both ends
+// must call it: two implementations differing by so much as a directory inode
+// would make every directory artifact differ from itself on every deploy.
+//
+// Not a hash, deliberately — that reads every byte on both sides, which is most
+// of the cost of shipping the tree. Size and mtime are what rsync itself uses.
+func TreeSummary(root string) (bytes int64, files int, newest int64) {
+	filepath.WalkDir(root, func(_ string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		fi, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		bytes += fi.Size()
+		files++
+		if m := fi.ModTime().Unix(); m > newest {
+			newest = m
+		}
+		return nil
+	})
+	return bytes, files, newest
 }

@@ -236,20 +236,13 @@ func dependedOn(spec *release.Spec) map[string]bool {
 // rest are stopped gracefully and restarted, which does have a gap — a published
 // host port can only belong to one container at a time.
 //
-// Returns the services it started, and whether it replaced any running
-// container at all.
-//
-// That second value is what separates "the deploy failed and production is
-// exactly as it was" from "the deploy failed halfway and the host is now
-// running a mix". Only the caller can record that distinction, and without it
-// the ledger would claim a clean failure after having already taken a service
-// down.
+// The second return value separates "the deploy failed and production is
+// exactly as it was" from "it failed halfway and the host is running a mix" —
+// the distinction the ledger records as failed versus degraded.
 func swapServices(spec, prev *release.Spec, envFile string) (started []string, mutated bool, err error) {
-	// Services something else depends on are health-checked before the things
-	// that depend on them start. `requires` previously ordered startup only, so
-	// a worker declaring `requires = ["db"]` could be running and failing
-	// against a database that had not finished booting — an ordering that looks
-	// like a dependency and does not behave like one.
+	// Services something else depends on are health-checked before their
+	// dependents start, so `requires` is a readiness edge rather than only an
+	// ordering one.
 	depended := dependedOn(spec)
 
 	for _, name := range spec.Order {

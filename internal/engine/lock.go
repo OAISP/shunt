@@ -10,20 +10,13 @@ import (
 	"time"
 )
 
-// Lock is a project lock held on the host for the whole of a deploy.
+// Lock is a project lock held on the host for the whole of a deploy, including
+// the transfer — the helper's own flock starts after it, by which point two
+// deploys have already rsync'd into the same store with --delete.
 //
-// The helper takes a flock around the part that mutates containers, which
-// covers the ledger and the container swap but starts far too late: by then
-// both CLIs have already rsync'd into the same store with --delete and staged
-// their artifacts. Two deploys could therefore corrupt each other's layout
-// before either helper ran.
-//
-// Holding it from the CLI closes that window without restructuring the store
-// into a shared blob pool with a garbage collector — the store stays the plain
-// --delete mirror it is documented to be. The lock is an ssh session running
-// `flock` on a fd it keeps open; when the session ends, for any reason including
-// the network dropping or the CLI being killed, the kernel releases it. There is
-// no lease to expire and no stale lockfile to clean up.
+// It is an ssh session holding `flock` on an open fd, so the kernel releases it
+// when the session ends for any reason, including the network dropping or the
+// CLI being killed. No lease to expire, no stale lockfile.
 type Lock struct {
 	cmd   *exec.Cmd
 	stdin io.WriteCloser
@@ -103,29 +96,19 @@ func (l *Lock) Release() {
 // Held reports whether the lock is currently held.
 func (l *Lock) Held() bool { return l != nil && l.held }
 
-// lockPath is deliberately NOT the helper's lock file.
+// lockPath is deliberately NOT the helper's lock file: the CLI holding that one
+// for a whole deploy would deadlock against the helper it then invokes.
 //
-// The helper flocks <project>/lock around host mutation. If the CLI held that
-// same file for the whole deploy, the helper it then invokes would block
-// forever waiting for a lock its own caller owns — a self-deadlock, and one
-// that looks exactly like a stuck deploy.
-//
-// So the two locks nest instead of colliding: this one serialises whole deploys
-// against each other, covering the transfer that the helper's lock starts too
-// late to protect; the helper's still serialises container mutation against
-// rollback, boot and prune. A rollback slipping between a deploy's transfer and
-// its apply is caught by ExpectedCurrent rather than by this lock.
+// The two nest instead. This one serialises whole deploys, covering the
+// transfer the helper's lock starts too late to protect; the helper's still
+// serialises container mutation against rollback, boot and prune.
 func (e *Engine) lockPath() string {
 	return e.root + "/" + e.M.Project + "/deploy.lock"
 }
 
 // ExpectedCurrent is the release the host was serving when the plan was built.
-//
-// It is sent with the spec so the helper can refuse to apply a plan that was
-// computed against a host somebody else has since changed. Holding the lock
-// makes that rare, but the plan is built *before* the lock is taken — the build
-// alone can take minutes — so the check is what makes the ordering safe rather
-// than merely unlikely to matter.
+// The plan is computed before the lock is taken — a build can take minutes — so
+// the helper rechecks it rather than trusting the ordering.
 func (s *RemoteState) ExpectedCurrent() string {
 	if s == nil || s.Ledger == nil {
 		return ""

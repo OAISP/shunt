@@ -2,29 +2,29 @@
 // a host by some means other than a live connection to the machine that built
 // it — a USB stick, an approval queue, an air-gapped network.
 //
-// It is deliberately the smallest thing that works. A bundle is an uncompressed
-// tar holding a description, the OCI layouts, and any artifacts. It carries no
-// helper binary, because the CLI applying it already embeds one; it carries no
-// checksum of its own, because every blob inside is content-addressed and
-// rehashed on load; and it is always complete rather than a delta against some
-// particular host, because a delta is only valid against the state it was
-// computed from and that is a promise a file sitting in a queue cannot keep.
+// A bundle is an uncompressed tar holding a description, the OCI layouts and any
+// artifacts. It carries no helper binary — the CLI applying it embeds one — and
+// no checksum of its own, since every blob is content-addressed and rehashed on
+// load. It is always complete rather than a delta against a particular host: a
+// delta is only valid against the state it was computed from, which is not a
+// promise a file sitting in a queue can keep.
 package bundle
 
 import (
 	"archive/tar"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/OAISP/shunt/internal/manifest"
+	"github.com/OAISP/shunt/internal/oci"
 	"github.com/OAISP/shunt/internal/release"
 )
 
@@ -86,12 +86,12 @@ func Write(w io.Writer, c Contents) error {
 		return err
 	}
 
-	for _, name := range sortedKeys(c.ImageDirs) {
+	for _, name := range slices.Sorted(maps.Keys(c.ImageDirs)) {
 		if err := writeTree(tw, path.Join("images", name), c.ImageDirs[name]); err != nil {
 			return fmt.Errorf("image %s: %w", name, err)
 		}
 	}
-	for _, name := range sortedKeys(c.ArtifactPaths) {
+	for _, name := range slices.Sorted(maps.Keys(c.ArtifactPaths)) {
 		if err := writeTree(tw, path.Join("artifacts", name), c.ArtifactPaths[name]); err != nil {
 			return fmt.Errorf("artifact %s: %w", name, err)
 		}
@@ -152,18 +152,14 @@ func Verify(r io.Reader, dir string) (*Extracted, *Report, error) {
 	}
 	rep := &Report{}
 
-	for _, name := range sortedKeys(ex.ImageDirs) {
+	for _, name := range slices.Sorted(maps.Keys(ex.ImageDirs)) {
 		rep.Images = append(rep.Images, name)
-		blobs := filepath.Join(ex.ImageDirs[name], "blobs", "sha256")
-		ents, err := os.ReadDir(blobs)
+		blobs, err := oci.Blobs(ex.ImageDirs[name])
 		if err != nil {
-			return nil, nil, fmt.Errorf("image %s has no blobs directory: %w", name, err)
+			return nil, nil, fmt.Errorf("image %s: %w", name, err)
 		}
-		for _, e := range ents {
-			if e.IsDir() {
-				continue
-			}
-			n, err := hashBlob(filepath.Join(blobs, e.Name()), e.Name())
+		for digest := range blobs {
+			n, err := oci.VerifyBlob(filepath.Join(oci.BlobDir(ex.ImageDirs[name]), digest), digest)
 			if err != nil {
 				return nil, nil, fmt.Errorf("image %s: %w", name, err)
 			}
@@ -171,7 +167,7 @@ func Verify(r io.Reader, dir string) (*Extracted, *Report, error) {
 			rep.Bytes += n
 		}
 	}
-	for _, name := range sortedKeys(ex.ArtifactPaths) {
+	for _, name := range slices.Sorted(maps.Keys(ex.ArtifactPaths)) {
 		rep.Artifacts = append(rep.Artifacts, name)
 	}
 
@@ -191,33 +187,6 @@ func Verify(r io.Reader, dir string) (*Extracted, *Report, error) {
 		}
 	}
 	return ex, rep, nil
-}
-
-// hashBlob checks one content-addressed file against its name and returns its
-// size.
-func hashBlob(path, want string) (int64, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-
-	h := sha256.New()
-	n, err := io.Copy(h, f)
-	if err != nil {
-		return 0, err
-	}
-	if got := hex.EncodeToString(h.Sum(nil)); got != want {
-		return 0, fmt.Errorf("blob %s is corrupt (hashes to %s)", short(want), short(got))
-	}
-	return n, nil
-}
-
-func short(s string) string {
-	if len(s) > 16 {
-		return s[:16]
-	}
-	return s
 }
 
 // Extracted is an opened bundle: its description, plus where its payload was
@@ -390,18 +359,4 @@ func copyInto(tw *tar.Writer, name, src string, fi os.FileInfo) error {
 	}
 	_, err = io.Copy(tw, f)
 	return err
-}
-
-func sortedKeys(m map[string]string) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	// Sorted so the same release always produces a byte-identical archive.
-	for i := 1; i < len(out); i++ {
-		for j := i; j > 0 && out[j] < out[j-1]; j-- {
-			out[j], out[j-1] = out[j-1], out[j]
-		}
-	}
-	return out
 }
