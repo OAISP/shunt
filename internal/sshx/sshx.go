@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -134,42 +135,99 @@ func (c *Client) Upload(ctx context.Context, local, remote string, mode os.FileM
 	return cmd.Run()
 }
 
+// probeScript collects everything shunt needs to know about a host in one round
+// trip, as key=value lines so a missing field cannot shift the meaning of the
+// others the way positional output can.
+//
+// It covers the tools shunt shells out to on the host — not just the obvious
+// ones. `tar` streams the image layout into `docker load` and `curl` runs url
+// health checks; when either was missing the deploy got all the way past the
+// container swap before failing, which is the worst possible moment to discover
+// a missing package.
+const probeScript = `
+echo "arch=$(uname -m)"
+echo "docker=$(docker version --format '{{.Server.Version}}' 2>&1 | head -1)"
+echo "rsync=$(rsync --version 2>/dev/null | head -1 | awk '{print $3}')"
+echo "rsync_zstd=$(rsync --version 2>/dev/null | grep -ci zstd)"
+command -v curl >/dev/null && echo "curl=yes" || echo "curl=no"
+command -v tar  >/dev/null && echo "tar=yes"  || echo "tar=no"
+echo "free_kb=$(df -Pk "${SHUNT_ROOT:-$HOME}" 2>/dev/null | awk 'NR==2{print $4}')"
+`
+
 // Probe verifies the host is reachable and reports what shunt needs from it.
 func (c *Client) Probe(ctx context.Context) (Facts, error) {
 	var f Facts
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	out, err := c.Run(ctx, "sh", "-c",
-		`printf '%s\n' "$(uname -m)"; docker version --format '{{.Server.Version}}' 2>&1 | head -1; `+
-			`command -v rsync >/dev/null && echo yes || echo no`)
+	out, err := c.Run(ctx, "sh", "-c", probeScript)
 	if err != nil {
 		return f, err
 	}
-	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) < 3 {
+	kv := map[string]string{}
+	for _, ln := range strings.Split(out, "\n") {
+		if k, v, ok := strings.Cut(strings.TrimSpace(ln), "="); ok {
+			kv[k] = v
+		}
+	}
+	if kv["arch"] == "" {
 		return f, fmt.Errorf("unexpected probe output: %q", out)
 	}
-	f.Arch = strings.TrimSpace(lines[0])
-	f.DockerVersion = strings.TrimSpace(lines[1])
-	f.HasRsync = strings.TrimSpace(lines[2]) == "yes"
+	f.Arch = kv["arch"]
+	f.DockerVersion = kv["docker"]
+	f.RsyncVersion = kv["rsync"]
+	f.HasRsync = f.RsyncVersion != ""
+	f.RsyncZstd = kv["rsync_zstd"] != "" && kv["rsync_zstd"] != "0"
+	f.HasCurl = kv["curl"] == "yes"
+	f.HasTar = kv["tar"] == "yes"
+	if n, err := strconv.ParseInt(kv["free_kb"], 10, 64); err == nil {
+		f.FreeBytes = n * 1024
+	}
 
 	if strings.Contains(strings.ToLower(f.DockerVersion), "cannot connect") ||
 		strings.Contains(strings.ToLower(f.DockerVersion), "permission denied") {
 		return f, fmt.Errorf("docker is not usable as this user on %s: %s\n"+
 			"  add the user to the docker group, or point host= at one that can reach the socket", c.Host, f.DockerVersion)
 	}
-	if !f.HasRsync {
-		return f, fmt.Errorf("rsync is not installed on %s — shunt needs it for incremental image transfer\n"+
-			"  install it with: apt-get install -y rsync", c.Host)
+	if missing := f.Missing(); len(missing) > 0 {
+		return f, fmt.Errorf("%s is missing %s that shunt needs\n  install with: apt-get install -y %s",
+			c.Host, strings.Join(missing, " and "), strings.Join(missing, " "))
 	}
 	return f, nil
+}
+
+// Missing names the required host tools that are absent.
+func (f Facts) Missing() []string {
+	var missing []string
+	if !f.HasRsync {
+		missing = append(missing, "rsync")
+	}
+	if !f.HasTar {
+		missing = append(missing, "tar")
+	}
+	if !f.HasCurl {
+		missing = append(missing, "curl")
+	}
+	return missing
 }
 
 type Facts struct {
 	Arch          string
 	DockerVersion string
-	HasRsync      bool
+
+	HasRsync     bool
+	RsyncVersion string
+	// RsyncZstd reports whether this rsync was built with zstd. Ubuntu 20.04
+	// ships 3.1.3, which has no --compress-choice at all, and stock macOS is
+	// older still — so the flag cannot simply be assumed.
+	RsyncZstd bool
+
+	HasCurl bool // url health checks shell out to it on the host
+	HasTar  bool // the image layout is streamed into `docker load` through it
+
+	// FreeBytes is free space where the store and ledger live. Running out
+	// mid-transfer leaves a partial layout and a confusing error.
+	FreeBytes int64
 }
 
 // GoArch maps uname -m to the GOARCH used to pick a helper binary.

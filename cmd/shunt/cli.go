@@ -179,6 +179,10 @@ func prepare(ctx context.Context, c *commonFlags, noCache bool) (*buildOut, erro
 			ui.ShortDigest(built[name].Digest), ui.Bytes(built[name].Bytes))
 	}
 
+	if err := e.PreflightSpace(built); err != nil {
+		return fail(err)
+	}
+
 	spec, err := e.Spec(ctx, id, built)
 	if err != nil {
 		return fail(err)

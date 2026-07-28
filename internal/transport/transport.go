@@ -18,6 +18,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/OAISP/shunt/internal/sshx"
 )
@@ -43,6 +44,32 @@ type Options struct {
 	LocalDir  string // OCI layout directory
 	RemoteDir string
 	Verbose   bool
+
+	// RemoteZstd reports whether the host's rsync was built with zstd. Both ends
+	// have to support it or the transfer fails outright.
+	RemoteZstd bool
+}
+
+// localZstd reports whether the rsync on this machine understands zstd.
+// Computed once: it costs a subprocess, and it cannot change mid-run.
+var localZstd = sync.OnceValue(func() bool {
+	out, err := exec.Command("rsync", "--version").Output()
+	return err == nil && strings.Contains(strings.ToLower(string(out)), "zstd")
+})
+
+// compressArgs picks a compression mode both ends actually support.
+//
+// zstd at level 1 is the right default — layer blobs are already compressed
+// inside, so this is about the cheap win on the small JSON files rather than the
+// bulk. But --compress-choice only exists from rsync 3.2, and plenty of live
+// hosts are older: Ubuntu 20.04 ships 3.1.3, and macOS ships 2.6.9 as
+// /usr/bin/rsync. Sending the flag to either end fails the deploy outright, so
+// fall back to plain -z, which every rsync in circulation understands.
+func compressArgs(remoteZstd bool) []string {
+	if localZstd() && remoteZstd {
+		return []string{"--compress", "--compress-choice=zstd", "--compress-level=1"}
+	}
+	return []string{"--compress"}
 }
 
 // Push mirrors LocalDir to RemoteDir on the host and reports transfer stats.
@@ -61,15 +88,13 @@ func Push(ctx context.Context, o Options) (*Stats, error) {
 		"--partial",
 		// Deliberately NOT --human-readable: that abbreviates the stats to
 		// "85.38M" and the byte counts below would be parsed wrong.
-		// Layer blobs are already gzip/zstd compressed inside; compressing again
-		// burns CPU for nothing. Only the small JSON files benefit, and
-		// --skip-compress on the blob extension-less names is not expressible,
-		// so we compress at a cheap level and let zstd's fast path handle it.
-		"--compress", "--compress-choice=zstd", "--compress-level=1",
-		"-e", o.Client.SSHCommand(),
-		strings.TrimSuffix(o.LocalDir, "/") + "/",
-		o.Client.Host + ":" + strings.TrimSuffix(o.RemoteDir, "/") + "/",
 	}
+	args = append(args, compressArgs(o.RemoteZstd)...)
+	args = append(args,
+		"-e", o.Client.SSHCommand(),
+		strings.TrimSuffix(o.LocalDir, "/")+"/",
+		o.Client.Host+":"+strings.TrimSuffix(o.RemoteDir, "/")+"/",
+	)
 	if o.Verbose {
 		args = append([]string{"--info=progress2"}, args...)
 	}
@@ -131,6 +156,7 @@ type FileOptions struct {
 	LocalPath  string
 	RemotePath string
 	Verbose    bool
+	RemoteZstd bool
 }
 
 // PushFile copies one file to the host, resumably and incrementally.
@@ -159,12 +185,14 @@ func PushFile(ctx context.Context, o FileOptions) (*Stats, error) {
 		// staged path and use that as the basis instead. On a 5.6 MB database
 		// with a small change that is the difference between 1.5 MB and 15 KB.
 		"--fuzzy",
-		"--compress", "--compress-choice=zstd", "--compress-level=1",
 		"--times",
+	}
+	args = append(args, compressArgs(o.RemoteZstd)...)
+	args = append(args,
 		"-e", o.Client.SSHCommand(),
 		o.LocalPath,
-		o.Client.Host + ":" + o.RemotePath,
-	}
+		o.Client.Host+":"+o.RemotePath,
+	)
 	if o.Verbose {
 		args = append([]string{"--info=progress2"}, args...)
 	}

@@ -23,6 +23,7 @@ import (
 	"github.com/OAISP/shunt/internal/secrets"
 	"github.com/OAISP/shunt/internal/sshx"
 	"github.com/OAISP/shunt/internal/transport"
+	"github.com/OAISP/shunt/internal/ui"
 )
 
 type Engine struct {
@@ -160,10 +161,11 @@ func (e *Engine) Push(ctx context.Context, built map[string]*build.Result, verbo
 	stats := map[string]*transport.Stats{}
 	for _, name := range sortedResultKeys(built) {
 		st, err := transport.Push(ctx, transport.Options{
-			Client:    e.Client,
-			LocalDir:  built[name].Dir,
-			RemoteDir: filepath.Join(e.StorePath(), name),
-			Verbose:   verbose,
+			Client:     e.Client,
+			LocalDir:   built[name].Dir,
+			RemoteDir:  filepath.Join(e.StorePath(), name),
+			Verbose:    verbose,
+			RemoteZstd: e.facts.RsyncZstd,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("push image %s: %w", name, err)
@@ -320,6 +322,7 @@ func (e *Engine) PushArtifacts(ctx context.Context, spec *release.Spec, verbose 
 			LocalPath:  e.LocalArtifactPath(a.Name),
 			RemotePath: a.Staged,
 			Verbose:    verbose,
+			RemoteZstd: e.facts.RsyncZstd,
 		})
 		if err != nil {
 			return nil, err
@@ -327,6 +330,33 @@ func (e *Engine) PushArtifacts(ctx context.Context, spec *release.Spec, verbose 
 		stats[a.Name] = st
 	}
 	return stats, nil
+}
+
+// PreflightSpace refuses a transfer the host has no room for.
+//
+// rsync running out of space partway leaves a truncated blob and an error about
+// a write failure, which tells the operator nothing about the actual problem.
+// Checking first costs nothing — the free-space figure already came back with
+// the probe. The headroom multiplier covers `docker load` unpacking the layout
+// alongside the copy rsync just wrote.
+func (e *Engine) PreflightSpace(built map[string]*build.Result) error {
+	if e.facts.FreeBytes <= 0 {
+		return nil // df was unavailable; not a reason to refuse to deploy
+	}
+	var need int64
+	for _, r := range built {
+		need += r.Bytes
+	}
+	if need == 0 {
+		return nil
+	}
+	const headroom = 3
+	if want := need * headroom; e.facts.FreeBytes < want {
+		return fmt.Errorf("%s has %s free, and this deploy needs roughly %s (%s of images, plus room to unpack them)\n"+
+			"  free some space, or run `shunt prune` to drop superseded images",
+			e.M.Host, ui.Bytes(e.facts.FreeBytes), ui.Bytes(want), ui.Bytes(need))
+	}
+	return nil
 }
 
 // PreflightArtifacts checks the host can actually receive every artifact, before

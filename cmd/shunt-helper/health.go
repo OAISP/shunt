@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"os/exec"
 	"strings"
 	"time"
@@ -133,8 +134,8 @@ func probe(spec *release.Spec, container string, svc release.Service, h *release
 // on the deploy network. Supporting both means a health check can be written as
 // "/health" regardless of which shape the service has.
 func probeBase(spec *release.Spec, container string, svc release.Service) (string, error) {
-	if port, ok := publishedHostPort(svc); ok {
-		return "http://127.0.0.1:" + port, nil
+	if host, port, ok := publishedHostPort(svc); ok {
+		return "http://" + net.JoinHostPort(host, port), nil
 	}
 	port := svc.Expose
 	if svc.Proxy != nil && svc.Proxy.Port != 0 {
@@ -150,23 +151,35 @@ func probeBase(spec *release.Spec, container string, svc release.Service) (strin
 	return fmt.Sprintf("http://%s:%d", ip, port), nil
 }
 
-// publishedHostPort extracts the host port from the first publish mapping,
-// which takes the forms "port", "host:container" or "ip:host:container".
-func publishedHostPort(svc release.Service) (string, bool) {
+// publishedHostPort extracts the address a published service is reachable on
+// from the first publish mapping, which takes the forms "port",
+// "host:container" or "ip:host:container".
+//
+// The bind address matters and used to be discarded. A service published as
+// "10.0.0.5:9090:3000" is not listening on 127.0.0.1, so probing there failed
+// the health check after the container had already been swapped in — a healthy
+// release reported broken because shunt looked in the wrong place.
+func publishedHostPort(svc release.Service) (host, port string, ok bool) {
 	for _, p := range svc.Publish {
 		// Strip any /tcp or /udp suffix before splitting.
 		spec, _, _ := strings.Cut(p, "/")
 		parts := strings.Split(spec, ":")
 		switch len(parts) {
 		case 2: // hostPort:containerPort
-			return parts[0], true
+			return "127.0.0.1", parts[0], true
 		case 3: // ip:hostPort:containerPort
-			return parts[1], true
+			addr := parts[0]
+			// 0.0.0.0 and :: mean "every interface", which includes loopback and
+			// is the one address certain to be reachable from the host itself.
+			if addr == "" || addr == "0.0.0.0" || addr == "::" {
+				addr = "127.0.0.1"
+			}
+			return addr, parts[1], true
 		}
 		// A bare container port means Docker picks a random host port; there is
 		// nothing stable to probe.
 	}
-	return "", false
+	return "", "", false
 }
 
 func tailLogs(container string, n int) string {

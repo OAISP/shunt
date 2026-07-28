@@ -616,19 +616,26 @@ func TestPrunePreviousRetainZeroKeepsNothing(t *testing.T) {
 // reachable on.
 func TestPublishedHostPort(t *testing.T) {
 	for _, tc := range []struct {
-		publish []string
-		want    string
-		ok      bool
+		publish    []string
+		host, port string
+		ok         bool
 	}{
-		{[]string{"127.0.0.1:9350:3000"}, "9350", true},
-		{[]string{"9350:3000"}, "9350", true},
-		{[]string{"0.0.0.0:8080:3000/tcp"}, "8080", true},
-		{[]string{"3000"}, "", false}, // random host port; nothing stable to probe
-		{nil, "", false},
+		{[]string{"9090:3000"}, "127.0.0.1", "9090", true},
+		{[]string{"127.0.0.1:9090:3000"}, "127.0.0.1", "9090", true},
+		// The bind address must be honoured, not assumed: probing loopback for a
+		// service bound elsewhere failed health after the swap had happened.
+		{[]string{"10.0.0.5:9090:3000"}, "10.0.0.5", "9090", true},
+		// "every interface" includes loopback, which is what the host can reach.
+		{[]string{"0.0.0.0:9090:3000"}, "127.0.0.1", "9090", true},
+		{[]string{"9090:3000/tcp"}, "127.0.0.1", "9090", true},
+		// A bare container port means docker picks a random host port.
+		{[]string{"3000"}, "", "", false},
+		{nil, "", "", false},
 	} {
-		got, ok := publishedHostPort(release.Service{Publish: tc.publish})
-		if got != tc.want || ok != tc.ok {
-			t.Errorf("publishedHostPort(%v) = (%q, %v), want (%q, %v)", tc.publish, got, ok, tc.want, tc.ok)
+		host, port, ok := publishedHostPort(release.Service{Publish: tc.publish})
+		if host != tc.host || port != tc.port || ok != tc.ok {
+			t.Errorf("publishedHostPort(%v) = (%q, %q, %v), want (%q, %q, %v)",
+				tc.publish, host, port, ok, tc.host, tc.port, tc.ok)
 		}
 	}
 }
