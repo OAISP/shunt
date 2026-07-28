@@ -624,14 +624,35 @@ baked into an image, never written to a local temp file, and never passed as
 arguments to the helper — so they cannot leak through your shell history, a
 stray file in `/tmp`, `ps` on either machine, or a published image layer.
 
-**The boundary is the host's Docker socket.** Docker expands `--env-file` into
-the container's own configuration, so anyone who can reach the Docker API on that
-host can read the values back with `docker inspect`. That is not a gap shunt can
-close: as the [Security](#security) section notes, socket access is already root
-on that host, and a process that can read the container config can equally read
-the `0600` env-file or the container's memory. Treat "can talk to the Docker
-socket" as "can read every secret in this project", and scope your deploy user
-accordingly.
+**The boundary is the host's Docker socket.** Anyone who can reach the Docker
+API on that host is root there: they can exec into the container, read the
+`0600` file directly, or read the process's memory. Treat "can talk to the
+Docker socket" as "can read every secret in this project", and scope your deploy
+user accordingly. No delivery mechanism changes that.
+
+What *is* worth changing is the passive copy. By default Docker expands
+`--env-file` into the container's own configuration, so the values come back out
+of `docker inspect` — and therefore out of anything that captures it: a
+monitoring agent, a bug report, a support ticket, an image made with
+`docker commit`. Set `mode = "file"` and each secret is written to its own
+`0600` file in a `0700` directory mounted read-only at `/run/secrets` instead:
+
+```toml
+[secrets]
+provider = "file"
+path     = "secrets/prod.env"
+mode     = "file"          # env (default) | file
+```
+
+```sh
+# in the app
+DATABASE_URL="$(cat /run/secrets/DATABASE_URL)"
+```
+
+Same path Docker Swarm and Kubernetes use, so an app written for either already
+looks in the right place. Measured on a live host: with `mode = "env"` the value
+appears in `docker inspect`; with `mode = "file"` it does not. Per-service
+`secrets = [...]` scoping works in both modes.
 
 Two things follow from that, worth knowing before you rely on either:
 

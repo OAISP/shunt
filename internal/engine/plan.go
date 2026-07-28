@@ -41,6 +41,10 @@ type Plan struct {
 	// re-derive shunt's own notion of "is there work to do".
 	HasChanges bool `json:"has_changes"`
 
+	// Release lists release-wide settings that changed — things that belong to
+	// no individual service but alter how all of them are created.
+	Release []string `json:"release,omitempty"`
+
 	// SecretsUnknown means the values could not be resolved here, so the secret
 	// diff is absent rather than empty. Applying a bundle on a machine without
 	// the provider is the case: reporting every key as removed would be worse
@@ -215,7 +219,12 @@ func (p *Plan) Changed() bool {
 			return true
 		}
 	}
-	return false
+	// Settings that belong to the release rather than to any one service —
+	// switching secrets from environment to files, renaming the network —
+	// change how every container is created but appear in no service diff.
+	// Without this they were silently ignored until something else forced a
+	// deploy, which is the same shape of bug stages had.
+	return len(p.Release) > 0
 }
 
 // BuildPlan diffs a freshly-built spec against the host's ledger.
@@ -321,6 +330,8 @@ func (e *Engine) BuildPlan(ctx context.Context, spec *release.Spec, built map[st
 	}
 
 	p.Stages = diffStages(oldSpec, spec)
+
+	p.Release = diffRelease(oldSpec, spec)
 
 	var salt string
 	if state != nil && state.Ledger != nil {
@@ -525,6 +536,30 @@ func diffService(old, nw release.Service) []string {
 		}
 	}
 	return r
+}
+
+// diffRelease reports settings that apply to the whole release rather than to
+// any one service.
+func diffRelease(old, nw *release.Spec) []string {
+	if old == nil {
+		return nil
+	}
+	var out []string
+	if old.Network != nw.Network {
+		out = append(out, fmt.Sprintf("network %s → %s", old.Network, nw.Network))
+	}
+	if old.SecretMode != nw.SecretMode {
+		out = append(out, fmt.Sprintf("secret delivery %s → %s",
+			secretModeName(old.SecretMode), secretModeName(nw.SecretMode)))
+	}
+	return out
+}
+
+func secretModeName(m string) string {
+	if m == "file" {
+		return "files under /run/secrets"
+	}
+	return "environment"
 }
 
 // diffSecrets compares key sets and whether values moved — never the values.

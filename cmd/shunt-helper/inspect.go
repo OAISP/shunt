@@ -182,6 +182,7 @@ func cmdPrune(args []string) error {
 			return err
 		}
 		pruneEnvFiles(project, keepIDs)
+		pruneSecretDirs(project, keepIDs)
 		return nil
 	})
 }
@@ -243,6 +244,27 @@ func pruneImages(project string, keep map[string]bool) error {
 		info(fmt.Sprintf("pruned %d superseded image(s)", removed))
 	}
 	return nil
+}
+
+// pruneSecretDirs drops the file-mode secret directories of releases that are
+// no longer restorable, on the same keep set as the env-files and the images.
+//
+// Gated together deliberately, for the same reason: these are the only
+// plaintext copy of a release's secrets, so dropping one while its images
+// survive leaves a release that looks restorable and is not.
+func pruneSecretDirs(project string, keepIDs map[string]bool) {
+	dir := filepath.Join(projectDir(project), "secrets")
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range ents {
+		// "<id>" or, for a narrowed service, "<id>.<scope>".
+		id, _, _ := strings.Cut(e.Name(), ".")
+		if !keepIDs[id] {
+			os.RemoveAll(filepath.Join(dir, e.Name()))
+		}
+	}
 }
 
 // pruneEnvFiles drops the env-files of releases that are no longer restorable.

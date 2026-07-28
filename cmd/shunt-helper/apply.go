@@ -87,9 +87,14 @@ func apply(spec *release.Spec) error {
 	if err := loadImages(spec); err != nil {
 		return finish(err)
 	}
-	envFile, err := writeEnvFile(spec)
-	if err != nil {
-		return finish(err)
+	// In file mode the per-service directories are written as containers start,
+	// so there is no single env-file to prepare here.
+	envFile := ""
+	if !spec.SecretsAsFiles() {
+		var err error
+		if envFile, err = writeEnvFile(spec); err != nil {
+			return finish(err)
+		}
 	}
 
 	// Accessories come up first so stages have a database to talk to. Existing
@@ -138,6 +143,7 @@ func apply(spec *release.Spec) error {
 		info("image prune: " + err.Error())
 	}
 	pruneEnvFiles(spec.Project, keepIDs)
+	pruneSecretDirs(spec.Project, keepIDs)
 
 	emit(release.Event{Kind: release.KindResult, Release: spec.ID, Status: release.StatusActive})
 	return finish(nil)

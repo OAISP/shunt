@@ -124,16 +124,28 @@ func startContainer(spec *release.Spec, name string, svc release.Service, envFil
 	if spec.Network != "" {
 		args = append(args, "--network", spec.Network, "--network-alias", name)
 	}
-	// A service that narrowed its secrets gets a file holding only those.
-	if len(svc.Secrets) > 0 {
-		scoped, err := writeEnvFileScoped(spec, svc.Secrets)
-		if err != nil {
-			return fmt.Errorf("service %s: %w", name, err)
+	if spec.SecretsAsFiles() {
+		// Values reach the container as files rather than environment, so they
+		// never enter its configuration and never come back out of inspect.
+		if len(spec.Secrets) > 0 {
+			dir, err := writeSecretFiles(spec, svc.Secrets)
+			if err != nil {
+				return fmt.Errorf("service %s: %w", name, err)
+			}
+			args = append(args, "-v", dir+":"+release.SecretMountPath+":ro")
 		}
-		envFile = scoped
-	}
-	if envFile != "" {
-		args = append(args, "--env-file", envFile)
+	} else {
+		// A service that narrowed its secrets gets a file holding only those.
+		if len(svc.Secrets) > 0 {
+			scoped, err := writeEnvFileScoped(spec, svc.Secrets)
+			if err != nil {
+				return fmt.Errorf("service %s: %w", name, err)
+			}
+			envFile = scoped
+		}
+		if envFile != "" {
+			args = append(args, "--env-file", envFile)
+		}
 	}
 	for _, k := range slices.Sorted(maps.Keys(svc.Env)) {
 		args = append(args, "-e", k+"="+svc.Env[k])

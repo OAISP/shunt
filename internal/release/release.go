@@ -51,9 +51,14 @@ type Spec struct {
 	Services map[string]Service `json:"services"`
 	Order    []string           `json:"order"` // service start order, precomputed by the CLI
 
-	// Secrets are applied to every service and stage via an --env-file written
-	// 0600 on the host. Values never appear in argv or in `docker inspect`.
+	// Secrets are applied to every service and stage on the host, either as an
+	// --env-file or as files under /run/secrets. See SecretMode.
 	Secrets map[string]string `json:"secrets,omitempty"`
+
+	// SecretMode is "env" (default) or "file". In file mode each secret is
+	// written to its own 0600 file in a directory mounted read-only at
+	// /run/secrets, which keeps the values out of `docker inspect`.
+	SecretMode string `json:"secret_mode,omitempty"`
 
 	// Provenance records where this release came from. It is carried on the
 	// spec so the host can store it with the release, which is what lets
@@ -282,6 +287,14 @@ func HashService(svc Service) string {
 // does not say. Both ends fall back to it, so a spec that predates the field
 // prunes the same way a current one does.
 const DefaultRetain = 5
+
+// SecretsAsFiles reports whether this release delivers secrets as files.
+func (s *Spec) SecretsAsFiles() bool { return s.SecretMode == "file" }
+
+// SecretMountPath is where a file-mode secrets directory is mounted. Fixed
+// rather than configurable: it is the same path Docker Swarm and Kubernetes
+// use, so an app written for either already looks in the right place.
+const SecretMountPath = "/run/secrets"
 
 // Release statuses recorded in the ledger.
 //

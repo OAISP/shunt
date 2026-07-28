@@ -266,8 +266,17 @@ func (e *Engine) Spec(ctx context.Context, id string, built map[string]*build.Re
 		Services:       svcs,
 		Order:          e.M.StartOrder(),
 		Secrets:        sec,
+		SecretMode:     secretMode(e.M),
 	}
 	return spec, nil
+}
+
+// secretMode reports how this manifest wants secrets delivered.
+func secretMode(m *manifest.Manifest) string {
+	if m.Secrets != nil && m.Secrets.Mode == "file" {
+		return "file"
+	}
+	return ""
 }
 
 // StagedPath is where an artifact is transferred to before being swapped into
@@ -763,8 +772,9 @@ func (e *Engine) Exec(ctx context.Context, container string, command []string) e
 // running service sees, without secrets being re-sent or re-resolved.
 func (e *Engine) RunOneOff(ctx context.Context, releaseID, imageRef string, command []string) error {
 	envFile := filepath.Join(e.root, e.M.Project, "env", releaseID+".env")
+	secretsDir := filepath.Join(e.root, e.M.Project, "secrets", releaseID)
 	argv := []string{"sh", "-c", oneOffScript()}
-	argv = append(argv, "--", e.M.Network, envFile, imageRef)
+	argv = append(argv, "--", e.M.Network, envFile, secretsDir, imageRef)
 	argv = append(argv, command...)
 	return e.Client.Interactive(ctx, argv...)
 }
@@ -773,11 +783,14 @@ func (e *Engine) RunOneOff(ctx context.Context, releaseID, imageRef string, comm
 // refuses to start at all when --env-file names a missing path. Deciding that
 // on the host keeps it to a single round trip.
 func oneOffScript() string {
-	return `net="$1"; env="$2"; img="$3"; shift 3
+	// Whichever form the release used is what a one-off gets, decided by what is
+	// actually on disk rather than by threading the mode through.
+	return `net="$1"; env="$2"; sec="$3"; img="$4"; shift 4
 args="--rm -i"
 [ -t 0 ] && args="$args -t"
 [ -n "$net" ] && args="$args --network $net"
 [ -f "$env" ] && args="$args --env-file $env"
+[ -d "$sec" ] && args="$args -v $sec:/run/secrets:ro"
 exec docker run $args "$img" "$@"`
 }
 

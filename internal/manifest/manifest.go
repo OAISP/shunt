@@ -231,6 +231,21 @@ type Secrets struct {
 	Provider string   `toml:"provider"` // file | env | sops
 	Path     string   `toml:"path"`
 	Keys     []string `toml:"keys"` // provider=env: which vars to forward
+
+	// Mode is how secrets reach the container: as environment variables
+	// ("env", the default) or as files under /run/secrets ("file").
+	//
+	// Docker expands --env-file into the container's own configuration, so in
+	// env mode the values come back out of `docker inspect` — and therefore out
+	// of anything that captures it: a monitoring agent, a bug report, a support
+	// ticket, an image made with `docker commit`. File mode mounts a 0600
+	// directory read-only instead, so inspect shows a path rather than a value.
+	//
+	// This does not change who *can* read the secrets. Anyone who can reach the
+	// Docker socket is root on that host and can exec into the container or read
+	// the file directly. What it removes is the passive copy that leaks by being
+	// printed.
+	Mode string `toml:"mode"`
 }
 
 // Duration wraps time.Duration so TOML can carry "3s" as a string.

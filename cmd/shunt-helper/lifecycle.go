@@ -60,7 +60,16 @@ func cmdRollback(args []string) error {
 		// If retention already dropped it, say so instead of silently starting
 		// containers with no environment at all.
 		envFile := envFilePath(project, target.ID)
-		if len(spec.Secrets) > 0 {
+		if spec.SecretsAsFiles() {
+			// File mode writes a directory per release; the containers are
+			// recreated from it, so it has to still be there.
+			if len(spec.Secrets) > 0 {
+				if _, err := os.Stat(secretsDir(project, target.ID, nil)); err != nil {
+					return fmt.Errorf("the secrets for release %s have been pruned; roll back to a newer release or redeploy that commit", target.ID)
+				}
+			}
+			envFile = ""
+		} else if len(spec.Secrets) > 0 {
 			if _, err := os.Stat(envFile); err != nil {
 				return fmt.Errorf("the env-file for release %s has been pruned; roll back to a newer release or redeploy that commit", target.ID)
 			}

@@ -61,6 +61,78 @@ func writeEnvFile(spec *release.Spec) (string, error) {
 	return writeEnvFileAt(spec, envFilePath(spec.Project, spec.ID))
 }
 
+// secretsDir is where a release's file-mode secrets live on the host.
+func secretsDir(project, id string, scope []string) string {
+	name := id
+	if len(scope) > 0 {
+		name = id + "." + scopeDigest(scope)
+	}
+	return filepath.Join(projectDir(project), "secrets", name)
+}
+
+func scopeDigest(scope []string) string {
+	keys := append([]string(nil), scope...)
+	sort.Strings(keys)
+	sum := sha256.Sum256([]byte(strings.Join(keys, "\x00")))
+	return hex.EncodeToString(sum[:])[:8]
+}
+
+// writeSecretFiles materialises secrets as one 0600 file per key in a 0700
+// directory, and returns the directory to mount.
+//
+// This is the alternative to --env-file. Docker copies an env-file into the
+// container's configuration, so those values come back out of `docker inspect`
+// and out of anything that captures it. A mount shows a path instead.
+//
+// It does not change who can read them: Docker socket access is root on the
+// host, and root can exec into the container or read the file directly. What it
+// removes is the copy that leaks by being printed.
+func writeSecretFiles(spec *release.Spec, scope []string) (string, error) {
+	values := spec.Secrets
+	if len(scope) > 0 {
+		values = map[string]string{}
+		var missing []string
+		for _, k := range scope {
+			v, ok := spec.Secrets[k]
+			if !ok {
+				missing = append(missing, k)
+				continue
+			}
+			values[k] = v
+		}
+		if len(missing) > 0 {
+			return "", fmt.Errorf("secrets %s are not provided by this release", strings.Join(missing, ", "))
+		}
+	}
+
+	dir := secretsDir(spec.Project, spec.ID, scope)
+	// Rewritten from scratch, so a key removed from the manifest does not linger
+	// as a file the app can still read.
+	if err := os.RemoveAll(dir); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	for _, k := range sortedSecretKeys(values) {
+		// No trailing newline: a file secret is the value, and an app reading it
+		// whole should not have to strip anything.
+		if err := os.WriteFile(filepath.Join(dir, k), []byte(values[k]), 0o600); err != nil {
+			return "", err
+		}
+	}
+	return dir, nil
+}
+
+func sortedSecretKeys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func writeEnvFileAt(spec *release.Spec, p string) (string, error) {
 	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return "", err
@@ -103,7 +175,15 @@ func runStage(spec *release.Spec, st release.Stage, envFile string) error {
 		return err
 	}
 	args := []string{"run", "--rm", "--network", spec.Network}
-	if envFile != "" {
+	if spec.SecretsAsFiles() {
+		if len(spec.Secrets) > 0 {
+			dir, err := writeSecretFiles(spec, nil)
+			if err != nil {
+				return err
+			}
+			args = append(args, "-v", dir+":"+release.SecretMountPath+":ro")
+		}
+	} else if envFile != "" {
 		args = append(args, "--env-file", envFile)
 	}
 	for _, k := range slices.Sorted(maps.Keys(st.Env)) {

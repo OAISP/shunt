@@ -158,6 +158,11 @@ func (m *Manifest) Validate() error {
 		default:
 			add("secrets: unknown provider %q (want file, env, or sops)", m.Secrets.Provider)
 		}
+		switch m.Secrets.Mode {
+		case "", "env", "file":
+		default:
+			add("secrets: unknown mode %q (want env or file)", m.Secrets.Mode)
+		}
 	}
 
 	for name, t := range m.Targets {

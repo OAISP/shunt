@@ -22,6 +22,7 @@ func (p *Plan) Render(w io.Writer, s ui.Style) {
 	p.renderArtifacts(w, s)
 	p.renderStages(w, s)
 	p.renderServices(w, s)
+	p.renderRelease(w, s)
 	p.renderSecrets(w, s)
 	fmt.Fprintln(w)
 }
@@ -150,6 +151,17 @@ func (p *Plan) renderServices(w io.Writer, s ui.Style) {
 			fmt.Fprintf(w, "  %s %-*s %s\n", s.Warn(), nameCol, svc.Name, s.Amber("orphaned"))
 			renderReasons(w, s, svc.Reasons)
 		}
+	}
+}
+
+// renderRelease shows settings that change how every container is created.
+func (p *Plan) renderRelease(w io.Writer, s ui.Style) {
+	if len(p.Release) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "\n%s %s\n", s.Bold("release"), s.Dim("(applies to every container)"))
+	for _, r := range p.Release {
+		fmt.Fprintf(w, "  %s %s\n", s.Change(), r)
 	}
 }
 
