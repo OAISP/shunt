@@ -224,6 +224,25 @@ mv shunt.toml.bak shunt.toml
 echo "v3" > index.html
 "$SHUNT" up -y </dev/null >/dev/null 2>&1 || true
 
+# ----------------------------------------------------------------- bundle ----
+# A bundle has to apply from a directory with no manifest, no Dockerfile and no
+# source — that is the entire point of it.
+step "bundle and apply"
+BUNDLE_DIR="$WORK/elsewhere"
+mkdir -p "$BUNDLE_DIR"
+echo "v5" > index.html
+succeeds "bundle builds a release into a file" "$SHUNT" bundle -o "$BUNDLE_DIR/rel.shuntpkg"
+
+( cd "$BUNDLE_DIR" && "$SHUNT" apply rel.shuntpkg -y ) >/dev/null 2>&1 || true
+eq "the bundle deployed" "$(served)" "v5"
+
+# Immutable release ids mean the host has already recorded this one.
+if ( cd "$BUNDLE_DIR" && "$SHUNT" apply rel.shuntpkg -y ) >/dev/null 2>&1; then
+  bad "applying the same bundle twice is refused"
+else
+  ok "applying the same bundle twice is refused"
+fi
+
 # ----------------------------------------------------------------- retire ----
 step "retire"
 python3 - <<'PY'

@@ -90,10 +90,10 @@ type Provenance struct {
 // Describe renders provenance for a human, or "" when nothing is known.
 func (p Provenance) Describe() string {
 	if p.Short == "" {
-		if p.Deployer == "" {
-			return ""
-		}
-		return "by " + p.Deployer
+		// No git metadata — a tarball checkout, or a bundle built outside a repo.
+		// The deployer alone is still worth saying, but "by X" reads wrong after
+		// the caller's "from".
+		return p.Deployer
 	}
 	s := p.Short
 	if p.Branch != "" {

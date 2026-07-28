@@ -400,6 +400,48 @@ Incrementally, like everything else: refreshing a stale local copy of a 500 MB
 database moves only the blocks that changed. Useful for working against real
 data, and for retrieving the pre-migration dump a `capture` stage produced.
 
+## Bundles
+
+Sometimes the machine that can build a release cannot reach the machine that
+should run it — an air-gapped network, a change-approval queue, a laptop with
+the source but no VPN.
+
+```sh
+shunt bundle                       # writes <project>-<release>.shuntpkg
+scp acme-20260728-….shuntpkg ops:  # or a USB stick, or an approval queue
+shunt apply acme-20260728-….shuntpkg
+```
+
+`shunt bundle` does everything `shunt up` does up to the transfer and writes the
+result to a file instead of a host. It never connects, so it works with the
+target unreachable.
+
+`shunt apply` needs **no Dockerfile, no shunt.toml and no source** — and no
+Docker at all on the machine that runs it. It deploys through exactly the same
+path as `shunt up`: the same lock held across the transfer, the same check that
+the host has not moved on since the plan, the same helper. Layer deduplication
+still applies, so re-applying a bundle to a host that already has most of the
+image ships only the difference.
+
+A bundle carries the release spec, the OCI layouts and any artifacts. It
+deliberately does **not** carry:
+
+- **Secret values.** A file that sits in a queue or on a stick is the last place
+  production credentials belong, and encrypting them into it only moves the key
+  problem. The provider block travels instead, and `shunt apply` resolves the
+  values locally — so whoever applies a bundle needs access to the secrets,
+  which is the correct requirement.
+- **The host helper.** The CLI applying the bundle already embeds one.
+- **A checksum of its own.** Every blob inside is content-addressed and rehashed
+  on load, so a damaged bundle fails on the way in.
+
+Bundles are always complete rather than a delta against a particular host: a
+delta is only valid against the state it was computed from, and that is not a
+promise a file sitting in a queue can keep.
+
+Applying the same bundle twice is refused — release ids are immutable, and the
+host has already recorded that one. Deploy elsewhere with `--host`.
+
 ## Commands
 
 | command | |

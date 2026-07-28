@@ -33,7 +33,16 @@ type Engine struct {
 	root       string // resolved SHUNT_ROOT on the host
 	helperPath string
 	facts      sshx.Facts
+
+	// artifactSrc overrides where an artifact's local copy is read from. A
+	// bundle supplies its own extracted paths, having no manifest to resolve
+	// them against.
+	artifactSrc map[string]string
 }
+
+// SetArtifactSources points artifact transfers at explicit local paths instead
+// of the manifest's src fields.
+func (e *Engine) SetArtifactSources(paths map[string]string) { e.artifactSrc = paths }
 
 func New(m *manifest.Manifest) *Engine {
 	return &Engine{M: m, Client: sshx.New(m.Host)}
@@ -352,6 +361,9 @@ func linkDestFor(a release.Artifact, present map[string]transport.FileStat) stri
 
 // LocalArtifactPath is the source file for a named artifact.
 func (e *Engine) LocalArtifactPath(name string) string {
+	if p, ok := e.artifactSrc[name]; ok {
+		return p
+	}
 	for _, a := range e.M.Artifacts {
 		if a.Name == name {
 			return e.M.Abs(a.Src)
@@ -490,13 +502,25 @@ func (e *Engine) PreflightSpace(built map[string]*build.Result) error {
 // tells the operator nothing useful, so every destination directory is probed in
 // a single round trip and each failure names its own fix.
 func (e *Engine) PreflightArtifacts(ctx context.Context) error {
-	if len(e.M.Artifacts) == 0 {
+	dests := make([]string, 0, len(e.M.Artifacts))
+	for _, a := range e.M.Artifacts {
+		dests = append(dests, a.Dest)
+	}
+	return e.PreflightArtifactDests(ctx, dests)
+}
+
+// PreflightArtifactDests is the same check driven by explicit destinations,
+// which is what a bundle has: it carries a release, not a manifest, so the
+// paths come from the spec. Skipping this was why applying a bundle with an
+// artifact failed at rsync with a bare "No such file or directory".
+func (e *Engine) PreflightArtifactDests(ctx context.Context, dests []string) error {
+	if len(dests) == 0 {
 		return nil
 	}
 	dirs := map[string]bool{}
-	for _, a := range e.M.Artifacts {
-		if a.Dest != "" {
-			dirs[filepath.Dir(a.Dest)] = true
+	for _, d := range dests {
+		if d != "" {
+			dirs[filepath.Dir(d)] = true
 		}
 	}
 	var script strings.Builder
