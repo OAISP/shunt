@@ -8,14 +8,16 @@ import (
 	"github.com/OAISP/shunt/internal/release"
 )
 
+const testSalt = "0123456789abcdef"
+
 // The host's ledger stores hashed secrets while a freshly-resolved spec holds
 // plaintext. Comparing them directly reported every key as changed on every
 // deploy; diffSecrets must hash before comparing.
 func TestDiffSecretsComparesAgainstHashedLedgerValues(t *testing.T) {
 	old := &release.Spec{Secrets: map[string]string{
-		"KEEP":    release.HashSecret("same"),
-		"ROTATED": release.HashSecret("old-value"),
-		"DROPPED": release.HashSecret("gone"),
+		"KEEP":    release.HashSecret(testSalt, "same"),
+		"ROTATED": release.HashSecret(testSalt, "old-value"),
+		"DROPPED": release.HashSecret(testSalt, "gone"),
 	}}
 	nw := &release.Spec{Secrets: map[string]string{
 		"KEEP":    "same",
@@ -23,7 +25,7 @@ func TestDiffSecretsComparesAgainstHashedLedgerValues(t *testing.T) {
 		"ADDED":   "brand-new",
 	}}
 
-	sc := diffSecrets(old, nw)
+	sc := diffSecrets(old, nw, testSalt)
 	if len(sc.Changed) != 1 || sc.Changed[0] != "ROTATED" {
 		t.Errorf("Changed = %v, want [ROTATED]", sc.Changed)
 	}
@@ -39,9 +41,60 @@ func TestDiffSecretsComparesAgainstHashedLedgerValues(t *testing.T) {
 }
 
 func TestDiffSecretsAgainstFirstDeploy(t *testing.T) {
-	sc := diffSecrets(nil, &release.Spec{Secrets: map[string]string{"A": "1", "B": "2"}})
+	sc := diffSecrets(nil, &release.Spec{Secrets: map[string]string{"A": "1", "B": "2"}}, testSalt)
 	if len(sc.Added) != 2 || sc.Added[0] != "A" || sc.Added[1] != "B" {
 		t.Errorf("Added = %v, want [A B] sorted", sc.Added)
+	}
+}
+
+// Drift is measured against what the host recorded as *applied*, not against
+// the last release's spec.
+//
+// The regression: `up` records the manifest it was handed even though it
+// deliberately leaves an existing accessory alone. Diffing against that made a
+// reported drift disappear after any unrelated deploy, while the container went
+// on running the old config — the warning vanished and the problem did not.
+func TestAccessoryDriftSurvivesAnUnrelatedDeploy(t *testing.T) {
+	running := release.Service{Image: "postgres:17-alpine", Restart: "unless-stopped"}
+	wanted := release.Service{Image: "postgres:18-alpine", Restart: "unless-stopped"}
+
+	// The previous deploy already recorded the *new* definition in its spec,
+	// which is exactly the state that used to hide the drift.
+	oldSpec := &release.Spec{Accessories: map[string]release.Service{"db": wanted}}
+	state := &RemoteState{Ledger: &release.Ledger{
+		Current:     "r1",
+		Releases:    []release.Entry{{ID: "r1", Status: release.StatusActive, Spec: oldSpec}},
+		Accessories: map[string]string{"db": release.HashService(running)},
+	}}
+	spec := &release.Spec{
+		ID:          "r2",
+		Accessories: map[string]release.Service{"db": wanted},
+		Services:    map[string]release.Service{},
+	}
+
+	p := &Plan{}
+	e := &Engine{}
+	got := e.planAccessories(p, spec, state, oldSpec)
+	if len(got) != 1 {
+		t.Fatalf("planAccessories returned %d entries, want 1", len(got))
+	}
+	if got[0].Action != "drift" {
+		t.Fatalf("accessory action = %q, want drift — the container still runs the old image", got[0].Action)
+	}
+}
+
+// Once `shunt boot` has actually applied the definition, the drift is resolved
+// and must stop being reported.
+func TestAccessoryIsUnchangedOnceApplied(t *testing.T) {
+	svc := release.Service{Image: "postgres:18-alpine", Restart: "unless-stopped"}
+	state := &RemoteState{Ledger: &release.Ledger{
+		Accessories: map[string]string{"db": release.HashService(svc)},
+	}}
+	spec := &release.Spec{Accessories: map[string]release.Service{"db": svc}}
+
+	got := (&Engine{}).planAccessories(&Plan{}, spec, state, nil)
+	if got[0].Action != "unchanged" {
+		t.Fatalf("accessory action = %q, want unchanged", got[0].Action)
 	}
 }
 

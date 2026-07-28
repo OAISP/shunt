@@ -5,8 +5,11 @@
 package release
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"time"
 )
 
@@ -124,9 +127,54 @@ type Stage struct {
 // Ledger is the host-side record of what has been deployed. It lives at
 // <root>/<project>/releases.json and is the authority for status and rollback.
 type Ledger struct {
-	Project  string  `json:"project"`
-	Current  string  `json:"current"`
+	Project string `json:"project"`
+
+	// Current is the release believed to be *serving*. A deploy that fails
+	// before replacing any running container does not move it — the previous
+	// release is still up, and reporting otherwise would contradict the error
+	// the operator was just shown.
+	Current string `json:"current"`
+
+	// LastAttempt is the most recent deploy regardless of outcome. It differs
+	// from Current exactly when the last deploy failed without taking over.
+	LastAttempt string `json:"last_attempt,omitempty"`
+
+	// Accessories records the definition hash of each accessory as it was
+	// actually applied — when its container was created or recreated — keyed by
+	// name.
+	//
+	// It has to be tracked separately from the release spec because a deploy
+	// records the manifest it was *given*, not the accessory state it *applied*:
+	// `up` deliberately leaves an existing accessory alone. Diffing the manifest
+	// against the last recorded spec therefore made drift disappear after any
+	// unrelated deploy, while the container kept running the old config.
+	Accessories map[string]string `json:"accessories,omitempty"`
+
+	// Salt keys the secret hashes stored in this ledger. Generated once per
+	// project on the host, so a truncated digest of a low-entropy value is not
+	// brute-forceable from the ledger alone.
+	Salt string `json:"salt,omitempty"`
+
 	Releases []Entry `json:"releases"`
+}
+
+// RecordAccessory notes the definition an accessory container was created with.
+func (l *Ledger) RecordAccessory(name string, svc Service) {
+	if l.Accessories == nil {
+		l.Accessories = map[string]string{}
+	}
+	l.Accessories[name] = HashService(svc)
+}
+
+// HashService fingerprints a service or accessory definition. encoding/json
+// sorts map keys, so the same definition always produces the same digest.
+func HashService(svc Service) string {
+	b, err := json.Marshal(svc)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return "h:" + hex.EncodeToString(sum[:])[:16]
 }
 
 // DefaultRetain is how many restorable releases a host keeps when the manifest
@@ -135,11 +183,23 @@ type Ledger struct {
 const DefaultRetain = 5
 
 // Release statuses recorded in the ledger.
+//
+// The distinction between failed and degraded is the whole point of recording a
+// status at all: one means the host is exactly as it was, the other means it is
+// not, and an operator reading `shunt status` after a bad night needs to know
+// which without inferring it from an error message.
 const (
 	StatusActive     = "active"     // currently serving
 	StatusSuperseded = "superseded" // replaced by a later release
-	StatusFailed     = "failed"     // did not reach a healthy state
+	StatusFailed     = "failed"     // failed before any running container was replaced
+	StatusDegraded   = "degraded"   // failed partway; the host is running a mix
 )
+
+// Healthy reports whether an entry represents a release that took over cleanly.
+// Failed and degraded releases are neither serving nor safe to roll onto.
+func (e *Entry) Healthy() bool {
+	return e.Status != StatusFailed && e.Status != StatusDegraded
+}
 
 type Entry struct {
 	ID         string              `json:"id"`
@@ -159,9 +219,25 @@ type Entry struct {
 // host's ledger. Both ends use it: the helper redacts with it before persisting,
 // and the CLI applies it to freshly-resolved values so `shunt plan` can compare
 // like with like without a plaintext secret ever crossing back.
-func HashSecret(v string) string {
-	sum := sha256.Sum256([]byte(v))
-	return "h:" + hex.EncodeToString(sum[:])[:16]
+//
+// Keyed by a per-project salt rather than a bare digest. Plenty of real secrets
+// are low-entropy or drawn from a known format — a six-digit pin, a postcode, an
+// api key with a fixed prefix — and an unsalted truncated sha256 of those is
+// recoverable by anyone who reads the ledger. The salt makes the stored digests
+// useless off that host while still comparing equal for equal values.
+func HashSecret(salt, v string) string {
+	m := hmac.New(sha256.New, []byte(salt))
+	m.Write([]byte(v))
+	return "h:" + hex.EncodeToString(m.Sum(nil))[:16]
+}
+
+// NewSalt generates a project's secret-hash salt.
+func NewSalt() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
 }
 
 // Find returns the entry with the given id, or nil.
@@ -176,7 +252,7 @@ func (l *Ledger) Find(id string) *Entry {
 
 // Restorable reports whether this entry can serve as a rollback target: it
 // reached a healthy state, and it retained the spec needed to replay it.
-func (e *Entry) Restorable() bool { return e.Status != StatusFailed && e.Spec != nil }
+func (e *Entry) Restorable() bool { return e.Healthy() && e.Spec != nil }
 
 // KeepIDs returns the releases whose images and env-files must survive pruning:
 // the newest `retain` restorable ones, plus whatever is currently active.
@@ -240,7 +316,9 @@ func (l *Ledger) Previous() *Entry {
 			seenCurrent = true
 			continue
 		}
-		if !seenCurrent || e.Status == StatusFailed {
+		// A degraded release is no more a rollback target than a failed one:
+		// rolling onto a release that only half took over repeats the problem.
+		if !seenCurrent || !e.Healthy() {
 			continue
 		}
 		return e

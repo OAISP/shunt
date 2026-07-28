@@ -148,7 +148,7 @@ func startContainer(spec *release.Spec, name string, svc release.Service, envFil
 // An accessory that already exists is left strictly alone. Recreating Postgres
 // on every code deploy would be both pointless and, with the wrong volume
 // config, destructive; changing one is the explicit `shunt boot` operation.
-func ensureAccessories(spec *release.Spec, envFile string) error {
+func ensureAccessories(spec *release.Spec, ledger *release.Ledger, envFile string) error {
 	for _, name := range spec.AccessoryOrder {
 		acc, present := spec.Accessories[name]
 		if !present {
@@ -165,6 +165,9 @@ func ensureAccessories(spec *release.Spec, envFile string) error {
 		if err := startContainer(spec, name, acc, envFile, "accessory"); err != nil {
 			return err
 		}
+		// Recorded here rather than from the release spec: a deploy records the
+		// manifest it was handed, but only this branch actually applied one.
+		ledger.RecordAccessory(name, acc)
 		ok("accessory:"+name, container+" booted")
 	}
 	return waitHealthy(spec, spec.AccessoryOrder, spec.Accessories)
@@ -177,9 +180,15 @@ func ensureAccessories(spec *release.Spec, envFile string) error {
 // rest are stopped gracefully and restarted, which does have a gap — a published
 // host port can only belong to one container at a time.
 //
-// Returns the services it started so a partial failure is still recorded.
-func swapServices(spec, prev *release.Spec, envFile string) ([]string, error) {
-	var started []string
+// Returns the services it started, and whether it replaced any running
+// container at all.
+//
+// That second value is what separates "the deploy failed and production is
+// exactly as it was" from "the deploy failed halfway and the host is now
+// running a mix". Only the caller can record that distinction, and without it
+// the ledger would claim a clean failure after having already taken a service
+// down.
+func swapServices(spec, prev *release.Spec, envFile string) (started []string, mutated bool, err error) {
 	for _, name := range spec.Order {
 		svc, present := spec.Services[name]
 		if !present {
@@ -188,9 +197,13 @@ func swapServices(spec, prev *release.Spec, envFile string) ([]string, error) {
 		container := serviceContainer(spec, name, svc)
 
 		if !svc.Proxied() {
+			// Replacing in place stops the old container first, so the moment
+			// this begins the host is no longer as it was — whether or not the
+			// new container comes up.
+			mutated = true
 			step("swap:"+name, "replacing "+container)
 			if err := startContainer(spec, name, svc, envFile, "service"); err != nil {
-				return started, err
+				return started, mutated, err
 			}
 			// A service that used to be proxied left per-release containers
 			// behind, and those still carry their proxy labels — so without this
@@ -205,24 +218,27 @@ func swapServices(spec, prev *release.Spec, envFile string) ([]string, error) {
 		// degrades to stop-then-start: a short gap instead of a dropped route.
 		if !canOverlap(prev, name, svc) {
 			info("proxy config for " + name + " changed — retiring the old container first to avoid a router conflict (brief gap)")
+			mutated = true
 			retireOldContainers(spec, name, svc)
 		}
 
 		step("swap:"+name, "starting "+container+" alongside the running release")
 		if err := startContainer(spec, name, svc, envFile, "service"); err != nil {
-			return started, err
+			return started, mutated, err
 		}
 		// The old container is still serving, so a broken new release must be
 		// pulled back out of rotation immediately rather than left half-live.
+		// Nothing was replaced, so this alone does not count as mutating.
 		if err := waitHealthy(spec, []string{name}, spec.Services); err != nil {
 			stopAndRemove(container, 0)
-			return started, fmt.Errorf("%w\n  the new container was removed; the previous release is still serving", err)
+			return started, mutated, fmt.Errorf("%w\n  the new container was removed; the previous release is still serving", err)
 		}
 		started = append(started, name)
 		ok("swap:"+name, container+" healthy and in rotation")
 
+		mutated = true
 		retireOldContainers(spec, name, svc)
 		ok("swap:"+name, "previous "+name+" drained")
 	}
-	return started, nil
+	return started, mutated, nil
 }

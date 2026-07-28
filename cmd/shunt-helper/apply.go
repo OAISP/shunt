@@ -30,31 +30,26 @@ func apply(spec *release.Spec) error {
 	if err != nil {
 		return err
 	}
+	if err := ensureSalt(ledger); err != nil {
+		return err
+	}
 	entry := release.Entry{
 		ID:        spec.ID,
-		Status:    "failed", // pessimistic until proven otherwise
+		Status:    release.StatusFailed, // pessimistic until proven otherwise
 		StartedAt: time.Now().UTC(),
 		Images:    spec.Images,
-		Spec:      redactSecrets(spec),
+		Spec:      redactSecrets(spec, ledger.Salt),
 	}
+
+	// mutated records whether any running container was replaced. It is what
+	// separates a failure that left the host exactly as it was from one that
+	// left it running a mix of two releases.
+	mutated := false
 
 	// finish records the outcome no matter which step failed, so `shunt status`
 	// always reflects reality rather than the last success.
 	finish := func(runErr error) error {
-		entry.FinishedAt = time.Now().UTC()
-		if runErr != nil {
-			entry.Error = runErr.Error()
-		} else {
-			entry.Status = release.StatusActive
-		}
-		for i := range ledger.Releases {
-			if ledger.Releases[i].Status == release.StatusActive {
-				ledger.Releases[i].Status = release.StatusSuperseded
-			}
-		}
-		ledger.Releases = append(ledger.Releases, entry)
-		ledger.Current = entry.ID
-		ledger.Trim(spec.Retain)
+		recordOutcome(ledger, &entry, mutated, runErr, spec.Retain)
 		if err := saveLedger(ledger); err != nil {
 			return errors.Join(runErr, err)
 		}
@@ -74,7 +69,7 @@ func apply(spec *release.Spec) error {
 
 	// Accessories come up first so stages have a database to talk to. Existing
 	// ones are left untouched.
-	if err := ensureAccessories(spec, envFile); err != nil {
+	if err := ensureAccessories(spec, ledger, envFile); err != nil {
 		return finish(fmt.Errorf("%w\n  no services were replaced — production is untouched", err))
 	}
 
@@ -91,14 +86,21 @@ func apply(spec *release.Spec) error {
 		return finish(fmt.Errorf("%w\n  no services were replaced — production is untouched", err))
 	}
 
-	started, err := swapServices(spec, previousSpec(ledger), envFile)
+	started, swapped, err := swapServices(spec, previousSpec(ledger), envFile)
+	mutated = mutated || swapped
+	entry.Services = started
 	if err != nil {
-		entry.Services = started
+		if mutated {
+			err = fmt.Errorf("%w\n  this host is now running a mix of releases — `shunt rollback` restores the previous one%s",
+				err, artifactRecovery(spec))
+		}
 		return finish(err)
 	}
-	entry.Services = started
 
 	if err := healthCheck(spec); err != nil {
+		// Reached only once services were swapped, so the host is mixed by
+		// definition even if swapServices itself reported nothing replaced.
+		mutated = true
 		return finish(fmt.Errorf("%w\n  containers are running but unhealthy — `shunt rollback` restores the previous release%s",
 			err, artifactRecovery(spec)))
 	}

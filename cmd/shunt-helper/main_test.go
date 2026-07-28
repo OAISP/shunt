@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -152,6 +153,88 @@ func TestDrainSeconds(t *testing.T) {
 		if got := drainSeconds(release.Service{Drain: tc.in}); got != tc.want {
 			t.Errorf("drainSeconds(%q) = %d, want %d", tc.in, got, tc.want)
 		}
+	}
+}
+
+// A deploy that fails before replacing anything must leave the serving release
+// alone. Moving Current onto the failure made `shunt status` contradict the
+// "production is untouched" error the operator had just been shown.
+func TestRecordOutcomeLeavesTheServingReleaseAloneOnACleanFailure(t *testing.T) {
+	l := &release.Ledger{
+		Project:  "demo",
+		Current:  "r1",
+		Releases: []release.Entry{{ID: "r1", Status: release.StatusActive, Spec: &release.Spec{ID: "r1"}}},
+	}
+	entry := release.Entry{ID: "r2"}
+	recordOutcome(l, &entry, false, errors.New("stage \"migrate\" failed"), 5)
+
+	if l.Current != "r1" {
+		t.Fatalf("Current = %q, want it to stay on the serving release r1", l.Current)
+	}
+	if got := l.Find("r1").Status; got != release.StatusActive {
+		t.Fatalf("r1 status = %q, want it to stay active", got)
+	}
+	if got := l.Find("r2").Status; got != release.StatusFailed {
+		t.Fatalf("r2 status = %q, want failed", got)
+	}
+	if l.LastAttempt != "r2" {
+		t.Fatalf("LastAttempt = %q, want r2", l.LastAttempt)
+	}
+}
+
+// A deploy that failed *after* replacing a container did change the host, so it
+// becomes current — flagged degraded, because the host is running a mix.
+func TestRecordOutcomeMarksAPartialSwapDegraded(t *testing.T) {
+	l := &release.Ledger{
+		Project:  "demo",
+		Current:  "r1",
+		Releases: []release.Entry{{ID: "r1", Status: release.StatusActive, Spec: &release.Spec{ID: "r1"}}},
+	}
+	entry := release.Entry{ID: "r2"}
+	recordOutcome(l, &entry, true, errors.New("web did not become healthy"), 5)
+
+	if l.Current != "r2" {
+		t.Fatalf("Current = %q, want r2 — it replaced running containers", l.Current)
+	}
+	if got := l.Find("r2").Status; got != release.StatusDegraded {
+		t.Fatalf("r2 status = %q, want degraded", got)
+	}
+	if got := l.Find("r1").Status; got != release.StatusSuperseded {
+		t.Fatalf("r1 status = %q, want superseded", got)
+	}
+}
+
+func TestRecordOutcomeActivatesOnSuccess(t *testing.T) {
+	l := &release.Ledger{
+		Project:  "demo",
+		Current:  "r1",
+		Releases: []release.Entry{{ID: "r1", Status: release.StatusActive, Spec: &release.Spec{ID: "r1"}}},
+	}
+	entry := release.Entry{ID: "r2"}
+	recordOutcome(l, &entry, true, nil, 5)
+
+	if l.Current != "r2" || l.Find("r2").Status != release.StatusActive {
+		t.Fatalf("Current = %q status = %q, want r2 active", l.Current, l.Find("r2").Status)
+	}
+	if got := l.Find("r1").Status; got != release.StatusSuperseded {
+		t.Fatalf("r1 status = %q, want superseded", got)
+	}
+}
+
+// canOverlap decides whether a blue/green swap is safe by comparing proxy
+// labels. Feeding it a failed attempt's spec would have it reason about labels
+// no running container carries.
+func TestPreviousSpecPrefersTheServingRelease(t *testing.T) {
+	l := &release.Ledger{
+		Project: "demo",
+		Current: "r1",
+		Releases: []release.Entry{
+			{ID: "r1", Status: release.StatusActive, Spec: &release.Spec{ID: "r1"}},
+			{ID: "r2", Status: release.StatusFailed, Spec: &release.Spec{ID: "r2"}},
+		},
+	}
+	if got := previousSpec(l); got == nil || got.ID != "r1" {
+		t.Fatalf("previousSpec = %v, want the serving release r1", got)
 	}
 }
 

@@ -202,23 +202,7 @@ func (e *Engine) BuildPlan(ctx context.Context, spec *release.Spec, built map[st
 		}
 	}
 
-	// Accessories are only ever created, never replaced by a deploy. When the
-	// manifest drifts from what is running, say so loudly rather than silently
-	// ignoring the change — the operator has to run `shunt boot` deliberately.
-	for _, name := range sortedKeys(spec.Accessories) {
-		acc := spec.Accessories[name]
-		ac := ServiceChange{Name: name, Action: "create"}
-		if oldSpec != nil {
-			if old, present := oldSpec.Accessories[name]; present {
-				ac.Action = "unchanged"
-				if reasons := diffService(old, acc); len(reasons) > 0 {
-					ac.Action = "drift"
-					ac.Reasons = append(reasons, "not applied by `shunt up` — run `shunt boot "+name+"` to recreate")
-				}
-			}
-		}
-		p.Accessories = append(p.Accessories, ac)
-	}
+	p.Accessories = e.planAccessories(p, spec, state, oldSpec)
 
 	for _, a := range spec.Artifacts {
 		// One stat over the existing connection; see RemoteFileStat for why this
@@ -238,7 +222,11 @@ func (e *Engine) BuildPlan(ctx context.Context, spec *release.Spec, built map[st
 		p.Stages = append(p.Stages, st.Name)
 	}
 
-	p.Secrets = diffSecrets(oldSpec, spec)
+	var salt string
+	if state != nil && state.Ledger != nil {
+		salt = state.Ledger.Salt
+	}
+	p.Secrets = diffSecrets(oldSpec, spec, salt)
 
 	est, err := e.estimate(ctx, built)
 	if err != nil {
@@ -248,6 +236,66 @@ func (e *Engine) BuildPlan(ctx context.Context, spec *release.Spec, built map[st
 		p.Transfer = *est
 	}
 	return p, nil
+}
+
+// planAccessories diffs the manifest's accessories against what the host
+// recorded as applied.
+//
+// Accessories are only ever created by a deploy, never replaced. When the
+// manifest drifts from what is actually running, say so loudly rather than
+// silently ignoring it — recreating one is the explicit `shunt boot`.
+//
+// The comparison is against the *applied* hash, not the last release's spec.
+// A deploy records the manifest it was handed even though it deliberately left
+// the accessory alone, so diffing against that made drift vanish after any
+// unrelated deploy while the container kept running the old config.
+func (e *Engine) planAccessories(p *Plan, spec *release.Spec, state *RemoteState, oldSpec *release.Spec) []ServiceChange {
+	var applied map[string]string
+	if state != nil && state.Ledger != nil {
+		applied = state.Ledger.Accessories
+	}
+
+	out := make([]ServiceChange, 0, len(spec.Accessories))
+	for _, name := range sortedKeys(spec.Accessories) {
+		acc := spec.Accessories[name]
+		ac := ServiceChange{Name: name, Action: "create"}
+		const hint = "not applied by `shunt up` — run `shunt boot "
+
+		switch got, recorded := applied[name]; {
+		case recorded:
+			ac.Action = "unchanged"
+			if got != release.HashService(acc) {
+				ac.Action = "drift"
+				ac.Reasons = append(driftReasons(oldSpec, name, acc), hint+name+"` to recreate")
+			}
+		case oldSpec != nil:
+			// A host deployed before applied-state tracking existed. Fall back to
+			// the old comparison rather than reporting every accessory as new.
+			if old, present := oldSpec.Accessories[name]; present {
+				ac.Action = "unchanged"
+				if reasons := diffService(old, acc); len(reasons) > 0 {
+					ac.Action = "drift"
+					ac.Reasons = append(reasons, hint+name+"` to recreate")
+				}
+			}
+		}
+		out = append(out, ac)
+	}
+	return out
+}
+
+// driftReasons explains an accessory drift in field-level terms when the last
+// recorded spec makes that possible. The hash proves *that* it drifted; this is
+// only there to say how, so a bare "drifted" is still correct without it.
+func driftReasons(oldSpec *release.Spec, name string, acc release.Service) []string {
+	if oldSpec == nil {
+		return nil
+	}
+	old, present := oldSpec.Accessories[name]
+	if !present {
+		return nil
+	}
+	return diffService(old, acc)
 }
 
 func imgChanged(imgs []ImageChange, name string) bool {
@@ -309,13 +357,17 @@ func diffService(old, nw release.Service) []string {
 }
 
 // diffSecrets compares key sets and whether values moved — never the values.
-func diffSecrets(old, nw *release.Spec) SecretChange {
+//
+// salt comes back from the host with the ledger, because that is what its stored
+// hashes are keyed by. An empty salt only happens on a host that has never
+// deployed, where there is nothing to compare against anyway.
+func diffSecrets(old, nw *release.Spec, salt string) SecretChange {
 	sc := SecretChange{Total: len(nw.Secrets)}
 	// The ledger stores hashes, never values, so hash the freshly-resolved
 	// secrets before comparing — otherwise every key looks changed every time.
 	hashed := make(map[string]string, len(nw.Secrets))
 	for k, v := range nw.Secrets {
-		hashed[k] = release.HashSecret(v)
+		hashed[k] = release.HashSecret(salt, v)
 	}
 	nw = &release.Spec{Secrets: hashed}
 	if old == nil {

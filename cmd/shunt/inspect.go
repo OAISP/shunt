@@ -44,7 +44,7 @@ func cmdStatus(ctx context.Context, args []string) error {
 
 	printCurrent(st.Ledger, s)
 	printContainers(st, s)
-	printHistory(st.Ledger, s)
+	printHistory(st.Ledger, e.M.Retain, s)
 	fmt.Println()
 	return nil
 }
@@ -65,6 +65,21 @@ func printCurrent(l *release.Ledger, s ui.Style) {
 	if cur.Error != "" {
 		fmt.Printf("  %s\n", s.Red(ui.FirstLine(cur.Error)))
 	}
+	if cur.Status == release.StatusDegraded {
+		fmt.Printf("  %s\n", s.Amber("this host is running a mix of releases — `shunt rollback` restores the previous one"))
+	}
+
+	// A last attempt that differs from the serving release means the most recent
+	// deploy failed without taking over. Saying so here is the whole point of
+	// tracking the two separately.
+	if l.LastAttempt != "" && l.LastAttempt != l.Current {
+		last := l.Find(l.LastAttempt)
+		fmt.Printf("\n  %s %s %s\n", s.Dim("last attempt"), l.LastAttempt,
+			s.Red("failed — the release above is still serving"))
+		if last != nil && last.Error != "" {
+			fmt.Printf("  %s\n", s.Dim(ui.FirstLine(last.Error)))
+		}
+	}
 }
 
 func printContainers(st *engine.RemoteState, s ui.Style) {
@@ -77,8 +92,12 @@ func printContainers(st *engine.RemoteState, s ui.Style) {
 	}
 }
 
-func printHistory(l *release.Ledger, s ui.Style) {
+// printHistory lists recent releases and marks the ones that cannot be rolled
+// back to. Offering a rollback target whose images were pruned months ago is
+// how an operator discovers the limit at the worst possible moment.
+func printHistory(l *release.Ledger, retain int, s ui.Style) {
 	fmt.Printf("\n  %s\n", s.Dim("history"))
+	keep := l.KeepIDs(retain)
 	shown := 0
 	for i := len(l.Releases) - 1; i >= 0 && shown < historyLimit; i-- {
 		r := l.Releases[i]
@@ -86,9 +105,18 @@ func printHistory(l *release.Ledger, s ui.Style) {
 		if r.ID == l.Current {
 			mark = "*"
 		}
-		line := fmt.Sprintf("%s %-24s %-11s %s", mark, r.ID, r.Status,
-			r.StartedAt.Local().Format("2006-01-02 15:04"))
-		if r.Status == release.StatusFailed {
+		note := ""
+		switch {
+		case !r.Healthy():
+			// Never a rollback target, so retention is beside the point.
+		case !keep[r.ID]:
+			note = "  (beyond retention — images pruned)"
+		case r.Spec == nil:
+			note = "  (no spec recorded — cannot be replayed)"
+		}
+		line := fmt.Sprintf("%s %-24s %-11s %s%s", mark, r.ID, r.Status,
+			r.StartedAt.Local().Format("2006-01-02 15:04"), note)
+		if !r.Healthy() || note != "" {
 			line = s.Dim(line)
 		}
 		fmt.Printf("  %s\n", line)

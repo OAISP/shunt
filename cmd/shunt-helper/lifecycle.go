@@ -68,7 +68,7 @@ func cmdRollback(args []string) error {
 		} else if _, err := os.Stat(envFile); err != nil {
 			envFile = ""
 		}
-		if _, err := swapServices(&spec, previousSpec(ledger), envFile); err != nil {
+		if _, _, err := swapServices(&spec, previousSpec(ledger), envFile); err != nil {
 			return err
 		}
 		if err := healthCheck(&spec); err != nil {
@@ -84,6 +84,7 @@ func cmdRollback(args []string) error {
 			}
 		}
 		ledger.Current = target.ID
+		ledger.LastAttempt = target.ID
 		if err := saveLedger(ledger); err != nil {
 			return err
 		}
@@ -112,6 +113,10 @@ func cmdBoot(in io.Reader, args []string) error {
 		return fmt.Errorf("%q is not an accessory in this manifest", name)
 	}
 	return withLock(spec.Project, func() error {
+		ledger, err := loadLedger(spec.Project)
+		if err != nil {
+			return err
+		}
 		if err := ensureNetwork(spec.Network); err != nil {
 			return err
 		}
@@ -130,6 +135,13 @@ func cmdBoot(in io.Reader, args []string) error {
 			return err
 		}
 		ok("boot:"+name, containerName(spec.Project, name)+" recreated")
-		return waitHealthy(&spec, []string{name}, spec.Accessories)
+		if err := waitHealthy(&spec, []string{name}, spec.Accessories); err != nil {
+			return err
+		}
+		// Only now is the drift actually resolved. Without recording it, `shunt
+		// plan` would keep reporting the accessory as drifted after the very
+		// command that fixed it.
+		ledger.RecordAccessory(name, acc)
+		return saveLedger(ledger)
 	})
 }

@@ -168,17 +168,54 @@ func TestFind(t *testing.T) {
 // Both ends hash independently, so equal values must hash equally and the
 // output must never contain the input.
 func TestHashSecret(t *testing.T) {
-	a, b := HashSecret("hunter2"), HashSecret("hunter2")
+	const salt = "0123456789abcdef"
+	a, b := HashSecret(salt, "hunter2"), HashSecret(salt, "hunter2")
 	if a != b {
 		t.Errorf("HashSecret is not deterministic: %q vs %q", a, b)
 	}
-	if a == HashSecret("hunter3") {
+	if a == HashSecret(salt, "hunter3") {
 		t.Error("distinct values collided")
 	}
 	if len(a) != 18 || a[:2] != "h:" {
 		t.Errorf("HashSecret = %q, want an 18-char h:-prefixed digest", a)
 	}
-	if HashSecret("") == "" {
+	if HashSecret(salt, "") == "" {
 		t.Error("empty value must still hash")
+	}
+	// The salt is the point: the same value on another host must not produce a
+	// digest an attacker can recognise from a rainbow table built elsewhere.
+	if a == HashSecret("fedcba9876543210", "hunter2") {
+		t.Error("hashes did not depend on the salt")
+	}
+}
+
+func TestNewSaltIsRandomAndHexEncoded(t *testing.T) {
+	a, err := NewSalt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := NewSalt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a == b {
+		t.Error("NewSalt returned the same value twice")
+	}
+	if len(a) != 32 {
+		t.Errorf("NewSalt = %q, want 32 hex chars", a)
+	}
+}
+
+// Accessory drift is detected by comparing definition hashes, so the hash has
+// to be stable for an unchanged definition and move for a changed one.
+func TestHashService(t *testing.T) {
+	a := Service{Image: "postgres:18-alpine", Volumes: []string{"pg:/var/lib/postgresql"}}
+	if HashService(a) != HashService(a) {
+		t.Error("HashService is not deterministic")
+	}
+	b := a
+	b.Image = "postgres:17-alpine"
+	if HashService(a) == HashService(b) {
+		t.Error("a changed image did not change the hash")
 	}
 }
