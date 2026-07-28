@@ -71,10 +71,17 @@ func cmdUp(ctx context.Context, args []string) error {
 	}
 	if !c.asJSON && !skipPlan {
 		p.Render(os.Stdout, c.out())
-		if !p.Changed() {
+	}
+	// Checked outside the rendering branch on purpose. Nesting it there meant
+	// --json and --no-plan shipped and recreated every service on every run,
+	// which is precisely the CI path where a redundant deploy costs the most.
+	if !p.Changed() {
+		if !c.asJSON {
 			fmt.Println("  nothing to do — the host already matches this manifest")
-			return nil
 		}
+		return nil
+	}
+	if !c.asJSON && !skipPlan {
 		ok, err := confirmed(yes, "  apply this plan?")
 		if err != nil || !ok {
 			return err

@@ -52,7 +52,11 @@ func cmdRollback(ctx context.Context, args []string) error {
 
 	fmt.Fprintln(os.Stderr)
 	return run(func(r engine.EventRenderer) error {
-		return e.Rollback(ctx, target, r)
+		// `want`, not `target`: target may be empty, which would let the helper
+		// resolve "previous" a second time and act on a different release than
+		// the one just confirmed. Deploy or roll back concurrently and the two
+		// answers genuinely differ.
+		return e.Rollback(ctx, want, r)
 	}, c.renderer(), "rollback")
 }
 
