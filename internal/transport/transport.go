@@ -29,10 +29,21 @@ import (
 const VerifiedSidecar = ".shunt-verified.json*"
 
 type Stats struct {
-	Sent    int64 // bytes actually put on the wire
-	Total   int64 // logical size of the layout
-	Matched int64 // bytes the host already had
-	Literal int64 // bytes that had to be transferred
+	Sent     int64 // bytes this end put on the wire
+	Received int64 // bytes this end took off the wire
+	Total    int64 // logical size of the transfer
+	Matched  int64 // bytes the far end already had
+	Literal  int64 // bytes that had to be transferred
+}
+
+// Moved is the payload in whichever direction this transfer ran. For a push
+// that is what was sent; for a fetch, sent is just protocol chatter and the
+// payload arrived the other way.
+func (s Stats) Moved(pull bool) int64 {
+	if pull {
+		return s.Received
+	}
+	return s.Sent
 }
 
 // DedupPercent is the share of the image rsync did not have to send because the
@@ -158,6 +169,8 @@ func parseStat(line string, st *Stats) {
 		st.Matched = get()
 	case strings.HasPrefix(line, "Total bytes sent:"):
 		st.Sent = get()
+	case strings.HasPrefix(line, "Total bytes received:"):
+		st.Received = get()
 	}
 }
 
@@ -168,6 +181,10 @@ type FileOptions struct {
 	RemotePath string
 	Verbose    bool
 	RemoteZstd bool
+
+	// LinkDest is an existing tree on the receiving side to reuse unchanged
+	// files from. Only meaningful for directory transfers.
+	LinkDest string
 }
 
 // PushFile copies one file to the host, resumably and incrementally.
@@ -181,10 +198,8 @@ func PushFile(ctx context.Context, o FileOptions) (*Stats, error) {
 	if err != nil {
 		return nil, fmt.Errorf("artifact %s: %w", o.LocalPath, err)
 	}
-	if fi.IsDir() {
-		return nil, fmt.Errorf("artifact %s is a directory; shunt ships files", o.LocalPath)
-	}
 
+	local, remote := o.LocalPath, o.RemotePath
 	args := []string{
 		"--stats",
 		"--partial",
@@ -198,11 +213,34 @@ func PushFile(ctx context.Context, o FileOptions) (*Stats, error) {
 		"--fuzzy",
 		"--times",
 	}
+	if fi.IsDir() {
+		// A directory artifact is a whole tree: model weights, a prebuilt index,
+		// an asset bundle. -a to carry permissions and times, --delete so the
+		// staged copy is the tree exactly rather than a merge with whatever an
+		// earlier release left, and trailing slashes so rsync copies the
+		// *contents* into the staged directory rather than nesting it.
+		args = append(args, "-a", "--delete")
+		// --fuzzy is what saves a single-file artifact from being re-sent every
+		// deploy, but it cannot help here: it looks for a basis file inside the
+		// destination directory, and the release-scoped staging directory is
+		// empty, so every file in the tree reads as new. --link-dest points at
+		// the live tree instead, so unchanged files become hard links to it and
+		// never cross the wire. Measured on a 195 KB tree with one small file
+		// changed: 195 KB re-sent becomes 158 bytes.
+		//
+		// A missing --link-dest is a warning rather than an error, so the first
+		// deploy — when there is no live tree yet — is unaffected.
+		if o.LinkDest != "" {
+			args = append(args, "--link-dest="+strings.TrimSuffix(o.LinkDest, "/"))
+		}
+		local = strings.TrimSuffix(local, "/") + "/"
+		remote = strings.TrimSuffix(remote, "/") + "/"
+	}
 	args = append(args, compressArgs(o.RemoteZstd)...)
 	args = append(args,
 		"-e", o.Client.SSHCommand(),
-		o.LocalPath,
-		o.Client.Host+":"+o.RemotePath,
+		local,
+		o.Client.Host+":"+remote,
 	)
 	if o.Verbose {
 		args = append([]string{"--info=progress2"}, args...)
@@ -231,6 +269,64 @@ func PushFile(ctx context.Context, o FileOptions) (*Stats, error) {
 		return nil, fmt.Errorf("rsync %s to %s: %w", o.LocalPath, o.Client.Host, err)
 	}
 	if o.Verbose {
+		fmt.Fprintln(os.Stderr)
+	}
+	return st, nil
+}
+
+// Fetch copies a path back down from the host, incrementally.
+//
+// The transport is symmetric — rsync does not care which end is the source — so
+// pulling production data down for local work costs one function rather than a
+// new subsystem. It is the natural other half of shipping artifacts up: the
+// same delta algorithm, so refreshing a 500 MB database you already have a
+// stale copy of moves only what changed.
+func Fetch(ctx context.Context, o FileOptions, isDir bool) (*Stats, error) {
+	args := []string{"--stats", "--partial", "--times", "--fuzzy"}
+	local, remote := o.LocalPath, o.RemotePath
+	if isDir {
+		args = append(args, "-a")
+		local = strings.TrimSuffix(local, "/") + "/"
+		remote = strings.TrimSuffix(remote, "/") + "/"
+	}
+	args = append(args, compressArgs(o.RemoteZstd)...)
+	args = append(args,
+		"-e", o.Client.SSHCommand(),
+		o.Client.Host+":"+remote,
+		local,
+	)
+	if o.Verbose {
+		args = append([]string{"--info=progress2"}, args...)
+	}
+	return runRsync(ctx, args, o.Verbose, func(err error) error {
+		return fmt.Errorf("fetch %s from %s: %w", o.RemotePath, o.Client.Host, err)
+	})
+}
+
+// runRsync executes rsync and collects its transfer statistics.
+func runRsync(ctx context.Context, args []string, verbose bool, wrap func(error) error) (*Stats, error) {
+	cmd := exec.CommandContext(ctx, "rsync", args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("rsync: %w", err)
+	}
+	st := &Stats{}
+	sc := bufio.NewScanner(stdout)
+	for sc.Scan() {
+		line := sc.Text()
+		if verbose && strings.Contains(line, "%") {
+			fmt.Fprintf(os.Stderr, "\r%s", strings.TrimSpace(line))
+		}
+		parseStat(line, st)
+	}
+	if err := cmd.Wait(); err != nil {
+		return nil, wrap(err)
+	}
+	if verbose {
 		fmt.Fprintln(os.Stderr)
 	}
 	return st, nil

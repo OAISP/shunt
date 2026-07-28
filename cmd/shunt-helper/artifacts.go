@@ -69,8 +69,24 @@ func validateStaged(a release.Artifact) error {
 	if err != nil {
 		return fmt.Errorf("staged file %s is missing — the transfer did not complete", a.Staged)
 	}
-	if fi.IsDir() {
-		return fmt.Errorf("staged path %s is a directory", a.Staged)
+	if a.Dir != fi.IsDir() {
+		return fmt.Errorf("staged path %s is %s but the manifest describes %s",
+			a.Staged, kindOf(fi.IsDir()), kindOf(a.Dir))
+	}
+	if a.Dir {
+		// A tree has no single size, so compare the same summary the CLI computed:
+		// total bytes across the tree. A truncated transfer shows up as a smaller
+		// total, which is the failure worth catching.
+		bytes, files := treeSize(a.Staged)
+		if files == 0 {
+			return fmt.Errorf("staged directory %s is empty — refusing to swap it in", a.Staged)
+		}
+		if a.Bytes > 0 && bytes != a.Bytes {
+			return fmt.Errorf("staged directory %s totals %s across %d file(s), expected %s — "+
+				"the transfer was interrupted; rerun the deploy and rsync will resume it",
+				a.Staged, ui.Bytes(bytes), files, ui.Bytes(a.Bytes))
+		}
+		return nil
 	}
 	// Exact size, not merely non-empty. rsync --partial deliberately leaves a
 	// truncated file behind when a large transfer is interrupted, and a 400 MB
@@ -84,16 +100,38 @@ func validateStaged(a release.Artifact) error {
 			a.Staged, ui.Bytes(fi.Size()), ui.Bytes(a.Bytes))
 	}
 	if fi.Size() == 0 {
-		os.Remove(a.Staged)
+		os.RemoveAll(a.Staged)
 		return fmt.Errorf("staged file %s is empty — refusing to swap it in", a.Staged)
 	}
 	if err := checkMagic(a.Staged, a.Magic); err != nil {
 		// A magic mismatch is the wrong file, not a partial one. Leaving it would
 		// give the next run's --fuzzy a bogus basis to diff against.
-		os.Remove(a.Staged)
+		os.RemoveAll(a.Staged)
 		return err
 	}
 	return nil
+}
+
+func kindOf(dir bool) string {
+	if dir {
+		return "a directory"
+	}
+	return "a file"
+}
+
+// treeSize totals a directory's file sizes and counts them.
+func treeSize(root string) (bytes int64, files int) {
+	filepath.WalkDir(root, func(_ string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if fi, err := d.Info(); err == nil {
+			bytes += fi.Size()
+			files++
+		}
+		return nil
+	})
+	return bytes, files
 }
 
 // promotion records what one swap did, so it can be undone if a later one fails.
@@ -121,18 +159,34 @@ func promote(spec *release.Spec, a release.Artifact) (promotion, error) {
 		return p, err
 	}
 	p.bytes = fi.Size()
+	if a.Dir {
+		p.bytes, _ = treeSize(a.Staged)
+	}
 
 	if _, err := os.Stat(a.Dest); err == nil {
 		prev := previousPath(a.Dest, spec.ID)
-		os.Remove(prev) // a retried release must not trip over its own backup
-		if err := os.Link(a.Dest, prev); err != nil {
-			// Filesystems without hard links are rare on a Linux host but not
-			// impossible. Fall back to the older rename-aside, and say so rather
-			// than quietly offering a weaker guarantee than the docs promise.
-			info(fmt.Sprintf("%s: no hard links on this filesystem, backing up by rename (brief window with no file at %s)",
-				a.Name, a.Dest))
+		os.RemoveAll(prev) // a retried release must not trip over its own backup
+
+		switch {
+		case a.Dir:
+			// A directory cannot be hard-linked, and rename refuses to replace a
+			// non-empty one — so the old tree has to move aside first. That leaves
+			// a window, one rename syscall wide, in which the destination does not
+			// exist. Unavoidable without symlinking the destination, which would
+			// change what `volumes = [...]` mounts.
 			if err := os.Rename(a.Dest, prev); err != nil {
 				return p, fmt.Errorf("keeping the previous copy: %w", err)
+			}
+		default:
+			if err := os.Link(a.Dest, prev); err != nil {
+				// Filesystems without hard links are rare on a Linux host but not
+				// impossible. Fall back to rename-aside, and say so rather than
+				// quietly offering a weaker guarantee than the docs promise.
+				info(fmt.Sprintf("%s: no hard links on this filesystem, backing up by rename (brief window with no file at %s)",
+					a.Name, a.Dest))
+				if err := os.Rename(a.Dest, prev); err != nil {
+					return p, fmt.Errorf("keeping the previous copy: %w", err)
+				}
 			}
 		}
 		p.prev = prev
@@ -155,12 +209,18 @@ func rollbackPromotions(done []promotion) (restored int, failed []string) {
 		p := done[i]
 		if p.prev == "" {
 			// Nothing was there before this release, so restoring means removing.
-			if err := os.Remove(p.dest); err != nil && !os.IsNotExist(err) {
+			// RemoveAll rather than Remove: the artifact may be a directory tree.
+			if err := os.RemoveAll(p.dest); err != nil && !os.IsNotExist(err) {
 				failed = append(failed, p.name)
 				continue
 			}
 			restored++
 			continue
+		}
+		// A directory destination must be cleared before the old tree can be
+		// renamed back over it; rename will not replace a non-empty directory.
+		if fi, err := os.Stat(p.dest); err == nil && fi.IsDir() {
+			os.RemoveAll(p.dest)
 		}
 		if err := os.Rename(p.prev, p.dest); err != nil {
 			failed = append(failed, p.name)
@@ -181,11 +241,11 @@ func clearStaleStaged(a release.Artifact) {
 	}
 	for _, m := range matches {
 		if m != a.Staged {
-			os.Remove(m)
+			os.RemoveAll(m)
 		}
 	}
 	// A fragment from a release that predates release-scoped staging.
-	os.Remove(a.Dest + ".new")
+	os.RemoveAll(a.Dest + ".new")
 }
 
 // checkMagic verifies the file begins with the expected literal.
@@ -230,7 +290,7 @@ func prunePrevious(dest string, retain int) {
 	slices.Sort(matches)
 	slices.Reverse(matches)
 	for _, old := range matches[retain:] {
-		os.Remove(old)
+		os.RemoveAll(old)
 	}
 }
 

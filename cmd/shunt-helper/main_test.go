@@ -669,6 +669,84 @@ func TestVerifyLayoutCatchesCorruptionOnFirstSight(t *testing.T) {
 	}
 }
 
+// dirArtifact stages a directory tree and returns the artifact describing it.
+func dirArtifact(t *testing.T, dir, name string, files map[string]string) release.Artifact {
+	t.Helper()
+	staged := filepath.Join(dir, name+".new."+testRelease)
+	var total int64
+	for rel, content := range files {
+		p := filepath.Join(staged, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		total += int64(len(content))
+	}
+	return release.Artifact{
+		Name: name, Dest: filepath.Join(dir, name), Staged: staged,
+		Bytes: total, Retain: 1, Dir: true,
+	}
+}
+
+// The README advertises model weights, which are a directory. Shipping one has
+// to swap the whole tree, nested files included.
+func TestSwapArtifactsPromotesADirectoryTree(t *testing.T) {
+	dir := t.TempDir()
+	a := dirArtifact(t, dir, "weights", map[string]string{
+		"model.bin":        "weights-v2",
+		"nested/vocab.txt": "vocab-v2",
+	})
+	// An existing tree that must be replaced, not merged into.
+	if err := os.MkdirAll(filepath.Join(a.Dest, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(a.Dest, "model.bin"), []byte("weights-v1"), 0o644)
+	os.WriteFile(filepath.Join(a.Dest, "stale.txt"), []byte("gone in v2"), 0o644)
+
+	spec := &release.Spec{ID: testRelease, Artifacts: []release.Artifact{a}}
+	if err := swapArtifacts(spec); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, filepath.Join(a.Dest, "model.bin")); got != "weights-v2" {
+		t.Fatalf("model.bin = %q, want weights-v2", got)
+	}
+	if got := readFile(t, filepath.Join(a.Dest, "nested/vocab.txt")); got != "vocab-v2" {
+		t.Fatalf("nested/vocab.txt = %q, want vocab-v2", got)
+	}
+	// The old tree moved aside wholesale, so a file the new release dropped must
+	// not survive into it.
+	if _, err := os.Stat(filepath.Join(a.Dest, "stale.txt")); !os.IsNotExist(err) {
+		t.Fatalf("a file from the previous tree survived the swap")
+	}
+}
+
+// A truncated tree has to be caught the same way a truncated file is.
+func TestValidateStagedRejectsAShortDirectory(t *testing.T) {
+	dir := t.TempDir()
+	a := dirArtifact(t, dir, "weights", map[string]string{"model.bin": "short"})
+	a.Bytes = 999999 // as if most of the tree never arrived
+
+	err := validateStaged(a)
+	if err == nil {
+		t.Fatal("validateStaged accepted a directory smaller than the release describes")
+	}
+	if !strings.Contains(err.Error(), "resume") {
+		t.Fatalf("error should point at resuming, got: %v", err)
+	}
+}
+
+func TestValidateStagedRejectsAKindMismatch(t *testing.T) {
+	dir := t.TempDir()
+	a := artifactFixture(t, dir, "data", "OLD", "NEW")
+	a.Dir = true // manifest says directory, the staged path is a file
+
+	if err := validateStaged(a); err == nil {
+		t.Fatal("validateStaged accepted a file where a directory was described")
+	}
+}
+
 func TestCheckMagic(t *testing.T) {
 	dir := t.TempDir()
 	good := filepath.Join(dir, "good.db")

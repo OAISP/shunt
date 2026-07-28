@@ -290,8 +290,15 @@ func (e *Engine) artifacts(releaseID string) ([]release.Artifact, error) {
 			fmt.Fprintf(os.Stderr, "warning: artifact %q: %s not found, the host keeps its current copy\n", a.Name, src)
 			continue
 		}
+		size, mtime := fi.Size(), fi.ModTime().Unix()
 		if fi.IsDir() {
-			return nil, fmt.Errorf("artifact %q: %s is a directory; shunt ships files", a.Name, src)
+			// A tree has no single size or mtime, so summarise it: the plan needs
+			// something to compare, and the helper needs something to validate
+			// the staged copy against.
+			size, mtime = treeSummary(src)
+			if a.Magic != "" {
+				return nil, fmt.Errorf("artifact %q: magic cannot apply to a directory", a.Name)
+			}
 		}
 		out = append(out, release.Artifact{
 			Name:   a.Name,
@@ -299,11 +306,36 @@ func (e *Engine) artifacts(releaseID string) ([]release.Artifact, error) {
 			Staged: StagedPath(a.Dest, releaseID),
 			Magic:  a.Magic,
 			Retain: a.Retain,
-			Bytes:  fi.Size(),
-			MTime:  fi.ModTime().Unix(),
+			Bytes:  size,
+			MTime:  mtime,
+			Dir:    fi.IsDir(),
 		})
 	}
 	return out, nil
+}
+
+// treeSummary totals a directory's file sizes and takes its newest mtime.
+//
+// Not a hash: hashing a directory of model weights means reading every byte on
+// both sides, which is most of the cost of simply shipping it. Size and mtime
+// are the same heuristic rsync itself uses to decide what to transfer, which
+// makes them the right basis for deciding whether the tree counts as changed.
+func treeSummary(root string) (bytes, mtime int64) {
+	filepath.WalkDir(root, func(_ string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		fi, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		bytes += fi.Size()
+		if m := fi.ModTime().Unix(); m > mtime {
+			mtime = m
+		}
+		return nil
+	})
+	return bytes, mtime
 }
 
 // LocalArtifactPath is the source file for a named artifact.
@@ -326,6 +358,9 @@ func (e *Engine) PushArtifacts(ctx context.Context, spec *release.Spec, verbose 
 			RemotePath: a.Staged,
 			Verbose:    verbose,
 			RemoteZstd: e.facts.RsyncZstd,
+			// The live tree is what an unchanged file should be linked from
+			// rather than re-sent; ignored for single-file artifacts.
+			LinkDest: a.Dest,
 		})
 		if err != nil {
 			return nil, err
@@ -333,6 +368,68 @@ func (e *Engine) PushArtifacts(ctx context.Context, spec *release.Spec, verbose 
 		stats[a.Name] = st
 	}
 	return stats, nil
+}
+
+// RemoteKind reports whether a host path is a directory and how large it is.
+func (e *Engine) RemoteKind(ctx context.Context, path string) (isDir bool, size int64, err error) {
+	out, err := e.Client.Run(ctx, "sh", "-c",
+		"p="+shellArg(path)+`; if [ -d "$p" ]; then echo -n "dir "; du -sb "$p" | cut -f1; `+
+			`elif [ -f "$p" ]; then echo -n "file "; stat -c %s "$p"; else echo "missing 0"; fi`)
+	if err != nil {
+		return false, 0, err
+	}
+	fields := strings.Fields(strings.TrimSpace(out))
+	if len(fields) < 2 {
+		return false, 0, fmt.Errorf("could not stat %s on %s", path, e.M.Host)
+	}
+	if fields[0] == "missing" {
+		return false, 0, fmt.Errorf("%s does not exist on %s", path, e.M.Host)
+	}
+	fmt.Sscanf(fields[1], "%d", &size)
+	return fields[0] == "dir", size, nil
+}
+
+// Fetch pulls a host path down to a local one.
+func (e *Engine) Fetch(ctx context.Context, remote, local string, isDir, verbose bool) (*transport.Stats, error) {
+	return transport.Fetch(ctx, transport.FileOptions{
+		Client:     e.Client,
+		LocalPath:  local,
+		RemotePath: remote,
+		Verbose:    verbose,
+		RemoteZstd: e.facts.RsyncZstd,
+	}, isDir)
+}
+
+// Captures lists stage capture files on the host, newest first.
+//
+// A pre-migration dump that cannot be retrieved is decorative, and working out
+// where the helper put it is not something an operator should have to do from
+// the manifest.
+func (e *Engine) Captures(ctx context.Context) ([]string, error) {
+	dirs := map[string]bool{}
+	for _, st := range e.M.Stages {
+		if st.Capture != "" {
+			dirs[filepath.Dir(st.Capture)] = true
+		}
+	}
+	if len(dirs) == 0 {
+		return nil, nil
+	}
+	var script strings.Builder
+	for _, d := range slices.Sorted(maps.Keys(dirs)) {
+		fmt.Fprintf(&script, "ls -1t %s/* 2>/dev/null | head -20\n", shellArg(d))
+	}
+	out, err := e.Client.Run(ctx, "sh", "-c", script.String())
+	if err != nil {
+		return nil, err
+	}
+	var found []string
+	for _, ln := range strings.Split(strings.TrimSpace(out), "\n") {
+		if ln = strings.TrimSpace(ln); ln != "" {
+			found = append(found, ln)
+		}
+	}
+	return found, nil
 }
 
 // PreflightSpace refuses a transfer the host has no room for.

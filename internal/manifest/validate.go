@@ -133,7 +133,7 @@ func (m *Manifest) Validate() error {
 		} else if !filepath.IsAbs(a.Dest) {
 			add("artifact %q: dest %q must be an absolute path on the host", a.Name, a.Dest)
 		} else if strings.HasSuffix(a.Dest, "/") {
-			add("artifact %q: dest %q must be a file path, not a directory", a.Name, a.Dest)
+			add("artifact %q: dest %q must not end in a slash", a.Name, a.Dest)
 		}
 		if a.Retain < 0 {
 			add("artifact %q: retain cannot be negative", a.Name)

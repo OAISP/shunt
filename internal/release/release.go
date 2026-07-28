@@ -119,6 +119,11 @@ type Artifact struct {
 	Retain int    `json:"retain"`
 	Bytes  int64  `json:"bytes"`
 	MTime  int64  `json:"mtime"` // unix seconds; rsync --times preserves it
+
+	// Dir marks an artifact that is a directory tree rather than a single file.
+	// The swap is the same rename, because renaming a directory within its
+	// parent is just as atomic as renaming a file.
+	Dir bool `json:"dir,omitempty"`
 }
 
 type Stage struct {
