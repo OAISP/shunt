@@ -129,6 +129,11 @@ type Ledger struct {
 	Releases []Entry `json:"releases"`
 }
 
+// DefaultRetain is how many restorable releases a host keeps when the manifest
+// does not say. Both ends fall back to it, so a spec that predates the field
+// prunes the same way a current one does.
+const DefaultRetain = 5
+
 // Release statuses recorded in the ledger.
 const (
 	StatusActive     = "active"     // currently serving
@@ -167,6 +172,62 @@ func (l *Ledger) Find(id string) *Entry {
 		}
 	}
 	return nil
+}
+
+// Restorable reports whether this entry can serve as a rollback target: it
+// reached a healthy state, and it retained the spec needed to replay it.
+func (e *Entry) Restorable() bool { return e.Status != StatusFailed && e.Spec != nil }
+
+// KeepIDs returns the releases whose images and env-files must survive pruning:
+// the newest `retain` restorable ones, plus whatever is currently active.
+//
+// Counting failed attempts toward `retain` is the subtle way to lose a rollback.
+// A run of failed deploys — exactly the situation where you most want to go back
+// — would otherwise push the last good release out of the keep set, and the next
+// successful deploy would delete its images and its env-file. So failures are
+// skipped rather than counted, and the history stays as deep as it claims.
+func (l *Ledger) KeepIDs(retain int) map[string]bool {
+	if retain <= 0 {
+		retain = DefaultRetain
+	}
+	keep := map[string]bool{}
+	if l.Current != "" {
+		keep[l.Current] = true
+	}
+	seen := 0
+	for i := len(l.Releases) - 1; i >= 0 && seen < retain; i-- {
+		if !l.Releases[i].Restorable() {
+			continue
+		}
+		keep[l.Releases[i].ID] = true
+		seen++
+	}
+	return keep
+}
+
+// Trim bounds the ledger's length without dropping releases that are still
+// rollback targets.
+//
+// A plain "keep the last N entries" would let a run of failed deploys evict the
+// last good release from the history altogether, which is the same bug KeepIDs
+// exists to prevent, one layer up.
+func (l *Ledger) Trim(retain int) {
+	if retain <= 0 {
+		retain = DefaultRetain
+	}
+	window := retain * 2
+	if len(l.Releases) <= window {
+		return
+	}
+	keep := l.KeepIDs(retain)
+	cutoff := len(l.Releases) - window
+	out := make([]Entry, 0, window+len(keep))
+	for i := range l.Releases {
+		if i >= cutoff || keep[l.Releases[i].ID] {
+			out = append(out, l.Releases[i])
+		}
+	}
+	l.Releases = out
 }
 
 // Previous returns the most recent successfully-activated release before the

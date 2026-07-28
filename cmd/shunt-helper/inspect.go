@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"github.com/OAISP/shunt/internal/release"
@@ -93,32 +92,55 @@ func cmdPrune(args []string) error {
 		if err != nil {
 			return err
 		}
-		return pruneImages(project, ledger, nil)
+		retain := retainFor(ledger, nil)
+		keepIDs := ledger.KeepIDs(retain)
+		if err := pruneImages(project, keepImageRefs(ledger, keepIDs, nil)); err != nil {
+			return err
+		}
+		pruneEnvFiles(project, keepIDs)
+		return nil
 	})
 }
 
-// pruneImages removes release-tagged images that no retained ledger entry
-// references. Keeping the last N is what makes rollback instant — it is a
-// deliberate disk-for-recovery-time trade, not an oversight.
-func pruneImages(project string, ledger *release.Ledger, current *release.Spec) error {
-	keep := map[string]bool{}
-	retain := 5
+// retainFor resolves how many restorable releases to keep: what the release
+// being applied asks for, else what the active one asked for, else the default.
+func retainFor(ledger *release.Ledger, current *release.Spec) int {
 	if current != nil && current.Retain > 0 {
-		retain = current.Retain
+		return current.Retain
 	}
-	seen := 0
-	for i := len(ledger.Releases) - 1; i >= 0 && seen < retain; i-- {
-		for _, img := range ledger.Releases[i].Images {
-			keep[img.Ref] = true
+	if cur := ledger.Find(ledger.Current); cur != nil && cur.Spec != nil && cur.Spec.Retain > 0 {
+		return cur.Spec.Retain
+	}
+	return release.DefaultRetain
+}
+
+// keepImageRefs collects every image ref that must survive pruning.
+//
+// current is the release being applied, which is not in the ledger yet — its
+// entry is only appended once the outcome is known — so its images have to be
+// added explicitly or a deploy would prune the very images it just loaded.
+func keepImageRefs(ledger *release.Ledger, keepIDs map[string]bool, current *release.Spec) map[string]bool {
+	refs := map[string]bool{}
+	for i := range ledger.Releases {
+		if !keepIDs[ledger.Releases[i].ID] {
+			continue
 		}
-		seen++
+		for _, img := range ledger.Releases[i].Images {
+			refs[img.Ref] = true
+		}
 	}
 	if current != nil {
 		for _, img := range current.Images {
-			keep[img.Ref] = true
+			refs[img.Ref] = true
 		}
 	}
+	return refs
+}
 
+// pruneImages removes release-tagged images that no retained release
+// references. Keeping the last N is what makes rollback instant — it is a
+// deliberate disk-for-recovery-time trade, not an oversight.
+func pruneImages(project string, keep map[string]bool) error {
 	out, err := exec.Command("docker", "images",
 		"--filter", "reference=shunt/"+project+"-*", "--format", "{{.Repository}}:{{.Tag}}").Output()
 	if err != nil {
@@ -139,23 +161,24 @@ func pruneImages(project string, ledger *release.Ledger, current *release.Spec) 
 	return nil
 }
 
-func pruneEnvFiles(project string, retain int) {
-	if retain <= 0 {
-		retain = 5
-	}
+// pruneEnvFiles drops the env-files of releases that are no longer restorable.
+//
+// It is gated on the same keep set as the images deliberately: an env-file is
+// the only plaintext copy of a release's secrets, so dropping one that still has
+// images makes that release un-rollbackable in a way nothing reports until you
+// try. The two have to expire together or not at all.
+func pruneEnvFiles(project string, keepIDs map[string]bool) {
 	dir := filepath.Join(projectDir(project), "env")
 	ents, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
-	names := make([]string, 0, len(ents))
 	for _, e := range ents {
-		if !e.IsDir() {
-			names = append(names, e.Name())
+		if e.IsDir() {
+			continue
 		}
-	}
-	sort.Sort(sort.Reverse(sort.StringSlice(names))) // ids sort lexically by time
-	for i := retain; i < len(names); i++ {
-		os.Remove(filepath.Join(dir, names[i]))
+		if id := strings.TrimSuffix(e.Name(), ".env"); !keepIDs[id] {
+			os.Remove(filepath.Join(dir, e.Name()))
+		}
 	}
 }

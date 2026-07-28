@@ -1,6 +1,10 @@
 package release
 
-import "testing"
+import (
+	"fmt"
+	"slices"
+	"testing"
+)
 
 func ledger(entries ...Entry) *Ledger {
 	l := &Ledger{Project: "demo", Releases: entries}
@@ -8,6 +12,108 @@ func ledger(entries ...Entry) *Ledger {
 		l.Current = entries[len(entries)-1].ID
 	}
 	return l
+}
+
+// good builds a restorable entry: reached a healthy state and kept its spec.
+func good(id string) Entry {
+	return Entry{ID: id, Status: StatusSuperseded, Spec: &Spec{ID: id}}
+}
+
+func bad(id string) Entry { return Entry{ID: id, Status: StatusFailed, Spec: &Spec{ID: id}} }
+
+func ids(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	slices.Sort(out)
+	return out
+}
+
+// The regression this whole retention path exists to prevent: a good release
+// followed by a run of failed deploys must still be restorable. Counting the
+// failures toward `retain` would evict it — and the operator only finds out when
+// they try to roll back, which is the worst possible moment to find out.
+func TestKeepIDsDoesNotCountFailedReleases(t *testing.T) {
+	l := ledger(good("r1"), bad("r2"), bad("r3"), bad("r4"), bad("r5"), bad("r6"))
+	keep := l.KeepIDs(5)
+	if !keep["r1"] {
+		t.Fatalf("KeepIDs dropped the last good release; kept %v", ids(keep))
+	}
+}
+
+// Whatever is currently active is kept regardless of how it is classified —
+// its containers are running right now.
+func TestKeepIDsAlwaysKeepsCurrent(t *testing.T) {
+	l := ledger(good("r1"), bad("r2"))
+	if keep := l.KeepIDs(5); !keep["r2"] {
+		t.Fatalf("KeepIDs dropped the current release; kept %v", ids(keep))
+	}
+}
+
+func TestKeepIDsBoundsToRetain(t *testing.T) {
+	l := ledger(good("r1"), good("r2"), good("r3"), good("r4"))
+	keep := l.KeepIDs(2)
+	// The newest two restorable, plus current — which is r4, already among them.
+	if got, want := ids(keep), []string{"r3", "r4"}; !slices.Equal(got, want) {
+		t.Fatalf("KeepIDs(2) = %v, want %v", got, want)
+	}
+}
+
+// An entry with no retained spec cannot be replayed, so it is not a rollback
+// target and must not consume a retain slot.
+func TestKeepIDsSkipsEntriesWithoutASpec(t *testing.T) {
+	l := ledger(good("r1"), Entry{ID: "r2", Status: StatusSuperseded}, good("r3"))
+	keep := l.KeepIDs(2)
+	if !keep["r1"] {
+		t.Fatalf("a spec-less entry consumed a retain slot; kept %v", ids(keep))
+	}
+}
+
+// Trimming the history must not be another way to lose the last good release.
+func TestTrimKeepsRestorableReleasesOutsideTheWindow(t *testing.T) {
+	entries := []Entry{good("r00")}
+	for i := 1; i <= 12; i++ {
+		entries = append(entries, bad(fmt.Sprintf("r%02d", i)))
+	}
+	l := ledger(entries...)
+	l.Trim(2) // window of 4 — r00 is far outside it
+
+	if l.Find("r00") == nil {
+		t.Fatalf("Trim evicted the last good release; kept %v", entryIDs(l))
+	}
+	if l.Find("r12") == nil {
+		t.Fatalf("Trim evicted the current release; kept %v", entryIDs(l))
+	}
+}
+
+func TestTrimIsAnOrderPreservingNoOpBelowTheWindow(t *testing.T) {
+	l := ledger(good("r1"), good("r2"), good("r3"))
+	l.Trim(5)
+	if got, want := entryIDs(l), []string{"r1", "r2", "r3"}; !slices.Equal(got, want) {
+		t.Fatalf("Trim = %v, want %v", got, want)
+	}
+}
+
+func TestTrimPreservesChronologicalOrder(t *testing.T) {
+	entries := []Entry{good("r00")}
+	for i := 1; i <= 10; i++ {
+		entries = append(entries, bad(fmt.Sprintf("r%02d", i)))
+	}
+	l := ledger(entries...)
+	l.Trim(2)
+	got := entryIDs(l)
+	if !slices.IsSorted(got) {
+		t.Fatalf("Trim reordered the history: %v", got)
+	}
+}
+
+func entryIDs(l *Ledger) []string {
+	out := make([]string, 0, len(l.Releases))
+	for i := range l.Releases {
+		out = append(out, l.Releases[i].ID)
+	}
+	return out
 }
 
 // Previous is what `shunt rollback` with no argument targets, so it must skip

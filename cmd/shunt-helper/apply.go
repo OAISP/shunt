@@ -54,9 +54,7 @@ func apply(spec *release.Spec) error {
 		}
 		ledger.Releases = append(ledger.Releases, entry)
 		ledger.Current = entry.ID
-		if n := spec.Retain; n > 0 && len(ledger.Releases) > n*2 {
-			ledger.Releases = ledger.Releases[len(ledger.Releases)-n*2:]
-		}
+		ledger.Trim(spec.Retain)
 		if err := saveLedger(ledger); err != nil {
 			return errors.Join(runErr, err)
 		}
@@ -105,10 +103,14 @@ func apply(spec *release.Spec) error {
 			err, artifactRecovery(spec)))
 	}
 
-	if err := pruneImages(spec.Project, ledger, spec); err != nil {
+	// This release is not in the ledger yet, so it has to be pinned into the keep
+	// set explicitly — otherwise the deploy prunes what it just loaded.
+	keepIDs := ledger.KeepIDs(retainFor(ledger, spec))
+	keepIDs[spec.ID] = true
+	if err := pruneImages(spec.Project, keepImageRefs(ledger, keepIDs, spec)); err != nil {
 		info("image prune: " + err.Error())
 	}
-	pruneEnvFiles(spec.Project, spec.Retain)
+	pruneEnvFiles(spec.Project, keepIDs)
 
 	emit(release.Event{Kind: release.KindResult, Release: spec.ID, Status: release.StatusActive})
 	return finish(nil)
