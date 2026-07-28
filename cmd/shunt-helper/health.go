@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"os/exec"
 	"strings"
 	"time"
@@ -9,13 +10,19 @@ import (
 	"github.com/OAISP/shunt/internal/release"
 )
 
-// healthCheck gates the release on every service reporting healthy. Proxied
-// services were already checked inline during the swap — re-probing them here
-// would just repeat work.
+// healthCheck gates the release on every service reporting healthy, skipping
+// the ones the swap already gated.
+//
+// Two kinds were checked inline: proxied services, which must be proven healthy
+// before the old container leaves rotation, and any service another one depends
+// on, which is checked before its dependents start. Re-probing those is not
+// merely redundant — a `grace` is a sleep, so a required service with a 30s
+// grace made the deploy wait a full minute for one container.
 func healthCheck(spec *release.Spec) error {
+	gated := dependedOn(spec)
 	var pending []string
 	for _, name := range spec.Order {
-		if svc, present := spec.Services[name]; present && !svc.Proxied() {
+		if svc, present := spec.Services[name]; present && !svc.Proxied() && !gated[name] {
 			pending = append(pending, name)
 		}
 	}
@@ -60,8 +67,8 @@ func waitHealthy(spec *release.Spec, order []string, set map[string]release.Serv
 			last = err.Error()
 			// Surface a container that already died rather than burning the full
 			// retry budget waiting for a process that will never listen.
-			if state, _ := exec.Command("docker", "inspect", "-f", "{{.State.Status}}", container).Output(); len(state) > 0 {
-				if s := strings.TrimSpace(string(state)); s == "exited" || s == "dead" {
+			if state, _ := docker.Run("docker", "inspect", "-f", "{{.State.Status}}", container); len(state) > 0 {
+				if s := strings.TrimSpace(state); s == "exited" || s == "dead" {
 					return fmt.Errorf("%s exited during startup:\n%s", container, tailLogs(container, 20))
 				}
 			}
@@ -118,11 +125,11 @@ func probe(spec *release.Spec, container string, svc release.Service, h *release
 		return "", fmt.Errorf("HTTP %s from %s", code, target)
 	}
 	args := append([]string{"exec", container}, h.Command...)
-	out, err := exec.Command("docker", args...).CombinedOutput()
+	out, err := docker.Run("docker", args...)
 	if err != nil {
-		return "", fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+		return "", fmt.Errorf("%v: %s", err, strings.TrimSpace(out))
 	}
-	return strings.TrimSpace(string(out)), nil
+	return strings.TrimSpace(out), nil
 }
 
 // probeBase turns a service into the origin a bare health path is resolved
@@ -133,8 +140,8 @@ func probe(spec *release.Spec, container string, svc release.Service, h *release
 // on the deploy network. Supporting both means a health check can be written as
 // "/health" regardless of which shape the service has.
 func probeBase(spec *release.Spec, container string, svc release.Service) (string, error) {
-	if port, ok := publishedHostPort(svc); ok {
-		return "http://127.0.0.1:" + port, nil
+	if host, port, ok := publishedHostPort(svc); ok {
+		return "http://" + net.JoinHostPort(host, port), nil
 	}
 	port := svc.Expose
 	if svc.Proxy != nil && svc.Proxy.Port != 0 {
@@ -150,28 +157,39 @@ func probeBase(spec *release.Spec, container string, svc release.Service) (strin
 	return fmt.Sprintf("http://%s:%d", ip, port), nil
 }
 
-// publishedHostPort extracts the host port from the first publish mapping,
-// which takes the forms "port", "host:container" or "ip:host:container".
-func publishedHostPort(svc release.Service) (string, bool) {
+// publishedHostPort extracts the address a published service is reachable on
+// from the first publish mapping, which takes the forms "port",
+// "host:container" or "ip:host:container".
+//
+// The bind address matters: a service published as "10.0.0.5:9090:3000" is not
+// listening on 127.0.0.1, and probing the wrong address fails the health check
+// after the container has already been swapped in.
+func publishedHostPort(svc release.Service) (host, port string, ok bool) {
 	for _, p := range svc.Publish {
 		// Strip any /tcp or /udp suffix before splitting.
 		spec, _, _ := strings.Cut(p, "/")
 		parts := strings.Split(spec, ":")
 		switch len(parts) {
 		case 2: // hostPort:containerPort
-			return parts[0], true
+			return "127.0.0.1", parts[0], true
 		case 3: // ip:hostPort:containerPort
-			return parts[1], true
+			addr := parts[0]
+			// 0.0.0.0 and :: mean "every interface", which includes loopback and
+			// is the one address certain to be reachable from the host itself.
+			if addr == "" || addr == "0.0.0.0" || addr == "::" {
+				addr = "127.0.0.1"
+			}
+			return addr, parts[1], true
 		}
 		// A bare container port means Docker picks a random host port; there is
 		// nothing stable to probe.
 	}
-	return "", false
+	return "", "", false
 }
 
 func tailLogs(container string, n int) string {
-	out, _ := exec.Command("docker", "logs", "--tail", fmt.Sprint(n), container).CombinedOutput()
-	s := strings.TrimSpace(string(out))
+	out, _ := docker.Run("docker", "logs", "--tail", fmt.Sprint(n), container)
+	s := strings.TrimSpace(out)
 	if s == "" {
 		return "  (no container logs)"
 	}

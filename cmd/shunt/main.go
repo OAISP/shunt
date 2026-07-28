@@ -41,11 +41,24 @@ func init() {
 
 const usage = `usage:
   shunt init                 scaffold a shunt.toml for this project
+  shunt validate             check shunt.toml without touching the network
+  shunt audit                check everything a deploy needs, and change nothing
   shunt plan                 build, then show what a deploy would change
   shunt up                   build, ship, run stages, swap containers, health-check
+                             --rollback-on-failure restores the previous release
+                             if this one fails after replacing a container
   shunt status               what the host is running right now
+  shunt exec <service> ...   run a command in the running container
+  shunt run <service> ...    run a one-off command in a fresh container
   shunt rollback [release]   restore the previous (or a named) release
   shunt boot <accessory>     (re)create a stateful accessory — destructive
+  shunt retire <service>     stop a service you removed from shunt.toml
+  shunt bundle               build a release into a portable file
+  shunt bundle inspect <f>   show what a bundle contains, without applying it
+  shunt bundle verify <f>    rehash a bundle's blobs; needs no host
+  shunt apply <bundle>       deploy a bundle, no build toolchain needed
+  shunt apply --plan <f>     show what applying a bundle would change
+  shunt fetch [name|path]    pull an artifact or capture back down
   shunt logs [service]       tail logs from the host
   shunt prune                drop superseded images on the host
   shunt version
@@ -54,6 +67,11 @@ common flags:
   -f, --file <path>   path to shunt.toml (default: nearest one up the tree)
   -v, --verbose       show build output and per-step detail
       --json          emit machine-readable events instead of prose
+
+exit codes:
+  0  success, or "shunt plan" found nothing to do
+  1  the command failed
+  2  "shunt plan" found changes to apply (and bad usage)
 
 Set SHUNT_NO_BANNER=1 to suppress the banner, NO_COLOR=1 to suppress colour.
 `
@@ -67,12 +85,22 @@ var commands = map[string]func(context.Context, []string) error{
 	// forgets to return, which is exactly the bug this shape makes impossible.
 	"init": func(_ context.Context, args []string) error { return cmdInit(args, os.Stdout) },
 
+	// validate needs no host either, for the same reason as init.
+	"validate": cmdValidate,
+
+	"audit":    cmdAudit,
 	"plan":     cmdPlan,
 	"up":       cmdUp,
 	"deploy":   cmdUp, // alias
 	"status":   cmdStatus,
+	"exec":     cmdExec,
+	"run":      cmdRun,
 	"rollback": cmdRollback,
 	"boot":     cmdBoot,
+	"retire":   cmdRetire,
+	"bundle":   cmdBundle,
+	"apply":    cmdApply,
+	"fetch":    cmdFetch,
 	"logs":     cmdLogs,
 	"prune":    cmdPrune,
 }
@@ -112,6 +140,9 @@ func main() {
 func exit(err error) {
 	if err == nil {
 		return
+	}
+	if errors.Is(err, errExitChanges) {
+		os.Exit(2)
 	}
 	if errors.Is(err, errReported) {
 		os.Exit(1)

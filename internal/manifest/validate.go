@@ -50,6 +50,9 @@ func (m *Manifest) Validate() error {
 				add("service %q: requires unknown service or accessory %q", name, dep)
 			}
 		}
+		if len(svc.Secrets) > 0 && m.Secrets == nil {
+			add("service %q: lists secrets but the manifest declares no [secrets] block", name)
+		}
 		if svc.Health != nil && svc.Health.URL == "" && len(svc.Health.Command) == 0 {
 			add("service %q: health block needs either url or command", name)
 		}
@@ -133,7 +136,7 @@ func (m *Manifest) Validate() error {
 		} else if !filepath.IsAbs(a.Dest) {
 			add("artifact %q: dest %q must be an absolute path on the host", a.Name, a.Dest)
 		} else if strings.HasSuffix(a.Dest, "/") {
-			add("artifact %q: dest %q must be a file path, not a directory", a.Name, a.Dest)
+			add("artifact %q: dest %q must not end in a slash", a.Name, a.Dest)
 		}
 		if a.Retain < 0 {
 			add("artifact %q: retain cannot be negative", a.Name)
@@ -154,6 +157,39 @@ func (m *Manifest) Validate() error {
 			add("secrets: provider is required")
 		default:
 			add("secrets: unknown provider %q (want file, env, or sops)", m.Secrets.Provider)
+		}
+		switch m.Secrets.Mode {
+		case "", "env", "file":
+		default:
+			add("secrets: unknown mode %q (want env or file)", m.Secrets.Mode)
+		}
+	}
+
+	for name, t := range m.Targets {
+		if !nameRE.MatchString(name) {
+			add("target %q: name must be lowercase alphanumeric with - or _", name)
+		}
+		if t.Host == "" {
+			add("target %q: host is required", name)
+		}
+		if t.Project != "" && !nameRE.MatchString(t.Project) {
+			add("target %q: project %q must be lowercase alphanumeric with - or _", name, t.Project)
+		}
+		if t.Secrets != nil {
+			switch t.Secrets.Provider {
+			case "file", "sops":
+				if t.Secrets.Path == "" {
+					add("target %q: secrets provider %q requires path", name, t.Secrets.Provider)
+				}
+			case "env":
+				if len(t.Secrets.Keys) == 0 {
+					add("target %q: secrets provider \"env\" requires keys", name)
+				}
+			case "":
+				add("target %q: secrets provider is required", name)
+			default:
+				add("target %q: unknown secrets provider %q", name, t.Secrets.Provider)
+			}
 		}
 	}
 

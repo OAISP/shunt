@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -10,56 +11,96 @@ import (
 	"strings"
 
 	"github.com/OAISP/shunt/internal/build"
+	"github.com/OAISP/shunt/internal/oci"
 	"github.com/OAISP/shunt/internal/release"
+	"github.com/OAISP/shunt/internal/sshx"
 	"github.com/OAISP/shunt/internal/transport"
 )
+
+// PlanSchema versions the machine-readable plan.
+//
+// `--json` previously emitted whatever Go field names happened to be, which is
+// not a contract: renaming a field would have silently broken every consumer.
+// The version is what lets a consumer notice a change instead of misreading one.
+const PlanSchema = 1
 
 // Plan is the diff between what the host is running and what the manifest says
 // it should run. Printing this before mutating anything is the difference
 // between a deploy tool and a script you hope works.
 type Plan struct {
-	ReleaseID   string
-	Current     *release.Entry
-	Images      []ImageChange
-	Accessories []ServiceChange
-	Services    []ServiceChange
-	Artifacts   []ArtifactChange
-	Stages      []string
-	Secrets     SecretChange
-	Transfer    TransferEstimate
+	// Schema is the version of this document's shape.
+	Schema      int              `json:"schema"`
+	ReleaseID   string           `json:"release_id"`
+	Current     *release.Entry   `json:"current"`
+	Images      []ImageChange    `json:"images"`
+	Accessories []ServiceChange  `json:"accessories"`
+	Services    []ServiceChange  `json:"services"`
+	Artifacts   []ArtifactChange `json:"artifacts"`
+	Stages      []StageChange    `json:"stages"`
+	Secrets     SecretChange     `json:"secrets"`
+	Transfer    TransferEstimate `json:"transfer"`
+
+	// Changed is materialised into the document so a consumer does not have to
+	// re-derive shunt's own notion of "is there work to do".
+	HasChanges bool `json:"has_changes"`
+
+	// Release lists release-wide settings that changed — things that belong to
+	// no individual service but alter how all of them are created.
+	Release []string `json:"release,omitempty"`
+
+	// SecretsUnknown means the values could not be resolved here, so the secret
+	// diff is absent rather than empty. Applying a bundle on a machine without
+	// the provider is the case: reporting every key as removed would be worse
+	// than admitting the comparison did not happen.
+	SecretsUnknown bool `json:"secrets_unknown,omitempty"`
 }
 
 type ImageChange struct {
-	Name     string
-	Action   string // create | update | unchanged | pull
-	OldDgst  string
-	NewDgst  string
-	External bool
+	Name     string `json:"name"`
+	Action   string `json:"action"` // create | update | unchanged | pull
+	OldDgst  string `json:"old_digest,omitempty"`
+	NewDgst  string `json:"new_digest,omitempty"`
+	External bool   `json:"external,omitempty"`
 }
 
 type ServiceChange struct {
-	Name    string
-	Action  string // create | update | unchanged | remove | drift
-	Reasons []string
+	Name    string   `json:"name"`
+	Action  string   `json:"action"` // create | update | unchanged | orphaned | drift
+	Reasons []string `json:"reasons,omitempty"`
 
 	// ZeroDowntime is true for proxied services, which start alongside the
 	// running release instead of replacing it in place.
-	ZeroDowntime bool
+	ZeroDowntime bool `json:"zero_downtime,omitempty"`
+
+	// ProxyGated is false for a proxied service whose health check the proxy
+	// cannot poll — a command check. Such a service overlaps, but the proxy has
+	// no way to keep a still-warming container out of rotation, so the swap
+	// leans on retry alone. Reported rather than left implicit.
+	ProxyGated bool `json:"proxy_gated,omitempty"`
+}
+
+// StageChange is one one-shot container the deploy would run, and whether the
+// manifest changed it.
+type StageChange struct {
+	Name   string `json:"name"`
+	Action string `json:"action"` // run | create | update | remove
 }
 
 type SecretChange struct {
-	Added, Removed, Changed []string
-	Total                   int
+	Added   []string `json:"added,omitempty"`
+	Removed []string `json:"removed,omitempty"`
+	Changed []string `json:"changed,omitempty"`
+	Total   int      `json:"total"`
 }
 
 // ArtifactChange is one data file the deploy would ship.
 type ArtifactChange struct {
-	Name       string
-	Dest       string
-	LocalBytes int64
-	LocalMTime int64
-	HostBytes  int64 // -1 when the host has no copy yet
-	HostMTime  int64
+	Name       string `json:"name"`
+	Dest       string `json:"dest"`
+	LocalBytes int64  `json:"local_bytes"`
+	LocalMTime int64  `json:"local_mtime"`
+	HostBytes  int64  `json:"host_bytes"` // -1 when the host has no copy yet
+	HostMTime  int64  `json:"host_mtime"`
 }
 
 // Differs reports whether the host's copy needs replacing, using size and mtime
@@ -81,9 +122,9 @@ func (a ArtifactChange) Action() string {
 }
 
 type TransferEstimate struct {
-	Total   int64 // logical size of all layouts
-	Missing int64 // bytes the host does not have yet
-	Blobs   int   // number of blobs to send
+	Total   int64 `json:"total"`   // logical size of all layouts
+	Missing int64 `json:"missing"` // bytes the host does not have yet
+	Blobs   int   `json:"blobs"`   // number of blobs to send
 }
 
 // CachedPercent is the share of the image the host already holds.
@@ -115,7 +156,9 @@ func (p *Plan) Changed() bool {
 		}
 	}
 	for _, s := range p.Services {
-		if s.Action != "unchanged" {
+		// An orphan is reported, never acted on — counting it would leave the
+		// plan permanently dirty with a change `shunt up` will never make.
+		if s.Action != "unchanged" && s.Action != "orphaned" {
 			return true
 		}
 	}
@@ -131,17 +174,30 @@ func (p *Plan) Changed() bool {
 			return true
 		}
 	}
-	return false
+	// Adding a migration to the manifest is a deploy. Without this the stage was
+	// invisible to change detection, `shunt up` said "nothing to do", and the
+	// migration silently never ran.
+	for _, st := range p.Stages {
+		if st.Action != "run" {
+			return true
+		}
+	}
+	// Settings that belong to the release rather than to any one service —
+	// switching secrets from environment to files, renaming the network —
+	// change how every container is created but appear in no service diff.
+	// Without this they were silently ignored until something else forced a
+	// deploy, which is the same shape of bug stages had.
+	return len(p.Release) > 0
 }
 
 // BuildPlan diffs a freshly-built spec against the host's ledger.
 func (e *Engine) BuildPlan(ctx context.Context, spec *release.Spec, built map[string]*build.Result, state *RemoteState) (*Plan, error) {
-	p := &Plan{ReleaseID: spec.ID}
+	p := &Plan{Schema: PlanSchema, ReleaseID: spec.ID}
 	if state != nil && state.Ledger != nil && state.Ledger.Current != "" {
 		p.Current = state.Ledger.Find(state.Ledger.Current)
 	}
 
-	for _, name := range sortedKeys(spec.Images) {
+	for _, name := range slices.Sorted(maps.Keys(spec.Images)) {
 		img := spec.Images[name]
 		if img.External {
 			p.Images = append(p.Images, ImageChange{Name: name, Action: "pull", External: true})
@@ -166,9 +222,13 @@ func (e *Engine) BuildPlan(ctx context.Context, spec *release.Spec, built map[st
 		oldSpec = p.Current.Spec
 	}
 
-	for _, name := range sortedKeys(spec.Services) {
+	for _, name := range slices.Sorted(maps.Keys(spec.Services)) {
 		svc := spec.Services[name]
-		sc := ServiceChange{Name: name, Action: "create", ZeroDowntime: svc.Proxied()}
+		sc := ServiceChange{
+			Name: name, Action: "create",
+			ZeroDowntime: svc.Proxied(),
+			ProxyGated:   release.ProxyGatesReadiness(svc),
+		}
 		if oldSpec != nil {
 			if old, ok := oldSpec.Services[name]; ok {
 				sc.Reasons = diffService(old, svc)
@@ -191,39 +251,37 @@ func (e *Engine) BuildPlan(ctx context.Context, spec *release.Spec, built map[st
 				}
 			}
 		}
+		// The ledger says what shunt last deployed; only the containers say what
+		// the host is running now. Without this a service deleted, stopped or
+		// replaced by hand read as "unchanged" and `shunt up` refused to fix it.
+		if drift := reconcileService(state, name, svc); len(drift) > 0 {
+			if sc.Action == "unchanged" {
+				sc.Action = "update"
+			}
+			sc.Reasons = append(sc.Reasons, drift...)
+		}
 		p.Services = append(p.Services, sc)
 	}
 	if oldSpec != nil {
-		for _, name := range sortedKeys(oldSpec.Services) {
+		for _, name := range slices.Sorted(maps.Keys(oldSpec.Services)) {
 			if _, ok := spec.Services[name]; !ok {
-				p.Services = append(p.Services, ServiceChange{Name: name, Action: "remove",
-					Reasons: []string{"no longer in shunt.toml — shunt will not stop it automatically"}})
+				p.Services = append(p.Services, orphanChange(state, name))
 			}
 		}
 	}
 
-	// Accessories are only ever created, never replaced by a deploy. When the
-	// manifest drifts from what is running, say so loudly rather than silently
-	// ignoring the change — the operator has to run `shunt boot` deliberately.
-	for _, name := range sortedKeys(spec.Accessories) {
-		acc := spec.Accessories[name]
-		ac := ServiceChange{Name: name, Action: "create"}
-		if oldSpec != nil {
-			if old, present := oldSpec.Accessories[name]; present {
-				ac.Action = "unchanged"
-				if reasons := diffService(old, acc); len(reasons) > 0 {
-					ac.Action = "drift"
-					ac.Reasons = append(reasons, "not applied by `shunt up` — run `shunt boot "+name+"` to recreate")
-				}
-			}
-		}
-		p.Accessories = append(p.Accessories, ac)
-	}
+	p.Accessories = e.planAccessories(p, spec, state, oldSpec)
 
+	// Every artifact stat in one round trip rather than one apiece; see
+	// RemoteFileStat for why size and mtime are the right test rather than
+	// hashing.
+	dests := make([]string, 0, len(spec.Artifacts))
 	for _, a := range spec.Artifacts {
-		// One stat over the existing connection; see RemoteFileStat for why this
-		// is the right test rather than hashing.
-		host := transport.RemoteFileStat(ctx, e.Client, a.Dest)
+		dests = append(dests, a.Dest)
+	}
+	hostStats := transport.RemoteFileStats(ctx, e.Client, dests)
+	for _, a := range spec.Artifacts {
+		host := hostStats[a.Dest]
 		p.Artifacts = append(p.Artifacts, ArtifactChange{
 			Name:       a.Name,
 			Dest:       a.Dest,
@@ -234,11 +292,17 @@ func (e *Engine) BuildPlan(ctx context.Context, spec *release.Spec, built map[st
 		})
 	}
 
-	for _, st := range spec.Stages {
-		p.Stages = append(p.Stages, st.Name)
-	}
+	p.Stages = diffStages(oldSpec, spec)
 
-	p.Secrets = diffSecrets(oldSpec, spec)
+	p.Release = diffRelease(oldSpec, spec)
+
+	var salt string
+	if state != nil && state.Ledger != nil {
+		salt = state.Ledger.Salt
+	}
+	p.Secrets = diffSecrets(oldSpec, spec, salt)
+
+	defer func() { p.HasChanges = p.Changed() }()
 
 	est, err := e.estimate(ctx, built)
 	if err != nil {
@@ -250,122 +314,86 @@ func (e *Engine) BuildPlan(ctx context.Context, spec *release.Spec, built map[st
 	return p, nil
 }
 
-func imgChanged(imgs []ImageChange, name string) bool {
-	for _, i := range imgs {
-		if i.Name == name {
-			return i.Action == "update" || i.Action == "create"
-		}
+// planAccessories diffs the manifest's accessories against what the host
+// recorded as applied.
+//
+// Accessories are only ever created by a deploy, never replaced. When the
+// manifest drifts from what is actually running, say so loudly rather than
+// silently ignoring it — recreating one is the explicit `shunt boot`.
+//
+// The comparison is against the *applied* hash, not the last release's spec.
+// A deploy records the manifest it was handed even though it deliberately left
+// the accessory alone, so diffing against that made drift vanish after any
+// unrelated deploy while the container kept running the old config.
+func (e *Engine) planAccessories(p *Plan, spec *release.Spec, state *RemoteState, oldSpec *release.Spec) []ServiceChange {
+	var applied map[string]string
+	if state != nil && state.Ledger != nil {
+		applied = state.Ledger.Accessories
 	}
-	return false
-}
 
-func diffService(old, nw release.Service) []string {
-	var r []string
-	if old.Image != nw.Image {
-		r = append(r, fmt.Sprintf("image %s → %s", old.Image, nw.Image))
-	}
-	if !reflect.DeepEqual(old.Command, nw.Command) {
-		r = append(r, "command changed")
-	}
-	if !reflect.DeepEqual(old.Publish, nw.Publish) {
-		r = append(r, fmt.Sprintf("publish %v → %v", old.Publish, nw.Publish))
-	}
-	if !reflect.DeepEqual(old.Volumes, nw.Volumes) {
-		r = append(r, "volumes changed")
-	}
-	if old.Expose != nw.Expose {
-		r = append(r, fmt.Sprintf("expose %d → %d", old.Expose, nw.Expose))
-	}
-	if old.Drain != nw.Drain {
-		r = append(r, fmt.Sprintf("drain %s → %s", old.Drain, nw.Drain))
-	}
-	if !reflect.DeepEqual(old.Proxy, nw.Proxy) {
-		switch {
-		case old.Proxy == nil:
-			r = append(r, "proxy added — this service becomes zero-downtime")
-		case nw.Proxy == nil:
-			r = append(r, "proxy removed — this service goes back to restart-in-place")
-		default:
-			r = append(r, fmt.Sprintf("proxy %s %s → %s %s",
-				old.Proxy.Kind, old.Proxy.Host, nw.Proxy.Kind, nw.Proxy.Host))
-		}
-	}
-	if old.Restart != nw.Restart {
-		r = append(r, fmt.Sprintf("restart %s → %s", old.Restart, nw.Restart))
-	}
-	for _, k := range mapKeys(old.Env, nw.Env) {
-		ov, oo := old.Env[k]
-		nv, no := nw.Env[k]
-		switch {
-		case oo && !no:
-			r = append(r, "- env "+k)
-		case !oo && no:
-			r = append(r, "+ env "+k+"="+nv)
-		case ov != nv:
-			r = append(r, fmt.Sprintf("~ env %s=%s → %s", k, ov, nv))
-		}
-	}
-	return r
-}
+	out := make([]ServiceChange, 0, len(spec.Accessories))
+	for _, name := range slices.Sorted(maps.Keys(spec.Accessories)) {
+		acc := spec.Accessories[name]
+		ac := ServiceChange{Name: name, Action: "create"}
+		const hint = "not applied by `shunt up` — run `shunt boot "
 
-// diffSecrets compares key sets and whether values moved — never the values.
-func diffSecrets(old, nw *release.Spec) SecretChange {
-	sc := SecretChange{Total: len(nw.Secrets)}
-	// The ledger stores hashes, never values, so hash the freshly-resolved
-	// secrets before comparing — otherwise every key looks changed every time.
-	hashed := make(map[string]string, len(nw.Secrets))
-	for k, v := range nw.Secrets {
-		hashed[k] = release.HashSecret(v)
-	}
-	nw = &release.Spec{Secrets: hashed}
-	if old == nil {
-		for k := range nw.Secrets {
-			sc.Added = append(sc.Added, k)
+		switch got, recorded := applied[name]; {
+		case recorded:
+			ac.Action = "unchanged"
+			if got != release.HashService(acc) {
+				ac.Action = "drift"
+				ac.Reasons = append(driftReasons(oldSpec, name, acc), hint+name+"` to recreate")
+			}
+		case oldSpec != nil:
+			// A host deployed before applied-state tracking existed. Fall back to
+			// the old comparison rather than reporting every accessory as new.
+			if old, present := oldSpec.Accessories[name]; present {
+				ac.Action = "unchanged"
+				if reasons := diffService(old, acc); len(reasons) > 0 {
+					ac.Action = "drift"
+					ac.Reasons = append(reasons, hint+name+"` to recreate")
+				}
+			}
 		}
-		slices.Sort(sc.Added)
-		return sc
+		out = append(out, ac)
 	}
-	for _, k := range mapKeys(old.Secrets, nw.Secrets) {
-		ov, oo := old.Secrets[k]
-		nv, no := nw.Secrets[k]
-		switch {
-		case oo && !no:
-			sc.Removed = append(sc.Removed, k)
-		case !oo && no:
-			sc.Added = append(sc.Added, k)
-		case ov != nv:
-			sc.Changed = append(sc.Changed, k)
-		}
-	}
-	return sc
+	return out
 }
 
 // estimate asks the host which blobs it already holds and sums the rest. This is
 // the number that makes the registry-free approach legible: it is the actual
 // wire cost of the deploy, before it happens.
+//
+// One round trip for every image, not one per image: each listing is fenced by
+// a marker line so the replies can be told apart. A manifest with several images
+// otherwise paid a full ssh round trip each, before any work had started.
 func (e *Engine) estimate(ctx context.Context, built map[string]*build.Result) (*TransferEstimate, error) {
 	est := &TransferEstimate{}
-	for name, r := range built {
-		local, err := layoutBlobs(r.Dir)
+	if len(built) == 0 {
+		return est, nil
+	}
+	names := slices.Sorted(maps.Keys(built))
+
+	var script strings.Builder
+	for _, name := range names {
+		dir := filepath.Join(e.StorePath(), name, "blobs", "sha256")
+		fmt.Fprintf(&script, "echo %s\nls -1 %s 2>/dev/null || true\n",
+			sshx.Quote(blobFence+name), sshx.Quote(dir))
+	}
+	out, err := e.Client.Run(ctx, "sh", "-c", script.String())
+	if err != nil {
+		return nil, err
+	}
+	have := parseBlobListing(out)
+
+	for _, name := range names {
+		local, err := oci.Blobs(built[name].Dir)
 		if err != nil {
 			return nil, err
-		}
-		for _, sz := range local {
-			est.Total += sz
-		}
-		remoteDir := filepath.Join(e.StorePath(), name, "blobs", "sha256")
-		out, err := e.Client.Run(ctx, "sh", "-c", "ls -1 "+shellArg(remoteDir)+" 2>/dev/null || true")
-		if err != nil {
-			return nil, err
-		}
-		have := map[string]bool{}
-		for _, ln := range strings.Split(strings.TrimSpace(out), "\n") {
-			if ln != "" {
-				have[strings.TrimSpace(ln)] = true
-			}
 		}
 		for digest, sz := range local {
-			if !have[digest] {
+			est.Total += sz
+			if !have[name][digest] {
 				est.Missing += sz
 				est.Blobs++
 			}
@@ -374,42 +402,23 @@ func (e *Engine) estimate(ctx context.Context, built map[string]*build.Result) (
 	return est, nil
 }
 
-func layoutBlobs(dir string) (map[string]int64, error) {
-	blobs := filepath.Join(dir, "blobs", "sha256")
-	ents, err := os.ReadDir(blobs)
-	if err != nil {
-		return nil, err
-	}
-	out := make(map[string]int64, len(ents))
-	for _, e := range ents {
-		if e.IsDir() {
-			continue
-		}
-		fi, err := e.Info()
-		if err != nil {
-			return nil, err
-		}
-		out[e.Name()] = fi.Size()
-	}
-	return out, nil
-}
+// blobFence separates one image's blob listing from the next in a batched reply.
+// A digest is hex, so this cannot collide with one.
+const blobFence = "--shunt-image:"
 
-func mapKeys(a, b map[string]string) []string {
-	set := map[string]bool{}
-	for k := range a {
-		set[k] = true
+func parseBlobListing(out string) map[string]map[string]bool {
+	have := map[string]map[string]bool{}
+	var current string
+	for _, ln := range strings.Split(out, "\n") {
+		ln = strings.TrimSpace(ln)
+		switch {
+		case ln == "":
+		case strings.HasPrefix(ln, blobFence):
+			current = strings.TrimPrefix(ln, blobFence)
+			have[current] = map[string]bool{}
+		case current != "":
+			have[current][ln] = true
+		}
 	}
-	for k := range b {
-		set[k] = true
-	}
-	out := make([]string, 0, len(set))
-	for k := range set {
-		out = append(out, k)
-	}
-	slices.Sort(out)
-	return out
-}
-
-func shellArg(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+	return have
 }

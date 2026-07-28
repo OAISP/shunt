@@ -38,9 +38,29 @@ type Manifest struct {
 	Secrets *Secrets `toml:"secrets"`
 	Retain  int      `toml:"retain"` // releases kept on the host for rollback
 
+	// Targets are alternative hosts this same manifest can deploy to —
+	// staging and production, typically.
+	//
+	// A target changes *where* a release goes, never *what* it contains: the
+	// images, services, stages and artifacts are the ones declared above,
+	// whichever target is selected. That keeps the rule that no deploy-time flag
+	// alters what gets deployed, while removing the need to maintain two
+	// near-identical manifests that drift apart in exactly the ways that matter.
+	Targets map[string]Target `toml:"targets"`
+
+	// Target is the selected target's name, empty when deploying to the
+	// manifest's own host.
+	Target string `toml:"-"`
+
 	// dir is the directory shunt.toml was loaded from; all relative paths resolve
 	// against it, not against the process working directory.
 	dir string
+
+	// projectBase and networkExplicit remember what the file said, so selecting
+	// a target can re-derive the values that depend on the project name without
+	// mistaking an earlier default for an explicit choice.
+	projectBase     string
+	networkExplicit string
 }
 
 // Image is something shunt builds locally and ships. Images referenced by a service
@@ -51,6 +71,21 @@ type Image struct {
 	Platform   string            `toml:"platform"`
 	Target     string            `toml:"target"`
 	Args       map[string]string `toml:"args"`
+}
+
+// Target is a named deploy destination.
+type Target struct {
+	Host string `toml:"host"`
+
+	// Project renames the deployment on the host, so staging and production can
+	// share one machine without colliding on container names, networks or the
+	// ledger. Defaults to "<project>-<target>" rather than the bare project,
+	// because sharing a host is the case that silently corrupts state.
+	Project string `toml:"project"`
+
+	// Secrets may differ per target — staging must not hold production
+	// credentials. Unset means the manifest's own [secrets] block.
+	Secrets *Secrets `toml:"secrets"`
 }
 
 type Service struct {
@@ -77,6 +112,12 @@ type Service struct {
 
 	// Requires orders service startup. Cycles are rejected at validation time.
 	Requires []string `toml:"requires"`
+
+	// Secrets narrows which resolved secrets this service receives. Empty means
+	// all of them, which is the historical behaviour and the right default for a
+	// single-service project — but a worker has no business holding the payment
+	// credentials just because the web app needs them.
+	Secrets []string `toml:"secrets"`
 }
 
 // Proxy describes how an already-running reverse proxy should find this service.
@@ -190,6 +231,15 @@ type Secrets struct {
 	Provider string   `toml:"provider"` // file | env | sops
 	Path     string   `toml:"path"`
 	Keys     []string `toml:"keys"` // provider=env: which vars to forward
+
+	// Mode is how secrets reach the container: environment variables ("env",
+	// the default) or files under /run/secrets ("file").
+	//
+	// Docker expands --env-file into the container's configuration, so env mode
+	// values come back out of `docker inspect` and anything that captures it.
+	// File mode removes that passive copy. It does not change who *can* read
+	// them: socket access is root on that host either way.
+	Mode string `toml:"mode"`
 }
 
 // Duration wraps time.Duration so TOML can carry "3s" as a string.
@@ -216,6 +266,41 @@ func (m *Manifest) Abs(p string) string {
 		return p
 	}
 	return filepath.Join(m.dir, p)
+}
+
+// SelectTarget points the manifest at a named target, or leaves it alone when
+// name is empty. It is applied after loading and before anything reads Host.
+func (m *Manifest) SelectTarget(name string) error {
+	if name == "" {
+		return nil
+	}
+	t, ok := m.Targets[name]
+	if !ok {
+		known := make([]string, 0, len(m.Targets))
+		for k := range m.Targets {
+			known = append(known, k)
+		}
+		slices.Sort(known)
+		if len(known) == 0 {
+			return fmt.Errorf("shunt.toml declares no [targets.*], so there is no target %q", name)
+		}
+		return fmt.Errorf("no target %q in shunt.toml (declared: %s)", name, strings.Join(known, ", "))
+	}
+	m.Host = t.Host
+	if t.Secrets != nil {
+		m.Secrets = t.Secrets
+	}
+	m.Project = t.Project
+	if m.Project == "" {
+		m.Project = m.projectBase + "-" + name
+	}
+	// The network is derived from the project, so it has to be re-derived here
+	// or staging and production would share one network on a shared host.
+	if m.networkExplicit == "" {
+		m.Network = m.Project + "-net"
+	}
+	m.Target = name
+	return nil
 }
 
 // Find walks up from start looking for shunt.toml, so the CLI works from any
@@ -254,6 +339,8 @@ func Load(path string) (*Manifest, error) {
 		return nil, fmt.Errorf("%s: unknown key(s): %s", filepath.Base(path), strings.Join(keys, ", "))
 	}
 	m.dir = filepath.Dir(path)
+	m.projectBase = m.Project
+	m.networkExplicit = m.Network
 	m.applyDefaults()
 	if err := m.Validate(); err != nil {
 		return nil, err

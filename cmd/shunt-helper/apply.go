@@ -30,33 +30,51 @@ func apply(spec *release.Spec) error {
 	if err != nil {
 		return err
 	}
-	entry := release.Entry{
-		ID:        spec.ID,
-		Status:    "failed", // pessimistic until proven otherwise
-		StartedAt: time.Now().UTC(),
-		Images:    spec.Images,
-		Spec:      redactSecrets(spec),
+	if err := ensureSalt(ledger); err != nil {
+		return err
 	}
+	// Checked under the lock, against the state the plan was computed from. The
+	// build can take minutes, so the host may have moved on between planning and
+	// applying — and applying a plan whose premise has expired is how one deploy
+	// silently reverts another.
+	if spec.ExpectedCurrent != "" && ledger.Current != "" && spec.ExpectedCurrent != ledger.Current {
+		return fmt.Errorf("this plan was built when %s was serving, but %s is serving now — "+
+			"another deploy or rollback landed in between\n  rerun `shunt up` to plan against the current state",
+			spec.ExpectedCurrent, ledger.Current)
+	}
+	entry := release.Entry{
+		ID:         spec.ID,
+		Status:     release.StatusFailed, // pessimistic until proven otherwise
+		StartedAt:  time.Now().UTC(),
+		Images:     spec.Images,
+		Provenance: spec.Provenance,
+		Spec:       redactSecrets(spec, ledger.Salt),
+	}
+
+	// mutated records whether any running container was replaced. It is what
+	// separates a failure that left the host exactly as it was from one that
+	// left it running a mix of two releases.
+	mutated := false
 
 	// finish records the outcome no matter which step failed, so `shunt status`
 	// always reflects reality rather than the last success.
 	finish := func(runErr error) error {
-		entry.FinishedAt = time.Now().UTC()
-		if runErr != nil {
-			entry.Error = runErr.Error()
-		} else {
-			entry.Status = release.StatusActive
-		}
-		for i := range ledger.Releases {
-			if ledger.Releases[i].Status == release.StatusActive {
-				ledger.Releases[i].Status = release.StatusSuperseded
+		// A degraded host is the one outcome an operator cannot leave alone: some
+		// services are on the new release and some on the old. Restoring is only
+		// attempted when asked, because it is the wrong move for a release whose
+		// stages already migrated a database — the code would go back and the
+		// schema would not.
+		if runErr != nil && mutated && spec.RollbackOnFailure {
+			if rbErr := autoRollback(spec, ledger); rbErr != nil {
+				runErr = fmt.Errorf("%w\n  automatic rollback also failed: %v", runErr, rbErr)
+			} else {
+				runErr = fmt.Errorf("%w\n  the previous release was restored automatically", runErr)
+				// The host is back on the previous release, so this attempt did not
+				// take anything over after all.
+				mutated = false
 			}
 		}
-		ledger.Releases = append(ledger.Releases, entry)
-		ledger.Current = entry.ID
-		if n := spec.Retain; n > 0 && len(ledger.Releases) > n*2 {
-			ledger.Releases = ledger.Releases[len(ledger.Releases)-n*2:]
-		}
+		recordOutcome(ledger, &entry, mutated, runErr, spec.Retain)
 		if err := saveLedger(ledger); err != nil {
 			return errors.Join(runErr, err)
 		}
@@ -69,14 +87,19 @@ func apply(spec *release.Spec) error {
 	if err := loadImages(spec); err != nil {
 		return finish(err)
 	}
-	envFile, err := writeEnvFile(spec)
-	if err != nil {
-		return finish(err)
+	// In file mode the per-service directories are written as containers start,
+	// so there is no single env-file to prepare here.
+	envFile := ""
+	if !spec.SecretsAsFiles() {
+		var err error
+		if envFile, err = writeEnvFile(spec); err != nil {
+			return finish(err)
+		}
 	}
 
 	// Accessories come up first so stages have a database to talk to. Existing
 	// ones are left untouched.
-	if err := ensureAccessories(spec, envFile); err != nil {
+	if err := ensureAccessories(spec, ledger, envFile); err != nil {
 		return finish(fmt.Errorf("%w\n  no services were replaced — production is untouched", err))
 	}
 
@@ -93,22 +116,34 @@ func apply(spec *release.Spec) error {
 		return finish(fmt.Errorf("%w\n  no services were replaced — production is untouched", err))
 	}
 
-	started, err := swapServices(spec, previousSpec(ledger), envFile)
+	started, swapped, err := swapServices(spec, previousSpec(ledger), envFile)
+	mutated = mutated || swapped
+	entry.Services = started
 	if err != nil {
-		entry.Services = started
+		if mutated {
+			err = fmt.Errorf("%w\n  this host is now running a mix of releases — `shunt rollback` restores the previous one%s",
+				err, artifactRecovery(spec))
+		}
 		return finish(err)
 	}
-	entry.Services = started
 
 	if err := healthCheck(spec); err != nil {
+		// Reached only once services were swapped, so the host is mixed by
+		// definition even if swapServices itself reported nothing replaced.
+		mutated = true
 		return finish(fmt.Errorf("%w\n  containers are running but unhealthy — `shunt rollback` restores the previous release%s",
 			err, artifactRecovery(spec)))
 	}
 
-	if err := pruneImages(spec.Project, ledger, spec); err != nil {
+	// This release is not in the ledger yet, so it has to be pinned into the keep
+	// set explicitly — otherwise the deploy prunes what it just loaded.
+	keepIDs := ledger.KeepIDs(retainFor(ledger, spec))
+	keepIDs[spec.ID] = true
+	if err := pruneImages(spec.Project, keepImageRefs(ledger, keepIDs, spec)); err != nil {
 		info("image prune: " + err.Error())
 	}
-	pruneEnvFiles(spec.Project, spec.Retain)
+	pruneEnvFiles(spec.Project, keepIDs)
+	pruneSecretDirs(spec.Project, keepIDs)
 
 	emit(release.Event{Kind: release.KindResult, Release: spec.ID, Status: release.StatusActive})
 	return finish(nil)

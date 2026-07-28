@@ -67,15 +67,6 @@ func colorOK(w *os.File) bool {
 	return isTerminal(w)
 }
 
-// isTerminal reports whether w is attached to a character device.
-func isTerminal(w *os.File) bool {
-	if w == nil {
-		return false
-	}
-	fi, err := w.Stat()
-	return err == nil && fi.Mode()&os.ModeCharDevice != 0
-}
-
 // IsTerminal is the exported form, used to decide whether to prompt.
 func IsTerminal(w *os.File) bool { return isTerminal(w) }
 

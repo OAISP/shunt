@@ -10,6 +10,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/OAISP/shunt/internal/build"
 	"github.com/OAISP/shunt/internal/engine"
@@ -26,11 +27,17 @@ const protocolVersion = release.Protocol
 // one explanation instead of two.
 var errReported = errors.New("already reported")
 
+// errExitChanges makes `shunt plan` exit 2 when the host does not match the
+// manifest. It is not a failure — it is the answer to the question — but a
+// distinct code lets CI branch on it without parsing output.
+var errExitChanges = errors.New("plan has changes")
+
 // commonFlags are accepted by every command that talks to a host.
 type commonFlags struct {
 	file    string
 	verbose bool
 	asJSON  bool
+	target  string
 }
 
 func newFlagSet(name string, c *commonFlags) *flag.FlagSet {
@@ -40,6 +47,8 @@ func newFlagSet(name string, c *commonFlags) *flag.FlagSet {
 	fs.BoolVar(&c.verbose, "v", false, "verbose output")
 	fs.BoolVar(&c.verbose, "verbose", false, "verbose output")
 	fs.BoolVar(&c.asJSON, "json", false, "machine-readable output")
+	fs.StringVar(&c.target, "t", "", "deploy target from [targets.*]")
+	fs.StringVar(&c.target, "target", "", "deploy target from [targets.*]")
 	return fs
 }
 
@@ -108,8 +117,9 @@ func isBoolFlag(f *flag.Flag) bool {
 	return ok && b.IsBoolFlag()
 }
 
-// loadManifest resolves -f/--file or walks up from the working directory.
-func loadManifest(path string) (*manifest.Manifest, error) {
+// loadManifest resolves -f/--file or walks up from the working directory, then
+// points the manifest at the selected target.
+func loadManifest(path, target string) (*manifest.Manifest, error) {
 	if path == "" {
 		wd, err := os.Getwd()
 		if err != nil {
@@ -119,13 +129,20 @@ func loadManifest(path string) (*manifest.Manifest, error) {
 			return nil, err
 		}
 	}
-	return manifest.Load(path)
+	m, err := manifest.Load(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.SelectTarget(target); err != nil {
+		return nil, err
+	}
+	return m, nil
 }
 
 // connect loads the manifest and opens the host connection, which is what every
 // command except init needs first.
-func connect(ctx context.Context, file string) (*engine.Engine, error) {
-	m, err := loadManifest(file)
+func connect(ctx context.Context, file, target string) (*engine.Engine, error) {
+	m, err := loadManifest(file, target)
 	if err != nil {
 		return nil, err
 	}
@@ -142,12 +159,17 @@ type buildOut struct {
 	spec   *release.Spec
 	built  map[string]*build.Result
 	state  *engine.RemoteState
+
+	// Phase timings, so `up` can report where the wall clock actually went
+	// rather than one opaque total.
+	buildTook time.Duration
+	shipTook  time.Duration
 }
 
 // prepare connects, builds every image, assembles the release spec and reads the
 // host's current state. Callers own closing the engine on success.
 func prepare(ctx context.Context, c *commonFlags, noCache bool) (*buildOut, error) {
-	e, err := connect(ctx, c.file)
+	e, err := connect(ctx, c.file, c.target)
 	if err != nil {
 		return nil, err
 	}
@@ -170,13 +192,19 @@ func prepare(ctx context.Context, c *commonFlags, noCache bool) (*buildOut, erro
 
 	id := engine.NewReleaseID()
 	fmt.Fprintf(os.Stderr, "\n%s\n", s.Bold("building"))
+	buildStart := time.Now()
 	built, err := e.Build(ctx, id, engine.BuildOptions{NoCache: noCache, Verbose: c.verbose})
 	if err != nil {
 		return fail(err)
 	}
+	buildTook := time.Since(buildStart)
 	for _, name := range slices.Sorted(maps.Keys(built)) {
 		fmt.Fprintf(os.Stderr, "  %s %s %s (%s)\n", s.Tick(), name,
 			ui.ShortDigest(built[name].Digest), ui.Bytes(built[name].Bytes))
+	}
+
+	if err := e.PreflightSpace(built); err != nil {
+		return fail(err)
 	}
 
 	spec, err := e.Spec(ctx, id, built)
@@ -187,7 +215,7 @@ func prepare(ctx context.Context, c *commonFlags, noCache bool) (*buildOut, erro
 	if err != nil {
 		return fail(err)
 	}
-	return &buildOut{engine: e, spec: spec, built: built, state: state}, nil
+	return &buildOut{engine: e, spec: spec, built: built, state: state, buildTook: buildTook}, nil
 }
 
 // confirm asks a yes/no question. Callers must only reach it when stdin is a

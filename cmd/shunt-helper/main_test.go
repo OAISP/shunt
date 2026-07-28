@@ -1,10 +1,15 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/OAISP/shunt/internal/release"
 )
@@ -154,6 +159,88 @@ func TestDrainSeconds(t *testing.T) {
 	}
 }
 
+// A deploy that fails before replacing anything must leave the serving release
+// alone. Moving Current onto the failure made `shunt status` contradict the
+// "production is untouched" error the operator had just been shown.
+func TestRecordOutcomeLeavesTheServingReleaseAloneOnACleanFailure(t *testing.T) {
+	l := &release.Ledger{
+		Project:  "demo",
+		Current:  "r1",
+		Releases: []release.Entry{{ID: "r1", Status: release.StatusActive, Spec: &release.Spec{ID: "r1"}}},
+	}
+	entry := release.Entry{ID: "r2"}
+	recordOutcome(l, &entry, false, errors.New("stage \"migrate\" failed"), 5)
+
+	if l.Current != "r1" {
+		t.Fatalf("Current = %q, want it to stay on the serving release r1", l.Current)
+	}
+	if got := l.Find("r1").Status; got != release.StatusActive {
+		t.Fatalf("r1 status = %q, want it to stay active", got)
+	}
+	if got := l.Find("r2").Status; got != release.StatusFailed {
+		t.Fatalf("r2 status = %q, want failed", got)
+	}
+	if l.LastAttempt != "r2" {
+		t.Fatalf("LastAttempt = %q, want r2", l.LastAttempt)
+	}
+}
+
+// A deploy that failed *after* replacing a container did change the host, so it
+// becomes current — flagged degraded, because the host is running a mix.
+func TestRecordOutcomeMarksAPartialSwapDegraded(t *testing.T) {
+	l := &release.Ledger{
+		Project:  "demo",
+		Current:  "r1",
+		Releases: []release.Entry{{ID: "r1", Status: release.StatusActive, Spec: &release.Spec{ID: "r1"}}},
+	}
+	entry := release.Entry{ID: "r2"}
+	recordOutcome(l, &entry, true, errors.New("web did not become healthy"), 5)
+
+	if l.Current != "r2" {
+		t.Fatalf("Current = %q, want r2 — it replaced running containers", l.Current)
+	}
+	if got := l.Find("r2").Status; got != release.StatusDegraded {
+		t.Fatalf("r2 status = %q, want degraded", got)
+	}
+	if got := l.Find("r1").Status; got != release.StatusSuperseded {
+		t.Fatalf("r1 status = %q, want superseded", got)
+	}
+}
+
+func TestRecordOutcomeActivatesOnSuccess(t *testing.T) {
+	l := &release.Ledger{
+		Project:  "demo",
+		Current:  "r1",
+		Releases: []release.Entry{{ID: "r1", Status: release.StatusActive, Spec: &release.Spec{ID: "r1"}}},
+	}
+	entry := release.Entry{ID: "r2"}
+	recordOutcome(l, &entry, true, nil, 5)
+
+	if l.Current != "r2" || l.Find("r2").Status != release.StatusActive {
+		t.Fatalf("Current = %q status = %q, want r2 active", l.Current, l.Find("r2").Status)
+	}
+	if got := l.Find("r1").Status; got != release.StatusSuperseded {
+		t.Fatalf("r1 status = %q, want superseded", got)
+	}
+}
+
+// canOverlap decides whether a blue/green swap is safe by comparing proxy
+// labels. Feeding it a failed attempt's spec would have it reason about labels
+// no running container carries.
+func TestPreviousSpecPrefersTheServingRelease(t *testing.T) {
+	l := &release.Ledger{
+		Project: "demo",
+		Current: "r1",
+		Releases: []release.Entry{
+			{ID: "r1", Status: release.StatusActive, Spec: &release.Spec{ID: "r1"}},
+			{ID: "r2", Status: release.StatusFailed, Spec: &release.Spec{ID: "r2"}},
+		},
+	}
+	if got := previousSpec(l); got == nil || got.ID != "r1" {
+		t.Fatalf("previousSpec = %v, want the serving release r1", got)
+	}
+}
+
 func TestPreviousSpec(t *testing.T) {
 	l := &release.Ledger{Releases: []release.Entry{
 		{ID: "r1", Spec: &release.Spec{ID: "r1"}},
@@ -191,6 +278,475 @@ func TestRetireKeepsOnlyTheCurrentContainer(t *testing.T) {
 // Every SQLite database starts with this string. A truncated or half-written
 // upload almost never does, and promoting one takes the app down with a database
 // it cannot open — the single most valuable check in the artifact path.
+// Retention used to derive its prefix from the *rendered* filename by cutting at
+// the last dash, which yielded a prefix unique to the file just written — so
+// `retain` matched one file, deleted nothing, and dumps grew until the disk did.
+func TestPruneCapturesKeepsNewestAcrossReleases(t *testing.T) {
+	dir := t.TempDir()
+	template := filepath.Join(dir, "pre-migrate-{{.Release}}.sql")
+
+	// Release ids carry their own dashes, which is what broke the old prefix.
+	for _, id := range []string{
+		"20260720-100000-aaa111", "20260721-100000-bbb222",
+		"20260722-100000-ccc333", "20260723-100000-ddd444",
+	} {
+		if err := os.WriteFile(expandCapture(template, id), []byte("dump"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// An unrelated capture from a different stage must survive untouched.
+	other := filepath.Join(dir, "backup-20260720-100000-aaa111.sql")
+	if err := os.WriteFile(other, []byte("dump"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	pruneCaptures(template, 2)
+
+	got := lsNames(t, dir)
+	want := []string{
+		"backup-20260720-100000-aaa111.sql",
+		"pre-migrate-20260722-100000-ccc333.sql",
+		"pre-migrate-20260723-100000-ddd444.sql",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("after prune = %v, want %v", got, want)
+	}
+}
+
+// A template with no placeholder names one fixed path that each release
+// overwrites. There are no generations to prune, and a prefix match would sweep
+// up every sibling file in the directory.
+func TestPruneCapturesIgnoresATemplateWithoutAPlaceholder(t *testing.T) {
+	dir := t.TempDir()
+	for _, n := range []string{"dump.sql", "dump.sql.old", "unrelated.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pruneCaptures(filepath.Join(dir, "dump.sql"), 1)
+	if got := lsNames(t, dir); len(got) != 3 {
+		t.Fatalf("prune touched files it should not have: %v", got)
+	}
+}
+
+// A pg_dump is every row of production. os.Create's 0644 left it readable by
+// every other user and container on the host.
+func TestCapturesAreWrittenPrivate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dump.sql")
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
+		t.Fatalf("capture mode = %04o, want no group/other access", perm)
+	}
+}
+
+func lsNames(t *testing.T, dir string) []string {
+	t.Helper()
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := make([]string, 0, len(ents))
+	for _, e := range ents {
+		out = append(out, e.Name())
+	}
+	slices.Sort(out)
+	return out
+}
+
+// artifactFixture writes a destination with `old` contents and a staged file
+// with `staged` contents, and returns the release.Artifact describing them.
+func artifactFixture(t *testing.T, dir, name, old, staged string) release.Artifact {
+	t.Helper()
+	dest := filepath.Join(dir, name+".db")
+	if old != "" {
+		if err := os.WriteFile(dest, []byte(old), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a := release.Artifact{
+		Name:   name,
+		Dest:   dest,
+		Staged: dest + ".new." + testRelease,
+		Bytes:  int64(len(staged)),
+		Retain: 1,
+	}
+	if err := os.WriteFile(a.Staged, []byte(staged), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return a
+}
+
+const testRelease = "20260727-120000-abc123"
+
+func readFile(t *testing.T, p string) string {
+	t.Helper()
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// unpromotable returns an artifact whose staged file is valid but whose
+// destination directory does not exist, so the final rename fails — after any
+// earlier artifact in the same release has already been swapped.
+func unpromotable(t *testing.T, dir, name string) release.Artifact {
+	t.Helper()
+	const contents = "NEW"
+	a := release.Artifact{
+		Name:   name,
+		Dest:   filepath.Join(dir, "no-such-dir", name+".db"),
+		Staged: filepath.Join(dir, name+".db.new."+testRelease),
+		Bytes:  int64(len(contents)),
+		Retain: 1,
+	}
+	if err := os.WriteFile(a.Staged, []byte(contents), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return a
+}
+
+// The core guarantee: if the second artifact cannot be promoted, the first must
+// not be left swapped. Otherwise "production is untouched" is false for data.
+func TestSwapArtifactsRestoresEarlierPromotionsOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	a := artifactFixture(t, dir, "first", "OLD-FIRST", "NEW-FIRST")
+	b := unpromotable(t, dir, "second")
+
+	spec := &release.Spec{ID: testRelease, Artifacts: []release.Artifact{a, b}}
+	err := swapArtifacts(spec)
+	if err == nil {
+		t.Fatal("swapArtifacts succeeded despite an unpromotable artifact")
+	}
+	if got := readFile(t, a.Dest); got != "OLD-FIRST" {
+		t.Fatalf("first artifact = %q, want it restored to %q", got, "OLD-FIRST")
+	}
+	if !strings.Contains(err.Error(), "restored") {
+		t.Fatalf("error does not mention the restore: %v", err)
+	}
+}
+
+// When a destination did not exist before this release, restoring it means
+// removing what was just written — not leaving a file the operator never had.
+func TestSwapArtifactsRemovesFirstTimeFilesOnRollback(t *testing.T) {
+	dir := t.TempDir()
+	a := artifactFixture(t, dir, "first", "", "NEW-FIRST") // no prior copy
+	b := unpromotable(t, dir, "second")
+
+	spec := &release.Spec{ID: testRelease, Artifacts: []release.Artifact{a, b}}
+	if err := swapArtifacts(spec); err == nil {
+		t.Fatal("swapArtifacts succeeded despite an unpromotable artifact")
+	}
+	if _, err := os.Stat(a.Dest); !os.IsNotExist(err) {
+		t.Fatalf("first artifact should have been removed on rollback, stat err = %v", err)
+	}
+}
+
+// Validation covers every artifact before any is promoted, so a bad third file
+// must leave the first two alone rather than swapping them and then failing.
+func TestSwapArtifactsValidatesAllBeforePromotingAny(t *testing.T) {
+	dir := t.TempDir()
+	a := artifactFixture(t, dir, "first", "OLD-FIRST", "NEW-FIRST")
+	b := artifactFixture(t, dir, "second", "OLD-SECOND", "NEW-SECOND")
+	c := artifactFixture(t, dir, "third", "OLD-THIRD", "NEW-THIRD")
+	c.Bytes = 9999 // as if the transfer had been cut short
+
+	spec := &release.Spec{ID: testRelease, Artifacts: []release.Artifact{a, b, c}}
+	if err := swapArtifacts(spec); err == nil {
+		t.Fatal("swapArtifacts accepted a truncated artifact")
+	}
+	for _, want := range []struct{ path, contents string }{
+		{a.Dest, "OLD-FIRST"}, {b.Dest, "OLD-SECOND"}, {c.Dest, "OLD-THIRD"},
+	} {
+		if got := readFile(t, want.path); got != want.contents {
+			t.Fatalf("%s = %q, want untouched %q", filepath.Base(want.path), got, want.contents)
+		}
+	}
+}
+
+// A truncated transfer must be kept, not deleted: --partial exists so the next
+// run resumes rather than re-sending hundreds of megabytes.
+func TestValidateStagedKeepsATruncatedTransferForResume(t *testing.T) {
+	dir := t.TempDir()
+	a := artifactFixture(t, dir, "data", "OLD", "PARTIAL")
+	a.Bytes = 500000
+
+	err := validateStaged(a)
+	if err == nil {
+		t.Fatal("validateStaged accepted a short file")
+	}
+	if !strings.Contains(err.Error(), "resume") {
+		t.Fatalf("error should point at resuming, got: %v", err)
+	}
+	if _, err := os.Stat(a.Staged); err != nil {
+		t.Fatalf("staged fragment was deleted, defeating --partial: %v", err)
+	}
+}
+
+// A magic mismatch is the wrong file rather than a partial one, so it is removed
+// — leaving it would give the next run's --fuzzy a bogus delta basis.
+func TestValidateStagedRemovesAFileOfTheWrongType(t *testing.T) {
+	dir := t.TempDir()
+	a := artifactFixture(t, dir, "data", "OLD", "not-a-database")
+	a.Magic = "SQLite format 3"
+
+	if err := validateStaged(a); err == nil {
+		t.Fatal("validateStaged accepted a file failing its magic check")
+	}
+	if _, err := os.Stat(a.Staged); !os.IsNotExist(err) {
+		t.Fatalf("staged file of the wrong type was kept, stat err = %v", err)
+	}
+}
+
+// The destination must never be absent, even momentarily: the backup is a hard
+// link, so the old contents are reachable from two names before the rename.
+func TestPromoteBacksUpByHardLink(t *testing.T) {
+	dir := t.TempDir()
+	a := artifactFixture(t, dir, "data", "OLD", "NEW")
+
+	spec := &release.Spec{ID: testRelease}
+	p, err := promote(spec, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, a.Dest); got != "NEW" {
+		t.Fatalf("dest = %q, want NEW", got)
+	}
+	if got := readFile(t, p.prev); got != "OLD" {
+		t.Fatalf("backup = %q, want OLD", got)
+	}
+}
+
+// Fragments from abandoned deploys must not accumulate beside the destination.
+func TestSwapArtifactsClearsStaleStagedFiles(t *testing.T) {
+	dir := t.TempDir()
+	a := artifactFixture(t, dir, "data", "OLD", "NEW")
+	stale := a.Dest + ".new.20260101-000000-old999"
+	legacy := a.Dest + ".new"
+	for _, p := range []string{stale, legacy} {
+		if err := os.WriteFile(p, []byte("fragment"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	spec := &release.Spec{ID: testRelease, Artifacts: []release.Artifact{a}}
+	if err := swapArtifacts(spec); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{stale, legacy} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Fatalf("stale fragment %s survived", filepath.Base(p))
+		}
+	}
+}
+
+// blobLayout writes an OCI-shaped blobs/sha256 directory whose filenames are
+// the real digests of their contents.
+func blobLayout(t *testing.T, contents ...string) string {
+	t.Helper()
+	dir := t.TempDir()
+	blobs := filepath.Join(dir, "blobs", "sha256")
+	if err := os.MkdirAll(blobs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range contents {
+		sum := sha256.Sum256([]byte(c))
+		if err := os.WriteFile(filepath.Join(blobs, hex.EncodeToString(sum[:])), []byte(c), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
+// The saving the whole design exists to produce was being handed back on the
+// host: shipping 5 KB and then re-hashing the entire image. A blob is
+// content-addressed and immutable, so verifying it twice proves nothing.
+func TestVerifyLayoutOnlyHashesBlobsItHasNotSeen(t *testing.T) {
+	dir := blobLayout(t, "layer-one", "layer-two")
+
+	if _, err := verifyLayout(dir); err != nil {
+		t.Fatal(err)
+	}
+	first := loadVerified(dir)
+	if len(first) != 2 {
+		t.Fatalf("sidecar recorded %d blobs, want 2", len(first))
+	}
+
+	// A second pass over an untouched layout must find everything already known.
+	if _, err := verifyLayout(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	// Corrupt a blob keeping both its size and its mtime. This documents the
+	// trade the cache makes: such a rewrite is trusted and slips through.
+	// Nothing rsync does produces it — writing a file always moves the mtime —
+	// so the exposure is silent on-disk corruption between deploys, against a
+	// full-image rehash on every deploy forever. SHUNT_NO_VERIFY_CACHE=1 buys
+	// the old behaviour back.
+	blobs := filepath.Join(dir, "blobs", "sha256")
+	ents, _ := os.ReadDir(blobs)
+	victim := filepath.Join(blobs, ents[0].Name())
+	fi, err := os.Stat(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt := strings.Repeat("x", int(fi.Size())) // same length, different bytes
+	if err := os.WriteFile(victim, []byte(corrupt), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	os.Chtimes(victim, fi.ModTime(), fi.ModTime())
+	if _, err := verifyLayout(dir); err != nil {
+		t.Fatalf("a same-size same-mtime rewrite is deliberately trusted: %v", err)
+	}
+
+	// Touch it the way rsync would, and the corruption must surface.
+	later := fi.ModTime().Add(time.Second)
+	os.Chtimes(victim, later, later)
+	if _, err := verifyLayout(dir); err == nil {
+		t.Fatal("verifyLayout accepted a corrupt blob after its mtime moved")
+	}
+}
+
+// The cache can be turned off for anyone who would rather pay the full hash.
+func TestVerifyCacheCanBeDisabled(t *testing.T) {
+	dir := blobLayout(t, "layer-one")
+	if _, err := verifyLayout(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	blobs := filepath.Join(dir, "blobs", "sha256")
+	ents, _ := os.ReadDir(blobs)
+	victim := filepath.Join(blobs, ents[0].Name())
+	fi, _ := os.Stat(victim)
+	if err := os.WriteFile(victim, []byte(strings.Repeat("x", int(fi.Size()))), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	os.Chtimes(victim, fi.ModTime(), fi.ModTime())
+
+	t.Setenv("SHUNT_NO_VERIFY_CACHE", "1")
+	if _, err := verifyLayout(dir); err == nil {
+		t.Fatal("SHUNT_NO_VERIFY_CACHE=1 must rehash every blob and catch the corruption")
+	}
+}
+
+// The sidecar mirrors the blobs present now, so a store that turns over does
+// not accumulate records for blobs that are long gone.
+func TestVerifiedSidecarDoesNotGrowUnbounded(t *testing.T) {
+	dir := blobLayout(t, "a", "b", "c")
+	if _, err := verifyLayout(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	blobs := filepath.Join(dir, "blobs", "sha256")
+	ents, _ := os.ReadDir(blobs)
+	os.Remove(filepath.Join(blobs, ents[0].Name()))
+
+	if _, err := verifyLayout(dir); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(loadVerified(dir)); got != 2 {
+		t.Fatalf("sidecar holds %d records, want 2 — it is not tracking the live set", got)
+	}
+}
+
+func TestVerifyLayoutCatchesCorruptionOnFirstSight(t *testing.T) {
+	dir := blobLayout(t, "genuine")
+	blobs := filepath.Join(dir, "blobs", "sha256")
+	ents, _ := os.ReadDir(blobs)
+	if err := os.WriteFile(filepath.Join(blobs, ents[0].Name()), []byte("tampered"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifyLayout(dir); err == nil {
+		t.Fatal("verifyLayout accepted a blob that does not hash to its name")
+	}
+}
+
+// dirArtifact stages a directory tree and returns the artifact describing it.
+func dirArtifact(t *testing.T, dir, name string, files map[string]string) release.Artifact {
+	t.Helper()
+	staged := filepath.Join(dir, name+".new."+testRelease)
+	var total int64
+	for rel, content := range files {
+		p := filepath.Join(staged, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		total += int64(len(content))
+	}
+	return release.Artifact{
+		Name: name, Dest: filepath.Join(dir, name), Staged: staged,
+		Bytes: total, Retain: 1, Dir: true,
+	}
+}
+
+// The README advertises model weights, which are a directory. Shipping one has
+// to swap the whole tree, nested files included.
+func TestSwapArtifactsPromotesADirectoryTree(t *testing.T) {
+	dir := t.TempDir()
+	a := dirArtifact(t, dir, "weights", map[string]string{
+		"model.bin":        "weights-v2",
+		"nested/vocab.txt": "vocab-v2",
+	})
+	// An existing tree that must be replaced, not merged into.
+	if err := os.MkdirAll(filepath.Join(a.Dest, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(a.Dest, "model.bin"), []byte("weights-v1"), 0o644)
+	os.WriteFile(filepath.Join(a.Dest, "stale.txt"), []byte("gone in v2"), 0o644)
+
+	spec := &release.Spec{ID: testRelease, Artifacts: []release.Artifact{a}}
+	if err := swapArtifacts(spec); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, filepath.Join(a.Dest, "model.bin")); got != "weights-v2" {
+		t.Fatalf("model.bin = %q, want weights-v2", got)
+	}
+	if got := readFile(t, filepath.Join(a.Dest, "nested/vocab.txt")); got != "vocab-v2" {
+		t.Fatalf("nested/vocab.txt = %q, want vocab-v2", got)
+	}
+	// The old tree moved aside wholesale, so a file the new release dropped must
+	// not survive into it.
+	if _, err := os.Stat(filepath.Join(a.Dest, "stale.txt")); !os.IsNotExist(err) {
+		t.Fatalf("a file from the previous tree survived the swap")
+	}
+}
+
+// A truncated tree has to be caught the same way a truncated file is.
+func TestValidateStagedRejectsAShortDirectory(t *testing.T) {
+	dir := t.TempDir()
+	a := dirArtifact(t, dir, "weights", map[string]string{"model.bin": "short"})
+	a.Bytes = 999999 // as if most of the tree never arrived
+
+	err := validateStaged(a)
+	if err == nil {
+		t.Fatal("validateStaged accepted a directory smaller than the release describes")
+	}
+	if !strings.Contains(err.Error(), "resume") {
+		t.Fatalf("error should point at resuming, got: %v", err)
+	}
+}
+
+func TestValidateStagedRejectsAKindMismatch(t *testing.T) {
+	dir := t.TempDir()
+	a := artifactFixture(t, dir, "data", "OLD", "NEW")
+	a.Dir = true // manifest says directory, the staged path is a file
+
+	if err := validateStaged(a); err == nil {
+		t.Fatal("validateStaged accepted a file where a directory was described")
+	}
+}
+
 func TestCheckMagic(t *testing.T) {
 	dir := t.TempDir()
 	good := filepath.Join(dir, "good.db")
@@ -262,19 +818,110 @@ func TestPrunePreviousRetainZeroKeepsNothing(t *testing.T) {
 // reachable on.
 func TestPublishedHostPort(t *testing.T) {
 	for _, tc := range []struct {
-		publish []string
-		want    string
-		ok      bool
+		publish    []string
+		host, port string
+		ok         bool
 	}{
-		{[]string{"127.0.0.1:9350:3000"}, "9350", true},
-		{[]string{"9350:3000"}, "9350", true},
-		{[]string{"0.0.0.0:8080:3000/tcp"}, "8080", true},
-		{[]string{"3000"}, "", false}, // random host port; nothing stable to probe
-		{nil, "", false},
+		{[]string{"9090:3000"}, "127.0.0.1", "9090", true},
+		{[]string{"127.0.0.1:9090:3000"}, "127.0.0.1", "9090", true},
+		// The bind address must be honoured, not assumed: probing loopback for a
+		// service bound elsewhere failed health after the swap had happened.
+		{[]string{"10.0.0.5:9090:3000"}, "10.0.0.5", "9090", true},
+		// "every interface" includes loopback, which is what the host can reach.
+		{[]string{"0.0.0.0:9090:3000"}, "127.0.0.1", "9090", true},
+		{[]string{"9090:3000/tcp"}, "127.0.0.1", "9090", true},
+		// A bare container port means docker picks a random host port.
+		{[]string{"3000"}, "", "", false},
+		{nil, "", "", false},
 	} {
-		got, ok := publishedHostPort(release.Service{Publish: tc.publish})
-		if got != tc.want || ok != tc.ok {
-			t.Errorf("publishedHostPort(%v) = (%q, %v), want (%q, %v)", tc.publish, got, ok, tc.want, tc.ok)
+		host, port, ok := publishedHostPort(release.Service{Publish: tc.publish})
+		if host != tc.host || port != tc.port || ok != tc.ok {
+			t.Errorf("publishedHostPort(%v) = (%q, %q, %v), want (%q, %q, %v)",
+				tc.publish, host, port, ok, tc.host, tc.port, tc.ok)
 		}
+	}
+}
+
+// File mode exists so values stay out of the container's configuration. The
+// files themselves must be readable only by the deploying user.
+func TestSecretFilesArePrivateAndExact(t *testing.T) {
+	t.Setenv("SHUNT_ROOT", t.TempDir())
+	spec := &release.Spec{
+		Project: "demo", ID: testRelease, SecretMode: "file",
+		Secrets: map[string]string{"DATABASE_URL": "postgres://x", "STRIPE_KEY": "sk_live"},
+	}
+	dir, err := writeSecretFiles(spec, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(dir); err != nil {
+		t.Fatal(err)
+	} else if fi.Mode().Perm()&0o077 != 0 {
+		t.Fatalf("secrets directory mode = %04o, want no group/other access", fi.Mode().Perm())
+	}
+	for k, want := range spec.Secrets {
+		p := filepath.Join(dir, k)
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Mode().Perm()&0o077 != 0 {
+			t.Fatalf("%s mode = %04o, want 0600", k, fi.Mode().Perm())
+		}
+		// No trailing newline: the file *is* the value, so an app reading it
+		// whole should not have to strip anything.
+		if got := readFile(t, p); got != want {
+			t.Fatalf("%s = %q, want exactly %q", k, got, want)
+		}
+	}
+}
+
+// A service that narrowed its secrets gets a directory holding only those.
+func TestSecretFilesHonourPerServiceScoping(t *testing.T) {
+	t.Setenv("SHUNT_ROOT", t.TempDir())
+	spec := &release.Spec{
+		Project: "demo", ID: testRelease, SecretMode: "file",
+		Secrets: map[string]string{"DATABASE_URL": "postgres://x", "STRIPE_KEY": "sk_live"},
+	}
+	dir, err := writeSecretFiles(spec, []string{"DATABASE_URL"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "STRIPE_KEY")); !os.IsNotExist(err) {
+		t.Fatal("a scoped service was given a secret it did not ask for")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "DATABASE_URL")); err != nil {
+		t.Fatalf("the scoped secret is missing: %v", err)
+	}
+}
+
+// A key removed from the manifest must not linger as a file the app can read.
+func TestSecretFilesAreRewrittenFromScratch(t *testing.T) {
+	t.Setenv("SHUNT_ROOT", t.TempDir())
+	spec := &release.Spec{
+		Project: "demo", ID: testRelease, SecretMode: "file",
+		Secrets: map[string]string{"OLD": "1", "KEEP": "2"},
+	}
+	if _, err := writeSecretFiles(spec, nil); err != nil {
+		t.Fatal(err)
+	}
+	spec.Secrets = map[string]string{"KEEP": "2"}
+	dir, err := writeSecretFiles(spec, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "OLD")); !os.IsNotExist(err) {
+		t.Fatal("a secret removed from the manifest survived as a readable file")
+	}
+}
+
+func TestSecretFilesRejectAScopeTheReleaseDoesNotProvide(t *testing.T) {
+	t.Setenv("SHUNT_ROOT", t.TempDir())
+	spec := &release.Spec{
+		Project: "demo", ID: testRelease, SecretMode: "file",
+		Secrets: map[string]string{"DATABASE_URL": "x"},
+	}
+	if _, err := writeSecretFiles(spec, []string{"NOPE"}); err == nil {
+		t.Fatal("writeSecretFiles accepted a key the release does not have")
 	}
 }

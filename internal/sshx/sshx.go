@@ -15,8 +15,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/OAISP/shunt/internal/ui"
 )
 
 type Client struct {
@@ -113,6 +116,54 @@ func (c *Client) Stream(ctx context.Context, in io.Reader, out, errw io.Writer, 
 	return cmd.Run()
 }
 
+// StartSession launches a long-running remote command and hands back its stdin
+// and stdout without waiting for it.
+//
+// This is what lets the CLI hold a lock on the host for the duration of a
+// deploy: the remote process lives as long as the session, and the kernel
+// releases whatever it held the moment the session ends — including when the
+// network drops or the CLI is killed. Callers own the returned Cmd.
+func (c *Client) StartSession(ctx context.Context, argv ...string) (*exec.Cmd, io.WriteCloser, io.Reader, error) {
+	args := append(c.baseArgs(), c.Host, "--")
+	args = append(args, quoteAll(argv)...)
+	cmd := exec.CommandContext(ctx, "ssh", args...)
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		return nil, nil, nil, err
+	}
+	return cmd, stdin, stdout, nil
+}
+
+// Interactive runs argv on the host with the local terminal attached,
+// allocating a remote tty when there is a local one.
+//
+// This is what makes `shunt exec app -- sh` behave like a shell rather than a
+// pipe: without -t the remote side has no tty, so readline, colour and Ctrl-C
+// all misbehave.
+func (c *Client) Interactive(ctx context.Context, argv ...string) error {
+	args := c.baseArgs()
+	if ui.IsTerminal(os.Stdin) {
+		args = append(args, "-t")
+	} else {
+		args = append(args, "-T")
+	}
+	args = append(args, c.Host, "--")
+	args = append(args, quoteAll(argv)...)
+
+	cmd := exec.CommandContext(ctx, "ssh", args...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	return cmd.Run()
+}
+
 // Upload copies a local file to the host with the given mode, via a single
 // `cat > file` over the multiplexed connection. Used for the helper binary and
 // nothing else; bulk data goes through rsync.
@@ -134,42 +185,109 @@ func (c *Client) Upload(ctx context.Context, local, remote string, mode os.FileM
 	return cmd.Run()
 }
 
+// probeScript collects everything shunt needs to know about a host in one round
+// trip, as key=value lines so a missing field cannot shift the meaning of the
+// others the way positional output can.
+//
+// It covers the tools shunt shells out to on the host. `curl` runs url health
+// checks, and when it was missing the deploy got all the way past the container
+// swap before failing — the worst possible moment to discover a missing
+// package. `tar` is still reported because a host that has it is worth knowing
+// about, but no longer required: the helper builds the load archive itself.
+const probeScript = `
+echo "root=${SHUNT_ROOT:-$HOME/.shunt}"
+echo "arch=$(uname -m)"
+echo "docker=$(docker version --format '{{.Server.Version}}' 2>&1 | head -1)"
+echo "rsync=$(rsync --version 2>/dev/null | head -1 | awk '{print $3}')"
+echo "rsync_zstd=$(rsync --version 2>/dev/null | grep -ci zstd)"
+command -v curl >/dev/null && echo "curl=yes" || echo "curl=no"
+command -v tar  >/dev/null && echo "tar=yes"  || echo "tar=no"
+echo "free_kb=$(df -Pk "${SHUNT_ROOT:-$HOME}" 2>/dev/null | awk 'NR==2{print $4}')"
+`
+
 // Probe verifies the host is reachable and reports what shunt needs from it.
 func (c *Client) Probe(ctx context.Context) (Facts, error) {
 	var f Facts
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	out, err := c.Run(ctx, "sh", "-c",
-		`printf '%s\n' "$(uname -m)"; docker version --format '{{.Server.Version}}' 2>&1 | head -1; `+
-			`command -v rsync >/dev/null && echo yes || echo no`)
+	out, err := c.Run(ctx, "sh", "-c", probeScript)
 	if err != nil {
 		return f, err
 	}
-	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) < 3 {
+	kv := map[string]string{}
+	for _, ln := range strings.Split(out, "\n") {
+		if k, v, ok := strings.Cut(strings.TrimSpace(ln), "="); ok {
+			kv[k] = v
+		}
+	}
+	if kv["arch"] == "" {
 		return f, fmt.Errorf("unexpected probe output: %q", out)
 	}
-	f.Arch = strings.TrimSpace(lines[0])
-	f.DockerVersion = strings.TrimSpace(lines[1])
-	f.HasRsync = strings.TrimSpace(lines[2]) == "yes"
+	f.Arch = kv["arch"]
+	f.Root = kv["root"]
+	f.DockerVersion = kv["docker"]
+	f.RsyncVersion = kv["rsync"]
+	f.HasRsync = f.RsyncVersion != ""
+	f.RsyncZstd = kv["rsync_zstd"] != "" && kv["rsync_zstd"] != "0"
+	f.HasCurl = kv["curl"] == "yes"
+	f.HasTar = kv["tar"] == "yes"
+	if n, err := strconv.ParseInt(kv["free_kb"], 10, 64); err == nil {
+		f.FreeBytes = n * 1024
+	}
 
 	if strings.Contains(strings.ToLower(f.DockerVersion), "cannot connect") ||
 		strings.Contains(strings.ToLower(f.DockerVersion), "permission denied") {
 		return f, fmt.Errorf("docker is not usable as this user on %s: %s\n"+
 			"  add the user to the docker group, or point host= at one that can reach the socket", c.Host, f.DockerVersion)
 	}
-	if !f.HasRsync {
-		return f, fmt.Errorf("rsync is not installed on %s — shunt needs it for incremental image transfer\n"+
-			"  install it with: apt-get install -y rsync", c.Host)
+	if missing := f.Missing(); len(missing) > 0 {
+		return f, fmt.Errorf("%s is missing %s that shunt needs\n  install with: apt-get install -y %s",
+			c.Host, strings.Join(missing, " and "), strings.Join(missing, " "))
 	}
 	return f, nil
 }
 
+// Missing names the required host tools that are absent.
+func (f Facts) Missing() []string {
+	var missing []string
+	if !f.HasRsync {
+		missing = append(missing, "rsync")
+	}
+	if !f.HasCurl {
+		missing = append(missing, "curl")
+	}
+	return missing
+}
+
 type Facts struct {
-	Arch          string
+	Arch string
+
+	// Root is the resolved SHUNT_ROOT on the host — where the store, the ledger
+	// and the helper live. It comes back with the probe rather than as its own
+	// `echo`, because that was a whole ssh round trip before any command had
+	// started doing anything.
+	Root string
+
 	DockerVersion string
-	HasRsync      bool
+
+	HasRsync     bool
+	RsyncVersion string
+	// RsyncZstd reports whether this rsync was built with zstd. Ubuntu 20.04
+	// ships 3.1.3, which has no --compress-choice at all, and stock macOS is
+	// older still — so the flag cannot simply be assumed.
+	RsyncZstd bool
+
+	HasCurl bool // url health checks shell out to it on the host
+
+	// HasTar is informational. The helper writes the load archive itself, so a
+	// host without tar deploys fine; it is reported only because its absence
+	// usually means a very minimal image worth knowing about.
+	HasTar bool
+
+	// FreeBytes is free space where the store and ledger live. Running out
+	// mid-transfer leaves a partial layout and a confusing error.
+	FreeBytes int64
 }
 
 // GoArch maps uname -m to the GOARCH used to pick a helper binary.
@@ -191,6 +309,10 @@ func quoteAll(argv []string) []string {
 	}
 	return out
 }
+
+// Quote makes a value safe for the remote shell that ssh always spawns. Callers
+// building a `sh -c` script for the host use it directly.
+func Quote(s string) string { return shellQuote(s) }
 
 // shellQuote single-quotes a value for the remote shell that ssh always spawns.
 func shellQuote(s string) string {

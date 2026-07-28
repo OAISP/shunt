@@ -37,11 +37,12 @@ jobs:
       - name: go vet
         run: go vet ./...
 
-      - name: shellcheck install.sh
+      - name: shellcheck
         run: |
           sudo apt-get install -y --no-install-recommends shellcheck > /dev/null
           shellcheck install.sh
           sh -n install.sh
+          shellcheck test/e2e.sh
 
       - name: test
         run: go test -race ./...
@@ -82,3 +83,54 @@ jobs:
           if "$shunt" help | grep -q "$(printf '\033')"; then
             echo "escape sequences leaked into piped output"; exit 1
           fi
+
+  # A real deploy over real ssh to a real Docker daemon. The unit tests cannot
+  # reach any of this: containers actually swap, health checks actually probe,
+  # and a failed stage actually has to leave the running release alone. The
+  # runner deploys to itself, which needs no extra infrastructure and exercises
+  # the same code path a VPS would.
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build
+        run: make build
+
+      - name: enable ssh to localhost
+        run: |
+          set -euo pipefail
+          ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519
+          cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys ~/.ssh/id_ed25519
+          sudo systemctl start ssh
+          ssh-keyscan -H localhost >> ~/.ssh/known_hosts 2>/dev/null
+          # shunt runs ssh with BatchMode, so this has to work non-interactively.
+          ssh -o BatchMode=yes localhost 'docker version --format "{{.Server.Version}}"'
+
+      - name: e2e
+        run: test/e2e.sh localhost
+
+  # The host-compatibility paths, against hosts that actually have the problem.
+  # A healthy runner cannot reproduce either: it has curl and tar, and an rsync
+  # new enough for zstd. Both cases are ones a real VPS hits.
+  compat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build
+        run: make build
+
+      - name: compat
+        run: test/compat.sh

@@ -5,8 +5,16 @@
 package release
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"net/url"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 )
 
@@ -46,9 +54,66 @@ type Spec struct {
 	Services map[string]Service `json:"services"`
 	Order    []string           `json:"order"` // service start order, precomputed by the CLI
 
-	// Secrets are applied to every service and stage via an --env-file written
-	// 0600 on the host. Values never appear in argv or in `docker inspect`.
+	// Secrets are applied to every service and stage on the host, either as an
+	// --env-file or as files under /run/secrets. See SecretMode.
 	Secrets map[string]string `json:"secrets,omitempty"`
+
+	// SecretMode is "env" (default) or "file". In file mode each secret is
+	// written to its own 0600 file in a directory mounted read-only at
+	// /run/secrets, which keeps the values out of `docker inspect`.
+	SecretMode string `json:"secret_mode,omitempty"`
+
+	// Provenance records where this release came from. It is carried on the
+	// spec so the host can store it with the release, which is what lets
+	// `shunt status` answer "which commit is production running" without the
+	// operator holding a mapping in their head.
+	Provenance Provenance `json:"provenance,omitzero"`
+
+	// RollbackOnFailure asks the helper to restore the previous release if this
+	// one fails *after* replacing a running container. Opt-in: rolling back
+	// automatically is right for a stateless web app and wrong for a deploy
+	// whose stages already migrated a database.
+	RollbackOnFailure bool `json:"rollback_on_failure,omitempty"`
+
+	// ExpectedCurrent is the release the host was serving when this plan was
+	// built. The helper refuses to apply a spec whose assumption no longer
+	// holds, so a plan computed against one state cannot be applied to another.
+	// Empty means "no expectation" — a first deploy, or a caller that did not
+	// read the host first.
+	ExpectedCurrent string `json:"expected_current,omitempty"`
+}
+
+// Provenance is the origin of a release: which commit, built by whom, with
+// which shunt. Every field is best-effort — a project deployed from a tarball
+// has no git metadata and must still deploy.
+type Provenance struct {
+	Commit   string `json:"commit,omitempty"`
+	Short    string `json:"short,omitempty"`
+	Branch   string `json:"branch,omitempty"`
+	Dirty    bool   `json:"dirty,omitempty"`
+	CLI      string `json:"cli,omitempty"`
+	Deployer string `json:"deployer,omitempty"`
+}
+
+// Describe renders provenance for a human, or "" when nothing is known.
+func (p Provenance) Describe() string {
+	if p.Short == "" {
+		// No git metadata — a tarball checkout, or a bundle built outside a repo.
+		// The deployer alone is still worth saying, but "by X" reads wrong after
+		// the caller's "from".
+		return p.Deployer
+	}
+	s := p.Short
+	if p.Branch != "" {
+		s = p.Branch + "@" + s
+	}
+	if p.Dirty {
+		s += " (dirty tree)"
+	}
+	if p.Deployer != "" {
+		s += " by " + p.Deployer
+	}
+	return s
 }
 
 type ImageRef struct {
@@ -73,6 +138,10 @@ type Service struct {
 	Expose int    `json:"expose,omitempty"`
 	Drain  string `json:"drain,omitempty"`
 	Proxy  *Proxy `json:"proxy,omitempty"`
+
+	// Secrets narrows which of the release's secrets this service receives.
+	// Empty means all of them.
+	Secrets []string `json:"secrets,omitempty"`
 }
 
 // Proxy carries what the helper needs to emit discovery labels for an external
@@ -84,6 +153,44 @@ type Proxy struct {
 	Port        int      `json:"port"`
 	EntryPoints []string `json:"entrypoints,omitempty"`
 	Retry       int      `json:"retry,omitempty"`
+}
+
+// HealthProbePath is the path a reverse proxy can poll to decide whether a
+// container should receive traffic.
+//
+// A bare path is used directly. An absolute url is reduced to its path, because
+// the proxy reaches the container on the deploy network and the host and port
+// written for shunt's own probe do not apply there — previously such a service
+// got no readiness gate at all purely because of how its health url happened to
+// be spelled.
+//
+// A command health check yields nothing: there is no way to express "run this
+// inside the container" to Traefik or caddy. Those services fall back to the
+// retry middleware, which covers a backend that is not yet listening but not one
+// that is listening and still warming up.
+func HealthProbePath(svc Service) string {
+	if svc.Health == nil {
+		return ""
+	}
+	u := svc.Health.URL
+	switch {
+	case u == "":
+		return ""
+	case strings.HasPrefix(u, "/"):
+		return u
+	}
+	parsed, err := url.Parse(u)
+	if err != nil || parsed.Path == "" {
+		return ""
+	}
+	return parsed.Path
+}
+
+// ProxyGatesReadiness reports whether the proxy itself can keep this service's
+// container out of rotation until it is ready. False means the overlap leans on
+// retry alone, which is worth saying out loud rather than leaving implicit.
+func ProxyGatesReadiness(svc Service) bool {
+	return !svc.Proxied() || HealthProbePath(svc) != ""
 }
 
 // Proxied services run blue/green: a new release starts alongside the old one
@@ -109,6 +216,11 @@ type Artifact struct {
 	Retain int    `json:"retain"`
 	Bytes  int64  `json:"bytes"`
 	MTime  int64  `json:"mtime"` // unix seconds; rsync --times preserves it
+
+	// Dir marks an artifact that is a directory tree rather than a single file.
+	// The swap is the same rename, because renaming a directory within its
+	// parent is just as atomic as renaming a file.
+	Dir bool `json:"dir,omitempty"`
 }
 
 type Stage struct {
@@ -124,17 +236,87 @@ type Stage struct {
 // Ledger is the host-side record of what has been deployed. It lives at
 // <root>/<project>/releases.json and is the authority for status and rollback.
 type Ledger struct {
-	Project  string  `json:"project"`
-	Current  string  `json:"current"`
+	Project string `json:"project"`
+
+	// Current is the release believed to be *serving*. A deploy that fails
+	// before replacing any running container does not move it — the previous
+	// release is still up, and reporting otherwise would contradict the error
+	// the operator was just shown.
+	Current string `json:"current"`
+
+	// LastAttempt is the most recent deploy regardless of outcome. It differs
+	// from Current exactly when the last deploy failed without taking over.
+	LastAttempt string `json:"last_attempt,omitempty"`
+
+	// Accessories records the definition hash of each accessory as it was
+	// actually applied — when its container was created or recreated — keyed by
+	// name.
+	//
+	// It has to be tracked separately from the release spec because a deploy
+	// records the manifest it was *given*, not the accessory state it *applied*:
+	// `up` deliberately leaves an existing accessory alone. Diffing the manifest
+	// against the last recorded spec therefore made drift disappear after any
+	// unrelated deploy, while the container kept running the old config.
+	Accessories map[string]string `json:"accessories,omitempty"`
+
+	// Salt keys the secret hashes stored in this ledger. Generated once per
+	// project on the host, so a truncated digest of a low-entropy value is not
+	// brute-forceable from the ledger alone.
+	Salt string `json:"salt,omitempty"`
+
 	Releases []Entry `json:"releases"`
 }
 
+// RecordAccessory notes the definition an accessory container was created with.
+func (l *Ledger) RecordAccessory(name string, svc Service) {
+	if l.Accessories == nil {
+		l.Accessories = map[string]string{}
+	}
+	l.Accessories[name] = HashService(svc)
+}
+
+// HashService fingerprints a service or accessory definition. encoding/json
+// sorts map keys, so the same definition always produces the same digest.
+func HashService(svc Service) string {
+	b, err := json.Marshal(svc)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return "h:" + hex.EncodeToString(sum[:])[:16]
+}
+
+// DefaultRetain is how many restorable releases a host keeps when the manifest
+// does not say. Both ends fall back to it, so a spec that predates the field
+// prunes the same way a current one does.
+const DefaultRetain = 5
+
+// SecretsAsFiles reports whether this release delivers secrets as files.
+func (s *Spec) SecretsAsFiles() bool { return s.SecretMode == "file" }
+
+// SecretMountPath is where a file-mode secrets directory is mounted. Fixed
+// rather than configurable: it is the same path Docker Swarm and Kubernetes
+// use, so an app written for either already looks in the right place.
+const SecretMountPath = "/run/secrets"
+
 // Release statuses recorded in the ledger.
+//
+// The distinction between failed and degraded is the whole point of recording a
+// status at all: one means the host is exactly as it was, the other means it is
+// not, and an operator reading `shunt status` after a bad night needs to know
+// which without inferring it from an error message.
 const (
 	StatusActive     = "active"     // currently serving
 	StatusSuperseded = "superseded" // replaced by a later release
-	StatusFailed     = "failed"     // did not reach a healthy state
+	StatusFailed     = "failed"     // failed before any running container was replaced
+	StatusDegraded   = "degraded"   // failed partway; the host is running a mix
 )
+
+// Healthy reports whether an entry represents a release that took over cleanly.
+// Failed and degraded releases are neither serving nor safe to roll onto.
+func (e *Entry) Healthy() bool {
+	return e.Status != StatusFailed && e.Status != StatusDegraded
+}
 
 type Entry struct {
 	ID         string              `json:"id"`
@@ -148,15 +330,49 @@ type Entry struct {
 	// Spec is retained so a rollback can re-apply the exact previous release
 	// without needing the manifest that produced it.
 	Spec *Spec `json:"spec,omitempty"`
+
+	// Provenance is lifted out of the spec so `status` and the JSON contract can
+	// read it without unpacking a whole release.
+	Provenance Provenance `json:"provenance,omitzero"`
 }
 
 // HashSecret is the one-way form a secret value takes once it is written to the
 // host's ledger. Both ends use it: the helper redacts with it before persisting,
 // and the CLI applies it to freshly-resolved values so `shunt plan` can compare
 // like with like without a plaintext secret ever crossing back.
-func HashSecret(v string) string {
-	sum := sha256.Sum256([]byte(v))
-	return "h:" + hex.EncodeToString(sum[:])[:16]
+//
+// Keyed by a per-project salt rather than a bare digest. Plenty of real secrets
+// are low-entropy or drawn from a known format — a six-digit pin, a postcode, an
+// api key with a fixed prefix — and an unsalted truncated sha256 of those is
+// recoverable by anyone who reads the ledger. The salt makes the stored digests
+// useless off that host while still comparing equal for equal values.
+func HashSecret(salt, v string) string {
+	m := hmac.New(sha256.New, []byte(salt))
+	m.Write([]byte(v))
+	return "h:" + hex.EncodeToString(m.Sum(nil))[:16]
+}
+
+// ScopeDigest names the subset of a release's secrets a service asked for.
+//
+// Both ends derive host paths from it — the helper to write a scoped env-file
+// or secrets directory, the CLI to point `shunt run` at the same one — so it
+// has to be one function. Two implementations that disagreed by a sort order
+// would send a console session to a directory that does not exist, and it would
+// simply start with no secrets rather than fail.
+func ScopeDigest(scope []string) string {
+	keys := append([]string(nil), scope...)
+	sort.Strings(keys)
+	sum := sha256.Sum256([]byte(strings.Join(keys, "\x00")))
+	return hex.EncodeToString(sum[:])[:8]
+}
+
+// NewSalt generates a project's secret-hash salt.
+func NewSalt() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
 }
 
 // Find returns the entry with the given id, or nil.
@@ -169,6 +385,62 @@ func (l *Ledger) Find(id string) *Entry {
 	return nil
 }
 
+// Restorable reports whether this entry can serve as a rollback target: it
+// reached a healthy state, and it retained the spec needed to replay it.
+func (e *Entry) Restorable() bool { return e.Healthy() && e.Spec != nil }
+
+// KeepIDs returns the releases whose images and env-files must survive pruning:
+// the newest `retain` restorable ones, plus whatever is currently active.
+//
+// Counting failed attempts toward `retain` is the subtle way to lose a rollback.
+// A run of failed deploys — exactly the situation where you most want to go back
+// — would otherwise push the last good release out of the keep set, and the next
+// successful deploy would delete its images and its env-file. So failures are
+// skipped rather than counted, and the history stays as deep as it claims.
+func (l *Ledger) KeepIDs(retain int) map[string]bool {
+	if retain <= 0 {
+		retain = DefaultRetain
+	}
+	keep := map[string]bool{}
+	if l.Current != "" {
+		keep[l.Current] = true
+	}
+	seen := 0
+	for i := len(l.Releases) - 1; i >= 0 && seen < retain; i-- {
+		if !l.Releases[i].Restorable() {
+			continue
+		}
+		keep[l.Releases[i].ID] = true
+		seen++
+	}
+	return keep
+}
+
+// Trim bounds the ledger's length without dropping releases that are still
+// rollback targets.
+//
+// A plain "keep the last N entries" would let a run of failed deploys evict the
+// last good release from the history altogether, which is the same bug KeepIDs
+// exists to prevent, one layer up.
+func (l *Ledger) Trim(retain int) {
+	if retain <= 0 {
+		retain = DefaultRetain
+	}
+	window := retain * 2
+	if len(l.Releases) <= window {
+		return
+	}
+	keep := l.KeepIDs(retain)
+	cutoff := len(l.Releases) - window
+	out := make([]Entry, 0, window+len(keep))
+	for i := range l.Releases {
+		if i >= cutoff || keep[l.Releases[i].ID] {
+			out = append(out, l.Releases[i])
+		}
+	}
+	l.Releases = out
+}
+
 // Previous returns the most recent successfully-activated release before the
 // current one — the target of `shunt rollback` with no argument.
 func (l *Ledger) Previous() *Entry {
@@ -179,7 +451,9 @@ func (l *Ledger) Previous() *Entry {
 			seenCurrent = true
 			continue
 		}
-		if !seenCurrent || e.Status == StatusFailed {
+		// A degraded release is no more a rollback target than a failed one:
+		// rolling onto a release that only half took over repeats the problem.
+		if !seenCurrent || !e.Healthy() {
 			continue
 		}
 		return e
@@ -208,4 +482,30 @@ type Event struct {
 	// Result payload, set when Kind == KindResult.
 	Release string `json:"release,omitempty"`
 	Status  string `json:"status,omitempty"`
+}
+
+// TreeSummary totals a directory's regular files and reports the newest mtime
+// among them. It defines what an Artifact's Bytes and MTime mean, so both ends
+// must call it: two implementations differing by so much as a directory inode
+// would make every directory artifact differ from itself on every deploy.
+//
+// Not a hash, deliberately — that reads every byte on both sides, which is most
+// of the cost of shipping the tree. Size and mtime are what rsync itself uses.
+func TreeSummary(root string) (bytes int64, files int, newest int64) {
+	filepath.WalkDir(root, func(_ string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		fi, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		bytes += fi.Size()
+		files++
+		if m := fi.ModTime().Unix(); m > newest {
+			newest = m
+		}
+		return nil
+	})
+	return bytes, files, newest
 }

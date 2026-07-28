@@ -22,6 +22,7 @@ func (p *Plan) Render(w io.Writer, s ui.Style) {
 	p.renderArtifacts(w, s)
 	p.renderStages(w, s)
 	p.renderServices(w, s)
+	p.renderRelease(w, s)
 	p.renderSecrets(w, s)
 	fmt.Fprintln(w)
 }
@@ -110,7 +111,29 @@ func (p *Plan) renderStages(w io.Writer, s ui.Style) {
 		return
 	}
 	fmt.Fprintf(w, "\n%s %s\n", s.Bold("stages"), s.Dim("(run before any service is replaced)"))
-	fmt.Fprintf(w, "    %s\n", strings.Join(p.Stages, " → "))
+
+	// The pipeline reads as a sequence, so keep it on one line and mark the
+	// entries the manifest changed rather than breaking it into a list.
+	names := make([]string, 0, len(p.Stages))
+	var notes []string
+	for _, st := range p.Stages {
+		switch st.Action {
+		case "remove":
+			notes = append(notes, fmt.Sprintf("%s %s no longer in shunt.toml — it will not run again", s.Remove(), st.Name))
+			continue
+		case "create":
+			notes = append(notes, fmt.Sprintf("%s %s added", s.Add(), st.Name))
+		case "update":
+			notes = append(notes, fmt.Sprintf("%s %s changed", s.Change(), st.Name))
+		}
+		names = append(names, st.Name)
+	}
+	if len(names) > 0 {
+		fmt.Fprintf(w, "    %s\n", strings.Join(names, " → "))
+	}
+	for _, n := range notes {
+		fmt.Fprintf(w, "  %s\n", n)
+	}
 }
 
 func (p *Plan) renderServices(w io.Writer, s ui.Style) {
@@ -124,13 +147,30 @@ func (p *Plan) renderServices(w io.Writer, s ui.Style) {
 		case "update":
 			fmt.Fprintf(w, "  %s %-*s %s%s\n", s.Change(), nameCol, svc.Name, swapVerb(svc), downtimeNote(svc, s))
 			renderReasons(w, s, svc.Reasons)
-		case "remove":
-			fmt.Fprintf(w, "  %s %-*s %s\n", s.Remove(), nameCol, svc.Name, s.Dim(strings.Join(svc.Reasons, "; ")))
+		case "orphaned":
+			fmt.Fprintf(w, "  %s %-*s %s\n", s.Warn(), nameCol, svc.Name, s.Amber("orphaned"))
+			renderReasons(w, s, svc.Reasons)
 		}
 	}
 }
 
+// renderRelease shows settings that change how every container is created.
+func (p *Plan) renderRelease(w io.Writer, s ui.Style) {
+	if len(p.Release) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "\n%s %s\n", s.Bold("release"), s.Dim("(applies to every container)"))
+	for _, r := range p.Release {
+		fmt.Fprintf(w, "  %s %s\n", s.Change(), r)
+	}
+}
+
 func (p *Plan) renderSecrets(w io.Writer, s ui.Style) {
+	if p.SecretsUnknown {
+		fmt.Fprintf(w, "\n%s %s\n", s.Bold("secrets"),
+			s.Amber("not compared — the values are not reachable from here"))
+		return
+	}
 	sc := p.Secrets
 	fmt.Fprintf(w, "\n%s %d key(s)", s.Bold("secrets"), sc.Total)
 	if len(sc.Added)+len(sc.Removed)+len(sc.Changed) == 0 {
@@ -165,8 +205,15 @@ func swapVerb(s ServiceChange) string {
 }
 
 func downtimeNote(sc ServiceChange, s ui.Style) string {
-	if sc.ZeroDowntime {
-		return "  " + s.Dim("(starts alongside; no downtime)")
+	if !sc.ZeroDowntime {
+		return "  " + s.Dim("(brief gap while it restarts)")
 	}
-	return "  " + s.Dim("(brief gap while it restarts)")
+	if !sc.ProxyGated {
+		// Overlapping without a proxy-pollable health check means the proxy will
+		// route to the new container as soon as it exists. A backend that is not
+		// listening yet is covered by retry; one that is listening and still
+		// warming up is not, and the operator should know which they have.
+		return "  " + s.Amber("(starts alongside; proxy cannot poll this health check)")
+	}
+	return "  " + s.Dim("(starts alongside; no downtime)")
 }

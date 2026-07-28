@@ -13,7 +13,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"sort"
 	"strings"
 	"time"
 
@@ -23,6 +22,7 @@ import (
 	"github.com/OAISP/shunt/internal/secrets"
 	"github.com/OAISP/shunt/internal/sshx"
 	"github.com/OAISP/shunt/internal/transport"
+	"github.com/OAISP/shunt/internal/ui"
 )
 
 type Engine struct {
@@ -32,6 +32,11 @@ type Engine struct {
 	root       string // resolved SHUNT_ROOT on the host
 	helperPath string
 	facts      sshx.Facts
+
+	// artifactSrc overrides where an artifact's local copy is read from. A
+	// bundle supplies its own extracted paths, having no manifest to resolve
+	// them against.
+	artifactSrc map[string]string
 }
 
 func New(m *manifest.Manifest) *Engine {
@@ -50,11 +55,7 @@ func (e *Engine) Connect(ctx context.Context) error {
 	}
 	e.facts = facts
 
-	out, err := e.Client.Run(ctx, "sh", "-c", `echo "${SHUNT_ROOT:-$HOME/.shunt}"`)
-	if err != nil {
-		return err
-	}
-	e.root = strings.TrimSpace(out)
+	e.root = strings.TrimSpace(facts.Root)
 	if e.root == "" || e.root == "/.shunt" {
 		return fmt.Errorf("could not resolve a home directory on %s; set SHUNT_ROOT there", e.M.Host)
 	}
@@ -97,7 +98,7 @@ func (e *Engine) ensureHelper(ctx context.Context) error {
 	}
 	// Old content-addressed helpers accumulate otherwise, one per CLI build.
 	e.Client.Run(ctx, "sh", "-c",
-		"ls -1t "+shellArg(filepath.Join(e.root, "bin"))+"/shunt-helper-* 2>/dev/null | tail -n +4 | xargs -r rm -f")
+		"ls -1t "+sshx.Quote(filepath.Join(e.root, "bin"))+"/shunt-helper-* 2>/dev/null | tail -n +4 | xargs -r rm -f")
 	return nil
 }
 
@@ -116,11 +117,14 @@ func (e *Engine) Build(ctx context.Context, id string, o BuildOptions) (map[stri
 	if o.Verbose {
 		logSink, progress = os.Stderr, "auto"
 	}
-	cacheDir, err := e.cacheDir()
+	cacheDir, err := e.cacheDir(id)
 	if err != nil {
 		return nil, err
 	}
-	for _, name := range sortedKeys(e.M.Images) {
+	// Old export directories are dropped here rather than at the end, so a run
+	// that fails partway still tidies up after its predecessors.
+	e.pruneCacheDirs(3)
+	for _, name := range slices.Sorted(maps.Keys(e.M.Images)) {
 		img := e.M.Images[name]
 		args, err := secrets.InterpolateMap(img.Args)
 		if err != nil {
@@ -158,12 +162,13 @@ func (e *Engine) Build(ctx context.Context, id string, o BuildOptions) (map[stri
 // Push mirrors each built layout to the host's store.
 func (e *Engine) Push(ctx context.Context, built map[string]*build.Result, verbose bool) (map[string]*transport.Stats, error) {
 	stats := map[string]*transport.Stats{}
-	for _, name := range sortedResultKeys(built) {
+	for _, name := range slices.Sorted(maps.Keys(built)) {
 		st, err := transport.Push(ctx, transport.Options{
-			Client:    e.Client,
-			LocalDir:  built[name].Dir,
-			RemoteDir: filepath.Join(e.StorePath(), name),
-			Verbose:   verbose,
+			Client:     e.Client,
+			LocalDir:   built[name].Dir,
+			RemoteDir:  filepath.Join(e.StorePath(), name),
+			Verbose:    verbose,
+			RemoteZstd: e.facts.RsyncZstd,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("push image %s: %w", name, err)
@@ -232,7 +237,7 @@ func (e *Engine) Spec(ctx context.Context, id string, built map[string]*build.Re
 		})
 	}
 
-	arts, err := e.artifacts()
+	arts, err := e.artifacts(id)
 	if err != nil {
 		return nil, err
 	}
@@ -252,127 +257,44 @@ func (e *Engine) Spec(ctx context.Context, id string, built map[string]*build.Re
 		Services:       svcs,
 		Order:          e.M.StartOrder(),
 		Secrets:        sec,
+		SecretMode:     secretMode(e.M),
 	}
 	return spec, nil
 }
 
-// StagedPath is where an artifact is transferred to before being swapped into
-// place. Keeping it beside the destination guarantees the final rename is on the
-// same filesystem, and therefore atomic.
-func StagedPath(dest string) string { return dest + ".new" }
-
-// artifacts resolves the manifest's artifact list, dropping any whose local file
-// is missing unless it is marked required.
-func (e *Engine) artifacts() ([]release.Artifact, error) {
-	out := make([]release.Artifact, 0, len(e.M.Artifacts))
-	for _, a := range e.M.Artifacts {
-		src := e.M.Abs(a.Src)
-		fi, err := os.Stat(src)
-		if err != nil {
-			if a.Required {
-				return nil, fmt.Errorf("artifact %q: %s is required but missing", a.Name, src)
-			}
-			// Not an error: the host keeps whatever it already has, which is the
-			// right default for a file produced by an occasional ETL run.
-			fmt.Fprintf(os.Stderr, "warning: artifact %q: %s not found, the host keeps its current copy\n", a.Name, src)
-			continue
-		}
-		if fi.IsDir() {
-			return nil, fmt.Errorf("artifact %q: %s is a directory; shunt ships files", a.Name, src)
-		}
-		out = append(out, release.Artifact{
-			Name:   a.Name,
-			Dest:   a.Dest,
-			Staged: StagedPath(a.Dest),
-			Magic:  a.Magic,
-			Retain: a.Retain,
-			Bytes:  fi.Size(),
-			MTime:  fi.ModTime().Unix(),
-		})
-	}
-	return out, nil
-}
-
-// LocalArtifactPath is the source file for a named artifact.
-func (e *Engine) LocalArtifactPath(name string) string {
-	for _, a := range e.M.Artifacts {
-		if a.Name == name {
-			return e.M.Abs(a.Src)
-		}
+// secretMode reports how this manifest wants secrets delivered.
+func secretMode(m *manifest.Manifest) string {
+	if m.Secrets != nil && m.Secrets.Mode == "file" {
+		return "file"
 	}
 	return ""
 }
 
-// PushArtifacts transfers each artifact to its staged path on the host.
-func (e *Engine) PushArtifacts(ctx context.Context, spec *release.Spec, verbose bool) (map[string]*transport.Stats, error) {
-	stats := map[string]*transport.Stats{}
-	for _, a := range spec.Artifacts {
-		st, err := transport.PushFile(ctx, transport.FileOptions{
-			Client:     e.Client,
-			LocalPath:  e.LocalArtifactPath(a.Name),
-			RemotePath: a.Staged,
-			Verbose:    verbose,
-		})
-		if err != nil {
-			return nil, err
-		}
-		stats[a.Name] = st
-	}
-	return stats, nil
-}
-
-// PreflightArtifacts checks the host can actually receive every artifact, before
-// anything expensive happens.
+// PreflightSpace refuses a transfer the host has no room for.
 //
-// Building and shipping a 400 MB image only to fail on mkdir wastes minutes and
-// tells the operator nothing useful, so every destination directory is probed in
-// a single round trip and each failure names its own fix.
-func (e *Engine) PreflightArtifacts(ctx context.Context) error {
-	if len(e.M.Artifacts) == 0 {
+// rsync running out of space partway leaves a truncated blob and an error about
+// a write failure, which tells the operator nothing about the actual problem.
+// Checking first costs nothing — the free-space figure already came back with
+// the probe. The headroom multiplier covers `docker load` unpacking the layout
+// alongside the copy rsync just wrote.
+func (e *Engine) PreflightSpace(built map[string]*build.Result) error {
+	if e.facts.FreeBytes <= 0 {
+		return nil // df was unavailable; not a reason to refuse to deploy
+	}
+	var need int64
+	for _, r := range built {
+		need += r.Bytes
+	}
+	if need == 0 {
 		return nil
 	}
-	dirs := map[string]bool{}
-	for _, a := range e.M.Artifacts {
-		if a.Dest != "" {
-			dirs[filepath.Dir(a.Dest)] = true
-		}
+	const headroom = 3
+	if want := need * headroom; e.facts.FreeBytes < want {
+		return fmt.Errorf("%s has %s free, and this deploy needs roughly %s (%s of images, plus room to unpack them)\n"+
+			"  free some space, or run `shunt prune` to drop superseded images",
+			e.M.Host, ui.Bytes(e.facts.FreeBytes), ui.Bytes(want), ui.Bytes(need))
 	}
-	var script strings.Builder
-	for _, d := range slices.Sorted(maps.Keys(dirs)) {
-		fmt.Fprintf(&script, "if ! mkdir -p %s 2>/dev/null; then echo \"NODIR %s\"; elif [ ! -w %s ]; then echo \"NOWRITE %s\"; fi\n",
-			shellArg(d), d, shellArg(d), d)
-	}
-	out, err := e.Client.Run(ctx, "sh", "-c", script.String())
-	if err != nil {
-		return err
-	}
-
-	var problems []string
-	for _, ln := range strings.Split(strings.TrimSpace(out), "\n") {
-		if ln == "" {
-			continue
-		}
-		kind, dir, _ := strings.Cut(ln, " ")
-		switch kind {
-		case "NODIR":
-			problems = append(problems, fmt.Sprintf("  %s could not be created", dir))
-		case "NOWRITE":
-			problems = append(problems, fmt.Sprintf("  %s is not writable", dir))
-		}
-	}
-	if len(problems) == 0 {
-		return nil
-	}
-
-	user := e.M.Host
-	if u, _, ok := strings.Cut(e.M.Host, "@"); ok {
-		user = u
-	}
-	return fmt.Errorf("artifact destinations are not usable on %s:\n%s\n\n"+
-		"  This is a one-time setup step — /opt is root-owned by default. On the host run:\n"+
-		"    sudo mkdir -p <dir> && sudo chown -R %s <dir>\n"+
-		"  Or point dest= somewhere you already own, e.g. $HOME.",
-		e.M.Host, strings.Join(problems, "\n"), user)
+	return nil
 }
 
 // BootSpec assembles a spec for `shunt boot`, which recreates an accessory
@@ -425,6 +347,7 @@ func convertServices(in map[string]manifest.Service) (map[string]release.Service
 		}
 		rs := release.Service{
 			Image:    s.Image,
+			Secrets:  s.Secrets,
 			Command:  s.Command,
 			Env:      env,
 			Publish:  s.Publish,
@@ -477,15 +400,41 @@ func NewReleaseID() string {
 	return time.Now().UTC().Format("20060102-150405") + "-" + hex.EncodeToString(b[:])
 }
 
+// Container is one container the host is running for this project, as reported
+// by the helper.
+type Container struct {
+	Name    string `json:"name"`
+	Status  string `json:"status"`
+	Image   string `json:"image"`
+	Release string `json:"release"`
+	Service string `json:"service"`
+	Kind    string `json:"kind"`
+
+	// Config is the hash of the definition this container was started with.
+	// Empty on containers created before shunt labelled them, which is why a
+	// missing value never counts as drift.
+	Config string `json:"config"`
+	State  string `json:"state"`
+}
+
+// Running reports whether docker considers this container up.
+func (c Container) Running() bool { return c.State == "running" }
+
 // RemoteState is what the host currently believes it is running.
 type RemoteState struct {
 	Ledger     *release.Ledger `json:"ledger"`
-	Containers []struct {
-		Name    string `json:"name"`
-		Status  string `json:"status"`
-		Image   string `json:"image"`
-		Release string `json:"release"`
-	} `json:"containers"`
+	Containers []Container     `json:"containers"`
+}
+
+// ServiceContainers returns the containers belonging to one service.
+func (s *RemoteState) ServiceContainers(name string) []Container {
+	var out []Container
+	for _, c := range s.Containers {
+		if c.Service == name {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 func (e *Engine) State(ctx context.Context) (*RemoteState, error) {
@@ -519,6 +468,12 @@ func (e *Engine) Boot(ctx context.Context, name string, spec *release.Spec, r Ev
 	return e.stream(ctx, strings.NewReader(string(b)), r, e.helperPath, "boot", name)
 }
 
+// Retire stops and removes the containers of a service the manifest no longer
+// declares.
+func (e *Engine) Retire(ctx context.Context, service string, r EventRenderer) error {
+	return e.stream(ctx, nil, r, e.helperPath, "retire", e.M.Project, service)
+}
+
 func (e *Engine) Rollback(ctx context.Context, id string, r EventRenderer) error {
 	args := []string{e.helperPath, "rollback", e.M.Project}
 	if id != "" {
@@ -527,40 +482,52 @@ func (e *Engine) Rollback(ctx context.Context, id string, r EventRenderer) error
 	return e.stream(ctx, nil, r, args...)
 }
 
-func (e *Engine) Logs(ctx context.Context, service string, follow bool, tail string) error {
-	args := []string{e.helperPath, "logs", e.M.Project}
-	if service != "" {
-		args = append(args, service)
-	}
-	if follow {
-		args = append(args, "--follow")
-	}
-	args = append(args, "--tail", tail)
-	return e.Client.Stream(ctx, nil, os.Stdout, os.Stderr, args...)
-}
+func (e *Engine) Facts() sshx.Facts { return e.facts }
 
-func (e *Engine) HelperPath() string { return e.helperPath }
-func (e *Engine) Facts() sshx.Facts  { return e.facts }
-
-func (e *Engine) cacheDir() (string, error) {
+// cacheDir is where this release's OCI layouts are exported.
+//
+// Scoped by release id because two deploys of the same project on one machine
+// otherwise share it, and Build starts by deleting the directory — so one
+// process wipes the layout another is still exporting into, and buildx fails
+// with a rename error naming a blob that vanished underneath it. The layout is
+// re-exported from scratch on every build regardless, so a per-release
+// directory costs nothing beyond the name.
+func (e *Engine) cacheDir(releaseID string) (string, error) {
 	base, err := os.UserCacheDir()
 	if err != nil {
 		base = filepath.Join(os.TempDir(), "shunt-cache")
 	}
-	d := filepath.Join(base, "shunt", e.M.Project)
+	d := filepath.Join(base, "shunt", e.M.Project, releaseID)
 	return d, os.MkdirAll(d, 0o755)
 }
 
-func sortedKeys[T any](m map[string]T) []string {
-	ks := make([]string, 0, len(m))
-	for k := range m {
-		ks = append(ks, k)
+// pruneCacheDirs keeps the most recent export directories and drops the rest.
+//
+// A few are kept rather than one, so a concurrent deploy's layout is never
+// deleted out from under it while it is still transferring.
+func (e *Engine) pruneCacheDirs(keep int) {
+	base, err := os.UserCacheDir()
+	if err != nil {
+		base = filepath.Join(os.TempDir(), "shunt-cache")
 	}
-	sort.Strings(ks)
-	return ks
+	root := filepath.Join(base, "shunt", e.M.Project)
+	ents, err := os.ReadDir(root)
+	if err != nil {
+		return
+	}
+	var dirs []string
+	for _, d := range ents {
+		if d.IsDir() {
+			dirs = append(dirs, d.Name())
+		}
+	}
+	// Release ids sort lexically by time.
+	slices.Sort(dirs)
+	slices.Reverse(dirs)
+	for i := keep; i < len(dirs); i++ {
+		os.RemoveAll(filepath.Join(root, dirs[i]))
+	}
 }
-
-func sortedResultKeys(m map[string]*build.Result) []string { return sortedKeys(m) }
 
 func truncate(s string, n int) string {
 	if len(s) <= n {
