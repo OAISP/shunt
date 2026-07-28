@@ -59,6 +59,21 @@ func apply(spec *release.Spec) error {
 	// finish records the outcome no matter which step failed, so `shunt status`
 	// always reflects reality rather than the last success.
 	finish := func(runErr error) error {
+		// A degraded host is the one outcome an operator cannot leave alone: some
+		// services are on the new release and some on the old. Restoring is only
+		// attempted when asked, because it is the wrong move for a release whose
+		// stages already migrated a database — the code would go back and the
+		// schema would not.
+		if runErr != nil && mutated && spec.RollbackOnFailure {
+			if rbErr := autoRollback(spec, ledger); rbErr != nil {
+				runErr = fmt.Errorf("%w\n  automatic rollback also failed: %v", runErr, rbErr)
+			} else {
+				runErr = fmt.Errorf("%w\n  the previous release was restored automatically", runErr)
+				// The host is back on the previous release, so this attempt did not
+				// take anything over after all.
+				mutated = false
+			}
+		}
 		recordOutcome(ledger, &entry, mutated, runErr, spec.Retain)
 		if err := saveLedger(ledger); err != nil {
 			return errors.Join(runErr, err)

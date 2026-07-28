@@ -197,3 +197,58 @@ func cmdBoot(in io.Reader, args []string) error {
 		return saveLedger(ledger)
 	})
 }
+
+// autoRollback restores the previous release after a deploy has already
+// replaced running containers.
+//
+// It runs inside the same helper invocation, under the same lock, so nothing
+// can slip between the failure and the recovery. Deliberately narrow: it
+// restores containers only, exactly as `shunt rollback` does, and says so —
+// data that stages or artifacts already changed is not reverted, and pretending
+// otherwise is how a "helpful" rollback loses a database.
+func autoRollback(spec *release.Spec, ledger *release.Ledger) error {
+	target := ledger.Previous()
+	if target == nil {
+		return errors.New("no previous successful release to restore")
+	}
+	if target.Spec == nil {
+		return fmt.Errorf("release %s predates spec retention and cannot be replayed", target.ID)
+	}
+	for _, img := range target.Images {
+		if !docker.Ok("docker", "image", "inspect", img.Ref) {
+			return fmt.Errorf("image %s for release %s is no longer on this host", img.Ref, target.ID)
+		}
+	}
+
+	info("restoring " + target.ID)
+	prev := *target.Spec
+	prev.ID = target.ID
+	for n, img := range prev.Images {
+		img.External = false
+		prev.Images[n] = img
+	}
+	// That release's own env-file, not this one's: its containers expect the
+	// environment they were deployed with.
+	prevEnv := envFilePath(spec.Project, target.ID)
+	if _, err := os.Stat(prevEnv); err != nil {
+		if len(prev.Secrets) > 0 {
+			return fmt.Errorf("the env-file for %s has been pruned", target.ID)
+		}
+		prevEnv = ""
+	}
+	if _, _, err := swapServices(&prev, spec, prevEnv); err != nil {
+		return err
+	}
+	if err := healthCheck(&prev); err != nil {
+		return err
+	}
+	for i := range ledger.Releases {
+		if ledger.Releases[i].ID == target.ID {
+			ledger.Releases[i].Status = release.StatusActive
+			ledger.Releases[i].Error = ""
+		}
+	}
+	ledger.Current = target.ID
+	ok("rollback", "restored "+target.ID)
+	return nil
+}

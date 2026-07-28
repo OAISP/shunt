@@ -10,6 +10,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"net/url"
+	"strings"
 	"time"
 )
 
@@ -58,6 +60,12 @@ type Spec struct {
 	// `shunt status` answer "which commit is production running" without the
 	// operator holding a mapping in their head.
 	Provenance Provenance `json:"provenance,omitzero"`
+
+	// RollbackOnFailure asks the helper to restore the previous release if this
+	// one fails *after* replacing a running container. Opt-in: rolling back
+	// automatically is right for a stateless web app and wrong for a deploy
+	// whose stages already migrated a database.
+	RollbackOnFailure bool `json:"rollback_on_failure,omitempty"`
 
 	// ExpectedCurrent is the release the host was serving when this plan was
 	// built. The helper refuses to apply a spec whose assumption no longer
@@ -137,6 +145,44 @@ type Proxy struct {
 	Port        int      `json:"port"`
 	EntryPoints []string `json:"entrypoints,omitempty"`
 	Retry       int      `json:"retry,omitempty"`
+}
+
+// HealthProbePath is the path a reverse proxy can poll to decide whether a
+// container should receive traffic.
+//
+// A bare path is used directly. An absolute url is reduced to its path, because
+// the proxy reaches the container on the deploy network and the host and port
+// written for shunt's own probe do not apply there — previously such a service
+// got no readiness gate at all purely because of how its health url happened to
+// be spelled.
+//
+// A command health check yields nothing: there is no way to express "run this
+// inside the container" to Traefik or caddy. Those services fall back to the
+// retry middleware, which covers a backend that is not yet listening but not one
+// that is listening and still warming up.
+func HealthProbePath(svc Service) string {
+	if svc.Health == nil {
+		return ""
+	}
+	u := svc.Health.URL
+	switch {
+	case u == "":
+		return ""
+	case strings.HasPrefix(u, "/"):
+		return u
+	}
+	parsed, err := url.Parse(u)
+	if err != nil || parsed.Path == "" {
+		return ""
+	}
+	return parsed.Path
+}
+
+// ProxyGatesReadiness reports whether the proxy itself can keep this service's
+// container out of rotation until it is ready. False means the overlap leans on
+// retry alone, which is worth saying out loud rather than leaving implicit.
+func ProxyGatesReadiness(svc Service) bool {
+	return !svc.Proxied() || HealthProbePath(svc) != ""
 }
 
 // Proxied services run blue/green: a new release starts alongside the old one

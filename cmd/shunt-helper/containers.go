@@ -189,6 +189,22 @@ func ensureAccessories(spec *release.Spec, ledger *release.Ledger, envFile strin
 	return waitHealthy(spec, spec.AccessoryOrder, spec.Accessories)
 }
 
+// dependedOn returns the services that at least one other service requires.
+//
+// Accessories are excluded: they are already up and health-checked before any
+// service starts, so nothing here needs to wait on them again.
+func dependedOn(spec *release.Spec) map[string]bool {
+	out := map[string]bool{}
+	for _, svc := range spec.Services {
+		for _, dep := range svc.Requires {
+			if _, isService := spec.Services[dep]; isService {
+				out[dep] = true
+			}
+		}
+	}
+	return out
+}
+
 // swapServices brings each service onto the new release in dependency order.
 //
 // Proxied services go blue/green: the new container starts alongside the old
@@ -205,6 +221,13 @@ func ensureAccessories(spec *release.Spec, ledger *release.Ledger, envFile strin
 // the ledger would claim a clean failure after having already taken a service
 // down.
 func swapServices(spec, prev *release.Spec, envFile string) (started []string, mutated bool, err error) {
+	// Services something else depends on are health-checked before the things
+	// that depend on them start. `requires` previously ordered startup only, so
+	// a worker declaring `requires = ["db"]` could be running and failing
+	// against a database that had not finished booting — an ordering that looks
+	// like a dependency and does not behave like one.
+	depended := dependedOn(spec)
+
 	for _, name := range spec.Order {
 		svc, present := spec.Services[name]
 		if !present {
@@ -227,6 +250,15 @@ func swapServices(spec, prev *release.Spec, envFile string) (started []string, m
 			retireOldContainers(spec, name, svc)
 			started = append(started, name)
 			ok("swap:"+name, container+" started")
+
+			// Only gate on services something actually depends on. Checking every
+			// service here would serialise unrelated startups behind each other's
+			// boot time for no benefit; the final health gate still covers them.
+			if depended[name] {
+				if err := waitHealthy(spec, []string{name}, spec.Services); err != nil {
+					return started, mutated, fmt.Errorf("%w\n  %s is required by another service, which was not started", err, name)
+				}
+			}
 			continue
 		}
 

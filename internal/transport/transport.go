@@ -346,6 +346,51 @@ type FileStat struct {
 // whether a file needs transferring, which makes it the right basis for deciding
 // whether an artifact counts as a change. Hashing would be exact but means
 // reading the whole file on both sides — most of the cost of just shipping it.
+// RemoteFileStats stats several host paths in a single round trip.
+//
+// Replies are keyed by index rather than by echoing the path back, so a path
+// containing whitespace cannot corrupt the parse.
+//
+// A directory is summarised as the sum of its regular files' sizes and their
+// newest mtime — deliberately the same computation the CLI does locally, and
+// deliberately not `du`, which counts directory inodes too and would make every
+// directory artifact differ from itself on every deploy.
+func RemoteFileStats(ctx context.Context, c *sshx.Client, paths []string) map[string]FileStat {
+	out := make(map[string]FileStat, len(paths))
+	if len(paths) == 0 {
+		return out
+	}
+	for _, p := range paths {
+		out[p] = FileStat{Size: -1}
+	}
+
+	var script strings.Builder
+	for i, p := range paths {
+		q := shellArg(p)
+		fmt.Fprintf(&script,
+			"if [ -d %s ]; then find %s -type f -exec stat -c '%%s %%Y' {} + 2>/dev/null | "+
+				"awk -v i=%d 'BEGIN{b=0;m=0} {b+=$1; if ($2>m) m=$2} END{print i, b, m}'; "+
+				"elif [ -f %s ]; then echo \"%d $(stat -c '%%s %%Y' %s)\"; "+
+				"else echo '%d -1 0'; fi\n",
+			q, q, i, q, i, q, i)
+	}
+	reply, err := c.Run(ctx, "sh", "-c", script.String())
+	if err != nil {
+		return out
+	}
+	for _, ln := range strings.Split(reply, "\n") {
+		var idx int
+		var st FileStat
+		if _, err := fmt.Sscanf(strings.TrimSpace(ln), "%d %d %d", &idx, &st.Size, &st.MTime); err != nil {
+			continue
+		}
+		if idx >= 0 && idx < len(paths) {
+			out[paths[idx]] = st
+		}
+	}
+	return out
+}
+
 func RemoteFileStat(ctx context.Context, c *sshx.Client, path string) FileStat {
 	out, err := c.Run(ctx, "sh", "-c",
 		"if [ -f "+shellArg(path)+" ]; then stat -c '%s %Y' "+shellArg(path)+"; else echo '-1 0'; fi")

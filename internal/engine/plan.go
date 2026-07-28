@@ -58,6 +58,12 @@ type ServiceChange struct {
 	// ZeroDowntime is true for proxied services, which start alongside the
 	// running release instead of replacing it in place.
 	ZeroDowntime bool `json:"zero_downtime,omitempty"`
+
+	// ProxyGated is false for a proxied service whose health check the proxy
+	// cannot poll — a command check. Such a service overlaps, but the proxy has
+	// no way to keep a still-warming container out of rotation, so the swap
+	// leans on retry alone. Reported rather than left implicit.
+	ProxyGated bool `json:"proxy_gated,omitempty"`
 }
 
 // StageChange is one one-shot container the deploy would run, and whether the
@@ -240,7 +246,11 @@ func (e *Engine) BuildPlan(ctx context.Context, spec *release.Spec, built map[st
 
 	for _, name := range sortedKeys(spec.Services) {
 		svc := spec.Services[name]
-		sc := ServiceChange{Name: name, Action: "create", ZeroDowntime: svc.Proxied()}
+		sc := ServiceChange{
+			Name: name, Action: "create",
+			ZeroDowntime: svc.Proxied(),
+			ProxyGated:   release.ProxyGatesReadiness(svc),
+		}
 		if oldSpec != nil {
 			if old, ok := oldSpec.Services[name]; ok {
 				sc.Reasons = diffService(old, svc)
@@ -284,10 +294,16 @@ func (e *Engine) BuildPlan(ctx context.Context, spec *release.Spec, built map[st
 
 	p.Accessories = e.planAccessories(p, spec, state, oldSpec)
 
+	// Every artifact stat in one round trip rather than one apiece; see
+	// RemoteFileStat for why size and mtime are the right test rather than
+	// hashing.
+	dests := make([]string, 0, len(spec.Artifacts))
 	for _, a := range spec.Artifacts {
-		// One stat over the existing connection; see RemoteFileStat for why this
-		// is the right test rather than hashing.
-		host := transport.RemoteFileStat(ctx, e.Client, a.Dest)
+		dests = append(dests, a.Dest)
+	}
+	hostStats := transport.RemoteFileStats(ctx, e.Client, dests)
+	for _, a := range spec.Artifacts {
+		host := hostStats[a.Dest]
 		p.Artifacts = append(p.Artifacts, ArtifactChange{
 			Name:       a.Name,
 			Dest:       a.Dest,
@@ -544,35 +560,64 @@ func diffSecrets(old, nw *release.Spec, salt string) SecretChange {
 // estimate asks the host which blobs it already holds and sums the rest. This is
 // the number that makes the registry-free approach legible: it is the actual
 // wire cost of the deploy, before it happens.
+//
+// One round trip for every image, not one per image: each listing is fenced by
+// a marker line so the replies can be told apart. A manifest with several images
+// otherwise paid a full ssh round trip each, before any work had started.
 func (e *Engine) estimate(ctx context.Context, built map[string]*build.Result) (*TransferEstimate, error) {
 	est := &TransferEstimate{}
-	for name, r := range built {
-		local, err := layoutBlobs(r.Dir)
+	if len(built) == 0 {
+		return est, nil
+	}
+	names := sortedResultKeys(built)
+
+	var script strings.Builder
+	for _, name := range names {
+		dir := filepath.Join(e.StorePath(), name, "blobs", "sha256")
+		fmt.Fprintf(&script, "echo %s\nls -1 %s 2>/dev/null || true\n",
+			shellArg(blobFence+name), shellArg(dir))
+	}
+	out, err := e.Client.Run(ctx, "sh", "-c", script.String())
+	if err != nil {
+		return nil, err
+	}
+	have := parseBlobListing(out)
+
+	for _, name := range names {
+		local, err := layoutBlobs(built[name].Dir)
 		if err != nil {
 			return nil, err
-		}
-		for _, sz := range local {
-			est.Total += sz
-		}
-		remoteDir := filepath.Join(e.StorePath(), name, "blobs", "sha256")
-		out, err := e.Client.Run(ctx, "sh", "-c", "ls -1 "+shellArg(remoteDir)+" 2>/dev/null || true")
-		if err != nil {
-			return nil, err
-		}
-		have := map[string]bool{}
-		for _, ln := range strings.Split(strings.TrimSpace(out), "\n") {
-			if ln != "" {
-				have[strings.TrimSpace(ln)] = true
-			}
 		}
 		for digest, sz := range local {
-			if !have[digest] {
+			est.Total += sz
+			if !have[name][digest] {
 				est.Missing += sz
 				est.Blobs++
 			}
 		}
 	}
 	return est, nil
+}
+
+// blobFence separates one image's blob listing from the next in a batched reply.
+// A digest is hex, so this cannot collide with one.
+const blobFence = "--shunt-image:"
+
+func parseBlobListing(out string) map[string]map[string]bool {
+	have := map[string]map[string]bool{}
+	var current string
+	for _, ln := range strings.Split(out, "\n") {
+		ln = strings.TrimSpace(ln)
+		switch {
+		case ln == "":
+		case strings.HasPrefix(ln, blobFence):
+			current = strings.TrimPrefix(ln, blobFence)
+			have[current] = map[string]bool{}
+		case current != "":
+			have[current][ln] = true
+		}
+	}
+	return have
 }
 
 func layoutBlobs(dir string) (map[string]int64, error) {

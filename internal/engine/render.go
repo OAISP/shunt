@@ -188,8 +188,15 @@ func swapVerb(s ServiceChange) string {
 }
 
 func downtimeNote(sc ServiceChange, s ui.Style) string {
-	if sc.ZeroDowntime {
-		return "  " + s.Dim("(starts alongside; no downtime)")
+	if !sc.ZeroDowntime {
+		return "  " + s.Dim("(brief gap while it restarts)")
 	}
-	return "  " + s.Dim("(brief gap while it restarts)")
+	if !sc.ProxyGated {
+		// Overlapping without a proxy-pollable health check means the proxy will
+		// route to the new container as soon as it exists. A backend that is not
+		// listening yet is covered by retry; one that is listening and still
+		// warming up is not, and the operator should know which they have.
+		return "  " + s.Amber("(starts alongside; proxy cannot poll this health check)")
+	}
+	return "  " + s.Dim("(starts alongside; no downtime)")
 }

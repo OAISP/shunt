@@ -338,6 +338,18 @@ func treeSummary(root string) (bytes, mtime int64) {
 	return bytes, mtime
 }
 
+// linkDestFor names the live tree to reuse unchanged files from, or "" when the
+// host has nothing there yet.
+func linkDestFor(a release.Artifact, present map[string]transport.FileStat) string {
+	if !a.Dir {
+		return "" // single files use --fuzzy instead
+	}
+	if st, ok := present[a.Dest]; ok && st.Size >= 0 {
+		return a.Dest
+	}
+	return ""
+}
+
 // LocalArtifactPath is the source file for a named artifact.
 func (e *Engine) LocalArtifactPath(name string) string {
 	for _, a := range e.M.Artifacts {
@@ -351,6 +363,17 @@ func (e *Engine) LocalArtifactPath(name string) string {
 // PushArtifacts transfers each artifact to its staged path on the host.
 func (e *Engine) PushArtifacts(ctx context.Context, spec *release.Spec, verbose bool) (map[string]*transport.Stats, error) {
 	stats := map[string]*transport.Stats{}
+
+	// Which destinations already exist, in one round trip. A directory transfer
+	// reuses the live tree via --link-dest, and pointing that at a path the host
+	// does not have yet makes rsync print a warning on a first deploy — accurate
+	// but alarming, and avoidable now that stats come back batched.
+	dests := make([]string, 0, len(spec.Artifacts))
+	for _, a := range spec.Artifacts {
+		dests = append(dests, a.Dest)
+	}
+	present := transport.RemoteFileStats(ctx, e.Client, dests)
+
 	for _, a := range spec.Artifacts {
 		st, err := transport.PushFile(ctx, transport.FileOptions{
 			Client:     e.Client,
@@ -359,8 +382,9 @@ func (e *Engine) PushArtifacts(ctx context.Context, spec *release.Spec, verbose 
 			Verbose:    verbose,
 			RemoteZstd: e.facts.RsyncZstd,
 			// The live tree is what an unchanged file should be linked from
-			// rather than re-sent; ignored for single-file artifacts.
-			LinkDest: a.Dest,
+			// rather than re-sent; ignored for single-file artifacts, and
+			// omitted entirely until the host actually has a tree to link from.
+			LinkDest: linkDestFor(a, present),
 		})
 		if err != nil {
 			return nil, err

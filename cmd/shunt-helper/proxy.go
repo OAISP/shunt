@@ -19,12 +19,24 @@ func proxyLabels(spec *release.Spec, name string, svc release.Service) []string 
 	var out []string
 	add := func(k, v string) { out = append(out, "--label", k+"="+v) }
 
+	// The path a proxy can probe to decide whether this container is ready. It
+	// is what keeps a still-booting release out of rotation during the overlap.
+	probe := release.HealthProbePath(svc)
+
 	switch p.Kind {
 	case "caddy":
 		add("caddy", p.Host)
 		add("caddy.reverse_proxy", fmt.Sprintf("{{upstreams %d}}", p.Port))
 		if p.Path != "" && p.Path != "/" {
 			add("caddy.route", p.Path+"*")
+		}
+		// caddy had no readiness gate at all: it was handed the container the
+		// moment it existed, so the overlap served whatever a booting app
+		// returned. Active health checks are the same mechanism Traefik gets.
+		if probe != "" {
+			add("caddy.reverse_proxy.health_uri", probe)
+			add("caddy.reverse_proxy.health_interval", "2s")
+			add("caddy.reverse_proxy.health_timeout", "2s")
 		}
 	default: // traefik
 		add("traefik.enable", "true")
@@ -54,8 +66,8 @@ func proxyLabels(spec *release.Spec, name string, svc release.Service) []string 
 		//
 		// The proxy-side health check is what keeps a container that is still
 		// booting out of rotation — without it the overlap would serve errors.
-		if svc.Health != nil && strings.HasPrefix(svc.Health.URL, "/") {
-			add("traefik.http.services."+id+".loadbalancer.healthcheck.path", svc.Health.URL)
+		if probe != "" {
+			add("traefik.http.services."+id+".loadbalancer.healthcheck.path", probe)
 			add("traefik.http.services."+id+".loadbalancer.healthcheck.interval", "2s")
 			add("traefik.http.services."+id+".loadbalancer.healthcheck.timeout", "2s")
 		}

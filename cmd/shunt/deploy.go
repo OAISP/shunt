@@ -57,12 +57,14 @@ func cmdPlan(ctx context.Context, args []string) error {
 // cmdUp runs the whole pipeline: build, ship, stages, swap, health.
 func cmdUp(ctx context.Context, args []string) error {
 	var c commonFlags
-	var noCache, yes, skipPlan bool
+	var noCache, yes, skipPlan, rollbackOnFail bool
 	fs := newFlagSet("up", &c)
 	fs.BoolVar(&noCache, "no-cache", false, "build without the layer cache")
 	fs.BoolVar(&yes, "y", false, "skip the confirmation prompt")
 	fs.BoolVar(&yes, "yes", false, "skip the confirmation prompt")
 	fs.BoolVar(&skipPlan, "no-plan", false, "do not show the plan first")
+	fs.BoolVar(&rollbackOnFail, "rollback-on-failure", false,
+		"restore the previous release if this one fails after replacing a container")
 	if err := parseArgs(fs, args); err != nil {
 		return err
 	}
@@ -112,6 +114,7 @@ func cmdUp(ctx context.Context, args []string) error {
 	// premise is re-stated for the helper to check under its own lock.
 	b.spec.ExpectedCurrent = b.state.ExpectedCurrent()
 	b.engine.WithProvenance(b.spec, version)
+	b.spec.RollbackOnFailure = rollbackOnFail
 
 	if err := ship(ctx, b, &c); err != nil {
 		return err

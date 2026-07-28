@@ -45,6 +45,8 @@ const usage = `usage:
   shunt audit                check everything a deploy needs, and change nothing
   shunt plan                 build, then show what a deploy would change
   shunt up                   build, ship, run stages, swap containers, health-check
+                             --rollback-on-failure restores the previous release
+                             if this one fails after replacing a container
   shunt status               what the host is running right now
   shunt exec <service> ...   run a command in the running container
   shunt run <service> ...    run a one-off command in a fresh container

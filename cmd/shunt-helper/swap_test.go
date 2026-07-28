@@ -202,3 +202,81 @@ func TestRetireStopsEveryContainerGracefully(t *testing.T) {
 		t.Fatal("containers were killed rather than drained")
 	}
 }
+
+// `requires` used to order startup and nothing more, so a service could be
+// running and failing against a dependency that had not finished booting.
+func TestSwapServicesWaitsForADependencyToBecomeHealthy(t *testing.T) {
+	f := newFake().
+		on("inspect -f {{.State.Status}}", "running\n", nil).
+		on("docker logs", "still booting\n", nil).
+		on("docker exec", "", errors.New("exit status 1")) // db never becomes healthy
+	withFake(t, f)
+
+	spec := svcSpec(map[string]release.Service{
+		"db": {Image: "app", Restart: "always", Health: &release.Health{
+			Command: []string{"pg_isready"}, Retries: 1, Interval: "1ms",
+		}},
+		"web": {Image: "app", Restart: "always", Requires: []string{"db"}},
+	}, "db", "web")
+
+	started, _, err := swapServices(spec, nil, "")
+	if err == nil {
+		t.Fatal("swapServices started a dependent service despite its dependency being unhealthy")
+	}
+	if !strings.Contains(err.Error(), "required by another service") {
+		t.Fatalf("error should explain the dependency, got: %v", err)
+	}
+	// db started; web must not have.
+	if len(started) != 1 || started[0] != "db" {
+		t.Fatalf("started = %v, want only [db]", started)
+	}
+	if f.did("--name demo-web") {
+		t.Fatal("the dependent service was started before its dependency was ready")
+	}
+}
+
+// A service nothing depends on must not be serialised behind its own health
+// check — the final gate already covers it, and waiting here would stack every
+// service's boot time end to end for no benefit.
+func TestSwapServicesDoesNotGateAServiceNothingRequires(t *testing.T) {
+	f := newFake()
+	withFake(t, f)
+
+	spec := svcSpec(map[string]release.Service{
+		"web":    {Image: "app", Restart: "always", Health: &release.Health{Command: []string{"true"}, Retries: 1}},
+		"worker": {Image: "app", Restart: "always"},
+	}, "web", "worker")
+
+	started, _, err := swapServices(spec, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(started) != 2 {
+		t.Fatalf("started = %v, want both", started)
+	}
+	// No health probe should have run during the swap itself.
+	if f.did("docker exec", "true") {
+		t.Fatal("an ungated service was health-checked mid-swap")
+	}
+}
+
+func TestDependedOnIgnoresAccessories(t *testing.T) {
+	spec := &release.Spec{
+		Services: map[string]release.Service{
+			"web":    {Requires: []string{"db", "cache"}},
+			"db":     {},
+			"worker": {Requires: []string{"db"}},
+		},
+		Accessories: map[string]release.Service{"cache": {}},
+	}
+	got := dependedOn(spec)
+	if !got["db"] {
+		t.Error("db is required by two services and should be gated")
+	}
+	if got["cache"] {
+		t.Error("accessories are already up and health-checked; they must not be gated again")
+	}
+	if got["web"] || got["worker"] {
+		t.Error("nothing requires web or worker")
+	}
+}
