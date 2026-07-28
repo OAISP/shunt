@@ -93,6 +93,52 @@ func cmdRollback(args []string) error {
 	})
 }
 
+// cmdRetire stops and removes every container belonging to one service.
+//
+// It exists because dropping a service from shunt.toml previously did nothing:
+// the plan reported it forever and the container ran forever. Retiring is a
+// separate verb rather than something `up` does, for the same reason booting an
+// accessory is — shunt does not stop containers it was not explicitly asked to.
+func cmdRetire(args []string) error {
+	if len(args) < 2 {
+		return errors.New("usage: shunt-helper retire <project> <service>")
+	}
+	project, service := args[0], args[1]
+	return withLock(project, func() error {
+		out, err := exec.Command("docker", "ps", "-a",
+			"--filter", "label=shunt.project="+project,
+			"--filter", "label=shunt.service="+service,
+			"--format", "{{.Names}}").Output()
+		if err != nil {
+			return fmt.Errorf("list containers for %s: %w", service, err)
+		}
+		names := splitLines(string(out))
+		if len(names) == 0 {
+			ok("retire:"+service, "nothing running for "+service)
+			return nil
+		}
+		for _, n := range names {
+			step("retire:"+service, "stopping "+n)
+			// A drain of 10s rather than an immediate kill: an orphan is still
+			// serving something until it stops.
+			stopAndRemove(n, 10)
+			ok("retire:"+service, n+" stopped and removed")
+		}
+
+		// Drop the applied-accessory record too, so a service that comes back
+		// later is not compared against state that no longer exists.
+		ledger, err := loadLedger(project)
+		if err != nil {
+			return err
+		}
+		if _, present := ledger.Accessories[service]; present {
+			delete(ledger.Accessories, service)
+			return saveLedger(ledger)
+		}
+		return nil
+	})
+}
+
 // cmdBoot force-recreates one accessory from a spec supplied on stdin. It is a
 // separate verb precisely because it is destructive to a stateful container and
 // must never happen as a side effect of shipping code.

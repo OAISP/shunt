@@ -131,7 +131,11 @@ func startContainer(spec *release.Spec, name string, svc release.Service, envFil
 	args = append(args, "--label", "shunt.project="+spec.Project,
 		"--label", "shunt.service="+name,
 		"--label", "shunt.kind="+kind,
-		"--label", "shunt.release="+spec.ID)
+		"--label", "shunt.release="+spec.ID,
+		// The definition this container was actually started with. `shunt plan`
+		// compares it against the manifest, which is what lets a plan describe
+		// the host rather than merely replaying the ledger.
+		"--label", "shunt.config="+release.HashService(svc))
 	args = append(args, proxyLabels(spec, name, svc)...)
 	args = append(args, ref)
 	args = append(args, svc.Command...)

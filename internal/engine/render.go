@@ -146,8 +146,9 @@ func (p *Plan) renderServices(w io.Writer, s ui.Style) {
 		case "update":
 			fmt.Fprintf(w, "  %s %-*s %s%s\n", s.Change(), nameCol, svc.Name, swapVerb(svc), downtimeNote(svc, s))
 			renderReasons(w, s, svc.Reasons)
-		case "remove":
-			fmt.Fprintf(w, "  %s %-*s %s\n", s.Remove(), nameCol, svc.Name, s.Dim(strings.Join(svc.Reasons, "; ")))
+		case "orphaned":
+			fmt.Fprintf(w, "  %s %-*s %s\n", s.Warn(), nameCol, svc.Name, s.Amber("orphaned"))
+			renderReasons(w, s, svc.Reasons)
 		}
 	}
 }

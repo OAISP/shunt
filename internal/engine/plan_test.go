@@ -155,6 +155,109 @@ func TestRemovedStageIsReported(t *testing.T) {
 	}
 }
 
+func deployed(l *release.Ledger) *release.Ledger {
+	if l == nil {
+		l = &release.Ledger{Current: "r1"}
+	}
+	return l
+}
+
+// A plan built from the ledger alone describes what shunt last did, not what
+// the host is doing. Deleting a container by hand used to read as "unchanged".
+func TestReconcileReportsAMissingContainer(t *testing.T) {
+	state := &RemoteState{Ledger: deployed(nil)}
+	got := reconcileService(state, "app", release.Service{Image: "app"})
+	if len(got) != 1 || !strings.Contains(got[0], "removed outside shunt") {
+		t.Fatalf("reconcileService = %v, want a missing-container reason", got)
+	}
+}
+
+func TestReconcileReportsAStoppedContainer(t *testing.T) {
+	svc := release.Service{Image: "app"}
+	state := &RemoteState{
+		Ledger: deployed(nil),
+		Containers: []Container{{
+			Name: "demo-app", Service: "app", State: "exited",
+			Config: release.HashService(svc),
+		}},
+	}
+	got := reconcileService(state, "app", svc)
+	if len(got) != 1 || !strings.Contains(got[0], "exited") {
+		t.Fatalf("reconcileService = %v, want a not-running reason", got)
+	}
+}
+
+// A container someone replaced by hand carries a different config hash.
+func TestReconcileReportsAReplacedContainer(t *testing.T) {
+	state := &RemoteState{
+		Ledger: deployed(nil),
+		Containers: []Container{{
+			Name: "demo-app", Service: "app", State: "running", Config: "h:somethingelse",
+		}},
+	}
+	got := reconcileService(state, "app", release.Service{Image: "app"})
+	if len(got) != 1 || !strings.Contains(got[0], "different configuration") {
+		t.Fatalf("reconcileService = %v, want a config-mismatch reason", got)
+	}
+}
+
+func TestReconcileIsQuietWhenTheHostMatches(t *testing.T) {
+	svc := release.Service{Image: "app", Restart: "unless-stopped"}
+	state := &RemoteState{
+		Ledger: deployed(nil),
+		Containers: []Container{{
+			Name: "demo-app", Service: "app", State: "running", Config: release.HashService(svc),
+		}},
+	}
+	if got := reconcileService(state, "app", svc); got != nil {
+		t.Fatalf("reconcileService = %v, want nil", got)
+	}
+}
+
+// Containers created before shunt wrote a config label must not all suddenly
+// report drift the first time an existing host is planned.
+func TestReconcileToleratesAnUnlabelledContainer(t *testing.T) {
+	state := &RemoteState{
+		Ledger:     deployed(nil),
+		Containers: []Container{{Name: "demo-app", Service: "app", State: "running"}},
+	}
+	if got := reconcileService(state, "app", release.Service{Image: "app"}); got != nil {
+		t.Fatalf("reconcileService = %v, want nil for an unlabelled container", got)
+	}
+}
+
+// Before the first deploy there is nothing to reconcile against; the service
+// diff already calls that a create.
+func TestReconcileIsQuietBeforeTheFirstDeploy(t *testing.T) {
+	if got := reconcileService(&RemoteState{Ledger: &release.Ledger{}}, "app", release.Service{}); got != nil {
+		t.Fatalf("reconcileService = %v, want nil", got)
+	}
+}
+
+// An orphan is reported but never acted on, so it must not make the plan
+// permanently dirty with a change `shunt up` will never make.
+func TestOrphanedServiceIsNotCountedAsWork(t *testing.T) {
+	state := &RemoteState{
+		Ledger:     deployed(nil),
+		Containers: []Container{{Name: "demo-worker", Service: "worker", State: "running"}},
+	}
+	sc := orphanChange(state, "worker")
+	if sc.Action != "orphaned" {
+		t.Fatalf("action = %q, want orphaned", sc.Action)
+	}
+	if !strings.Contains(sc.Reasons[0], "shunt retire worker") {
+		t.Fatalf("reason should name the fix, got %q", sc.Reasons[0])
+	}
+
+	p := &Plan{
+		Current:  &release.Entry{ID: "r1", Status: release.StatusActive},
+		Services: []ServiceChange{sc},
+	}
+	if p.Changed() {
+		t.Fatal("an orphaned service made the plan dirty; it would never come clean")
+	}
+}
+
 // A failed release leaves the host in an unknown state, so an identical
 // manifest is still work to do — otherwise `shunt up` refuses to retry.
 func TestChangedTreatsFailedCurrentAsWork(t *testing.T) {

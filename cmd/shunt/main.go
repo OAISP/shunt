@@ -46,6 +46,7 @@ const usage = `usage:
   shunt status               what the host is running right now
   shunt rollback [release]   restore the previous (or a named) release
   shunt boot <accessory>     (re)create a stateful accessory — destructive
+  shunt retire <service>     stop a service you removed from shunt.toml
   shunt logs [service]       tail logs from the host
   shunt prune                drop superseded images on the host
   shunt version
@@ -73,6 +74,7 @@ var commands = map[string]func(context.Context, []string) error{
 	"status":   cmdStatus,
 	"rollback": cmdRollback,
 	"boot":     cmdBoot,
+	"retire":   cmdRetire,
 	"logs":     cmdLogs,
 	"prune":    cmdPrune,
 }

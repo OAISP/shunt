@@ -515,15 +515,41 @@ func NewReleaseID() string {
 	return time.Now().UTC().Format("20060102-150405") + "-" + hex.EncodeToString(b[:])
 }
 
+// Container is one container the host is running for this project, as reported
+// by the helper.
+type Container struct {
+	Name    string `json:"name"`
+	Status  string `json:"status"`
+	Image   string `json:"image"`
+	Release string `json:"release"`
+	Service string `json:"service"`
+	Kind    string `json:"kind"`
+
+	// Config is the hash of the definition this container was started with.
+	// Empty on containers created before shunt labelled them, which is why a
+	// missing value never counts as drift.
+	Config string `json:"config"`
+	State  string `json:"state"`
+}
+
+// Running reports whether docker considers this container up.
+func (c Container) Running() bool { return c.State == "running" }
+
 // RemoteState is what the host currently believes it is running.
 type RemoteState struct {
 	Ledger     *release.Ledger `json:"ledger"`
-	Containers []struct {
-		Name    string `json:"name"`
-		Status  string `json:"status"`
-		Image   string `json:"image"`
-		Release string `json:"release"`
-	} `json:"containers"`
+	Containers []Container     `json:"containers"`
+}
+
+// ServiceContainers returns the containers belonging to one service.
+func (s *RemoteState) ServiceContainers(name string) []Container {
+	var out []Container
+	for _, c := range s.Containers {
+		if c.Service == name {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 func (e *Engine) State(ctx context.Context) (*RemoteState, error) {
@@ -555,6 +581,12 @@ func (e *Engine) Boot(ctx context.Context, name string, spec *release.Spec, r Ev
 		return err
 	}
 	return e.stream(ctx, strings.NewReader(string(b)), r, e.helperPath, "boot", name)
+}
+
+// Retire stops and removes the containers of a service the manifest no longer
+// declares.
+func (e *Engine) Retire(ctx context.Context, service string, r EventRenderer) error {
+	return e.stream(ctx, nil, r, e.helperPath, "retire", e.M.Project, service)
 }
 
 func (e *Engine) Rollback(ctx context.Context, id string, r EventRenderer) error {

@@ -28,17 +28,25 @@ func cmdStatus(args []string) error {
 		Status  string `json:"status"`
 		Image   string `json:"image"`
 		Release string `json:"release"`
+		Service string `json:"service"`
+		Kind    string `json:"kind"`
+		Config  string `json:"config"`
+		State   string `json:"state"`
 	}
+	// Service, config and state come back so `shunt plan` can compare the
+	// manifest against what is actually running rather than against the ledger's
+	// account of it.
 	out, _ := exec.Command("docker", "ps", "-a",
 		"--filter", "label=shunt.project="+args[0],
-		"--format", "{{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Label \"shunt.release\"}}").Output()
+		"--format", "{{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Label \"shunt.release\"}}\t"+
+			"{{.Label \"shunt.service\"}}\t{{.Label \"shunt.kind\"}}\t{{.Label \"shunt.config\"}}\t{{.State}}").Output()
 	var cs []containerInfo
 	for _, ln := range splitLines(string(out)) {
 		f := strings.Split(ln, "\t")
-		if len(f) < 4 {
+		if len(f) < 8 {
 			continue
 		}
-		cs = append(cs, containerInfo{f[0], f[1], f[2], f[3]})
+		cs = append(cs, containerInfo{f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]})
 	}
 	return json.NewEncoder(os.Stdout).Encode(map[string]any{"ledger": ledger, "containers": cs})
 }

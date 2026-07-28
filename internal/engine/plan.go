@@ -162,7 +162,9 @@ func (p *Plan) Changed() bool {
 		}
 	}
 	for _, s := range p.Services {
-		if s.Action != "unchanged" {
+		// An orphan is reported, never acted on — counting it would leave the
+		// plan permanently dirty with a change `shunt up` will never make.
+		if s.Action != "unchanged" && s.Action != "orphaned" {
 			return true
 		}
 	}
@@ -246,13 +248,21 @@ func (e *Engine) BuildPlan(ctx context.Context, spec *release.Spec, built map[st
 				}
 			}
 		}
+		// The ledger says what shunt last deployed; only the containers say what
+		// the host is running now. Without this a service deleted, stopped or
+		// replaced by hand read as "unchanged" and `shunt up` refused to fix it.
+		if drift := reconcileService(state, name, svc); len(drift) > 0 {
+			if sc.Action == "unchanged" {
+				sc.Action = "update"
+			}
+			sc.Reasons = append(sc.Reasons, drift...)
+		}
 		p.Services = append(p.Services, sc)
 	}
 	if oldSpec != nil {
 		for _, name := range sortedKeys(oldSpec.Services) {
 			if _, ok := spec.Services[name]; !ok {
-				p.Services = append(p.Services, ServiceChange{Name: name, Action: "remove",
-					Reasons: []string{"no longer in shunt.toml — shunt will not stop it automatically"}})
+				p.Services = append(p.Services, orphanChange(state, name))
 			}
 		}
 	}
@@ -289,6 +299,75 @@ func (e *Engine) BuildPlan(ctx context.Context, spec *release.Spec, built map[st
 		p.Transfer = *est
 	}
 	return p, nil
+}
+
+// reconcileService compares the manifest against the containers actually on the
+// host, and explains any difference.
+//
+// A plan built purely from the ledger describes what shunt last did, not what
+// the host is doing. Delete a container by hand, stop one, or replace it with a
+// `docker run` of your own, and the plan happily reported "host already matches
+// this manifest" while the service was down.
+func reconcileService(state *RemoteState, name string, svc release.Service) []string {
+	if state == nil {
+		return nil
+	}
+	found := state.ServiceContainers(name)
+	if len(found) == 0 {
+		// Nothing deployed yet is not drift; the service diff already calls that
+		// a create.
+		if state.Ledger == nil || state.Ledger.Current == "" {
+			return nil
+		}
+		return []string{"no container on the host — it was removed outside shunt"}
+	}
+
+	want := release.HashService(svc)
+	for _, c := range found {
+		// An empty config label means the container predates this check. Treat it
+		// as satisfied rather than reporting drift on every pre-existing host.
+		if c.Running() && (c.Config == "" || c.Config == want) {
+			return nil
+		}
+	}
+
+	c := found[0]
+	switch {
+	case !c.Running():
+		return []string{fmt.Sprintf("container %s is %s, not running", c.Name, orUnknown(c.State))}
+	default:
+		return []string{fmt.Sprintf("container %s is running a different configuration than shunt.toml describes", c.Name)}
+	}
+}
+
+func orUnknown(s string) string {
+	if s == "" {
+		return "in an unknown state"
+	}
+	return s
+}
+
+// orphanChange describes a service the manifest dropped but the host may still
+// be running.
+//
+// Deliberately not counted as work: shunt will not stop a container it was not
+// asked to stop, so treating it as actionable left the plan permanently dirty
+// with a change no `shunt up` would ever make. `shunt retire` is the explicit
+// way to act on it.
+func orphanChange(state *RemoteState, name string) ServiceChange {
+	sc := ServiceChange{Name: name, Action: "orphaned"}
+	running := 0
+	for _, c := range state.ServiceContainers(name) {
+		if c.Running() {
+			running++
+		}
+	}
+	if running > 0 {
+		sc.Reasons = []string{fmt.Sprintf("no longer in shunt.toml, but %d container(s) still running — `shunt retire %s` stops them", running, name)}
+	} else {
+		sc.Reasons = []string{"no longer in shunt.toml; nothing is running for it"}
+	}
+	return sc
 }
 
 // planAccessories diffs the manifest's accessories against what the host
