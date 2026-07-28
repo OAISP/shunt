@@ -841,3 +841,87 @@ func TestPublishedHostPort(t *testing.T) {
 		}
 	}
 }
+
+// File mode exists so values stay out of the container's configuration. The
+// files themselves must be readable only by the deploying user.
+func TestSecretFilesArePrivateAndExact(t *testing.T) {
+	t.Setenv("SHUNT_ROOT", t.TempDir())
+	spec := &release.Spec{
+		Project: "demo", ID: testRelease, SecretMode: "file",
+		Secrets: map[string]string{"DATABASE_URL": "postgres://x", "STRIPE_KEY": "sk_live"},
+	}
+	dir, err := writeSecretFiles(spec, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(dir); err != nil {
+		t.Fatal(err)
+	} else if fi.Mode().Perm()&0o077 != 0 {
+		t.Fatalf("secrets directory mode = %04o, want no group/other access", fi.Mode().Perm())
+	}
+	for k, want := range spec.Secrets {
+		p := filepath.Join(dir, k)
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Mode().Perm()&0o077 != 0 {
+			t.Fatalf("%s mode = %04o, want 0600", k, fi.Mode().Perm())
+		}
+		// No trailing newline: the file *is* the value, so an app reading it
+		// whole should not have to strip anything.
+		if got := readFile(t, p); got != want {
+			t.Fatalf("%s = %q, want exactly %q", k, got, want)
+		}
+	}
+}
+
+// A service that narrowed its secrets gets a directory holding only those.
+func TestSecretFilesHonourPerServiceScoping(t *testing.T) {
+	t.Setenv("SHUNT_ROOT", t.TempDir())
+	spec := &release.Spec{
+		Project: "demo", ID: testRelease, SecretMode: "file",
+		Secrets: map[string]string{"DATABASE_URL": "postgres://x", "STRIPE_KEY": "sk_live"},
+	}
+	dir, err := writeSecretFiles(spec, []string{"DATABASE_URL"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "STRIPE_KEY")); !os.IsNotExist(err) {
+		t.Fatal("a scoped service was given a secret it did not ask for")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "DATABASE_URL")); err != nil {
+		t.Fatalf("the scoped secret is missing: %v", err)
+	}
+}
+
+// A key removed from the manifest must not linger as a file the app can read.
+func TestSecretFilesAreRewrittenFromScratch(t *testing.T) {
+	t.Setenv("SHUNT_ROOT", t.TempDir())
+	spec := &release.Spec{
+		Project: "demo", ID: testRelease, SecretMode: "file",
+		Secrets: map[string]string{"OLD": "1", "KEEP": "2"},
+	}
+	if _, err := writeSecretFiles(spec, nil); err != nil {
+		t.Fatal(err)
+	}
+	spec.Secrets = map[string]string{"KEEP": "2"}
+	dir, err := writeSecretFiles(spec, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "OLD")); !os.IsNotExist(err) {
+		t.Fatal("a secret removed from the manifest survived as a readable file")
+	}
+}
+
+func TestSecretFilesRejectAScopeTheReleaseDoesNotProvide(t *testing.T) {
+	t.Setenv("SHUNT_ROOT", t.TempDir())
+	spec := &release.Spec{
+		Project: "demo", ID: testRelease, SecretMode: "file",
+		Secrets: map[string]string{"DATABASE_URL": "x"},
+	}
+	if _, err := writeSecretFiles(spec, []string{"NOPE"}); err == nil {
+		t.Fatal("writeSecretFiles accepted a key the release does not have")
+	}
+}

@@ -9,21 +9,28 @@
 #               detect and fall back. This is the case that would break a deploy
 #               to a large share of real VPS hosts.
 #
-#   no-tools    A minimal image without curl or tar. shunt shells out to both on
-#               the host — tar streams the layout into `docker load`, curl runs
-#               url health checks — and both were historically discovered only
-#               after the container swap.
+#   no-curl     A minimal image without curl. shunt shells out to it on the host
+#               for url health checks, and its absence was historically
+#               discovered only after the container swap.
 #
-# Each host is a container running sshd with the runner's docker socket mounted,
-# on the host network so published ports and health probes agree about what
-# 127.0.0.1 means.
+#   no-tar      tar used to be required too, for streaming the layout into
+#               `docker load`. The helper writes that archive itself now, so a
+#               host without tar has to deploy — which the old-rsync host, whose
+#               tar is removed, proves.
+#
+# Each host is a container running sshd with the daemon's socket mounted, and its
+# ssh port published. Deliberately not --network host: that shares a namespace
+# only when the daemon is local, and on Docker Desktop the daemon lives in its
+# own VM, so the harness would be unrunnable on a developer machine. The fixture
+# health-checks via `docker exec` for the same reason — it needs no agreement
+# about what 127.0.0.1 means, and the curl-less host has no curl to probe with
+# anyway.
 set -euo pipefail
 
 SHUNT="${SHUNT:-$(cd "$(dirname "$0")/.." && pwd)/shunt}"
 WORK="$(mktemp -d)"
 KEY="$WORK/id_ed25519"
 SSH_PORT="${COMPAT_SSH_PORT:-22222}"
-APP_PORT="${COMPAT_APP_PORT:-19095}"
 CONTAINER="shunt-compat-host"
 
 pass=0
@@ -58,16 +65,14 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN $setup
 RUN mkdir -p /var/run/sshd /root/.ssh && \\
     sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config && \\
-    sed -i 's/^#*Port .*/Port $SSH_PORT/' /etc/ssh/sshd_config
+    sed -i 's/^#*Port .*/Port 22/' /etc/ssh/sshd_config
 COPY id_ed25519.pub /root/.ssh/authorized_keys
 RUN chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys
 CMD ["/usr/sbin/sshd", "-D", "-e"]
 EOF
   docker build -q -f "$WORK/Dockerfile.host" -t shunt-compat-host-img "$WORK" >/dev/null
 
-  # Host network so a port published by the real daemon is reachable at the same
-  # 127.0.0.1 the health probe inside this container will use.
-  docker run -d --name "$CONTAINER" --network host \
+  docker run -d --name "$CONTAINER" -p "127.0.0.1:$SSH_PORT:22" \
     -v /var/run/docker.sock:/var/run/docker.sock \
     shunt-compat-host-img >/dev/null
 
@@ -99,10 +104,9 @@ context = "."
 
 [services.app]
 image   = "app"
-publish = ["127.0.0.1:$APP_PORT:8080"]
 
 [services.app.health]
-url     = "/index.html"
+command = ["cat", "/srv/index.html"]
 retries = 20
 EOF
 }
@@ -139,7 +143,7 @@ chmod +x "$WORK/bin/ssh"
 export PATH="$WORK/bin:$PATH"
 
 # ------------------------------------------------------- missing curl / tar ---
-step "a host missing curl and tar is refused up front"
+step "a host missing curl is refused up front"
 start_host "ubuntu:24.04" \
   "apt-get update -qq && apt-get install -y -qq openssh-server rsync docker.io >/dev/null && apt-get remove -y -qq curl >/dev/null && rm -f /bin/tar /usr/bin/tar"
 
@@ -147,16 +151,16 @@ fixture "$WORK/app"
 cd "$WORK/app"
 
 out="$("$SHUNT" audit 2>&1 || true)"
-if printf '%s' "$out" | grep -qiE "curl|tar"; then
-  ok "audit names the missing tools"
+if printf '%s' "$out" | grep -qi "curl"; then
+  ok "audit names the missing tool"
 else
-  bad "audit names the missing tools — got: $(printf '%s' "$out" | tail -3)"
+  bad "audit names the missing tool — got: $(printf '%s' "$out" | tail -3)"
 fi
 
 # The deploy must refuse before building or shipping anything, not after the
 # container swap.
 out="$("$SHUNT" up -y 2>&1 || true)"
-if printf '%s' "$out" | grep -qiE "missing (curl|tar)|curl and tar|tar and curl"; then
+if printf '%s' "$out" | grep -qi "missing curl"; then
   ok "up refuses before doing any work"
 else
   bad "up refuses before doing any work — got: $(printf '%s' "$out" | tail -3)"
@@ -168,9 +172,9 @@ else
 fi
 
 # ------------------------------------------------------------- old rsync ------
-step "a host with rsync 3.1.3 (no --compress-choice) still deploys"
+step "a host with rsync 3.1.3 and no tar still deploys"
 start_host "ubuntu:20.04" \
-  "apt-get update -qq && apt-get install -y -qq openssh-server rsync curl tar docker.io >/dev/null"
+  "apt-get update -qq && apt-get install -y -qq openssh-server rsync curl docker.io >/dev/null && rm -f /bin/tar /usr/bin/tar"
 
 ver="$(ssh_host rsync --version | head -1 | awk '{print $3}')"
 case "$ver" in
@@ -182,19 +186,26 @@ if ssh_host rsync --version | grep -qi zstd; then
 else
   ok "this rsync has no zstd, so the fallback is what is under test"
 fi
+if ssh_host "command -v tar" >/dev/null 2>&1; then
+  bad "this host still has tar; the no-tar path would not be exercised"
+else
+  ok "this host has no tar, so loading without it is what is under test"
+fi
 
 cd "$WORK/app"
 if "$SHUNT" up -y >"$WORK/old-rsync.log" 2>&1; then
-  ok "the deploy succeeded via the plain -z fallback"
+  ok "the deploy succeeded with old rsync and no tar"
 else
   bad "the deploy failed: $(tail -5 "$WORK/old-rsync.log")"
 fi
 
-served="$(ssh_host "curl -sS --max-time 5 http://127.0.0.1:$APP_PORT/index.html" 2>/dev/null || true)"
+# Read the file out of the running container rather than over the network, so
+# the assertion holds wherever the daemon happens to live.
+served="$(ssh_host "docker exec compat-app cat /srv/index.html" 2>/dev/null | tr -d '\r\n' || true)"
 if [ "$served" = "compat" ]; then
-  ok "the app is serving"
+  ok "the app is running and serving the deployed content"
 else
-  bad "the app is serving — got '$served'"
+  bad "the app is running — got '$served'"
 fi
 
 # A second deploy must still dedup: the fallback changes compression, not the

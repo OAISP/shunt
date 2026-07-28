@@ -432,3 +432,41 @@ func TestArtifactAction(t *testing.T) {
 		t.Errorf("differing artifact Action = %q, want replace", got)
 	}
 }
+
+// Settings that belong to the release rather than to a service change how every
+// container is created but appear in no service diff. Switching secrets from
+// environment to files silently did nothing until something else forced a
+// deploy — the same shape of bug stages had.
+func TestReleaseWideSettingChangesCountAsWork(t *testing.T) {
+	old := &release.Spec{Network: "demo-net"}
+	nw := &release.Spec{Network: "demo-net", SecretMode: "file"}
+
+	p := &Plan{
+		Current: &release.Entry{ID: "r1", Status: release.StatusActive},
+		Release: diffRelease(old, nw),
+	}
+	if len(p.Release) != 1 || !strings.Contains(p.Release[0], "secret delivery") {
+		t.Fatalf("Release = %v, want the secret mode change", p.Release)
+	}
+	if !p.Changed() {
+		t.Fatal("switching secret delivery was not treated as work")
+	}
+}
+
+func TestRenamingTheNetworkCountsAsWork(t *testing.T) {
+	got := diffRelease(&release.Spec{Network: "old-net"}, &release.Spec{Network: "new-net"})
+	if len(got) != 1 || !strings.Contains(got[0], "network") {
+		t.Fatalf("diffRelease = %v, want the network change", got)
+	}
+}
+
+func TestUnchangedReleaseSettingsAreNotWork(t *testing.T) {
+	same := &release.Spec{Network: "demo-net", SecretMode: "file"}
+	if got := diffRelease(same, same); len(got) != 0 {
+		t.Fatalf("diffRelease = %v, want none", got)
+	}
+	// A first deploy has nothing to compare against.
+	if got := diffRelease(nil, same); len(got) != 0 {
+		t.Fatalf("diffRelease against no previous release = %v, want none", got)
+	}
+}
