@@ -88,6 +88,21 @@ func cmdUp(ctx context.Context, args []string) error {
 		}
 	}
 
+	// Taken before the transfer, not just around the container swap. Two deploys
+	// otherwise rsync into the same store with --delete and stage artifacts over
+	// each other long before either helper reaches its own lock.
+	lock, err := b.engine.AcquireLock(ctx, func(msg string) {
+		fmt.Fprintf(os.Stderr, "  %s\n", c.err().Dim(msg))
+	})
+	if err != nil {
+		return err
+	}
+	defer lock.Release()
+
+	// Another deploy may have landed while we waited for the lock, so the plan's
+	// premise is re-stated for the helper to check under its own lock.
+	b.spec.ExpectedCurrent = b.state.ExpectedCurrent()
+
 	if err := ship(ctx, b, &c); err != nil {
 		return err
 	}

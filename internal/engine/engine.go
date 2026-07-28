@@ -117,10 +117,13 @@ func (e *Engine) Build(ctx context.Context, id string, o BuildOptions) (map[stri
 	if o.Verbose {
 		logSink, progress = os.Stderr, "auto"
 	}
-	cacheDir, err := e.cacheDir()
+	cacheDir, err := e.cacheDir(id)
 	if err != nil {
 		return nil, err
 	}
+	// Old export directories are dropped here rather than at the end, so a run
+	// that fails partway still tidies up after its predecessors.
+	e.pruneCacheDirs(3)
 	for _, name := range sortedKeys(e.M.Images) {
 		img := e.M.Images[name]
 		args, err := secrets.InterpolateMap(img.Args)
@@ -612,13 +615,49 @@ func (e *Engine) Logs(ctx context.Context, service string, follow bool, tail str
 func (e *Engine) HelperPath() string { return e.helperPath }
 func (e *Engine) Facts() sshx.Facts  { return e.facts }
 
-func (e *Engine) cacheDir() (string, error) {
+// cacheDir is where this release's OCI layouts are exported.
+//
+// Scoped by release id because two deploys of the same project on one machine
+// otherwise share it, and Build starts by deleting the directory — so one
+// process wipes the layout another is still exporting into, and buildx fails
+// with a rename error naming a blob that vanished underneath it. The layout is
+// re-exported from scratch on every build regardless, so a per-release
+// directory costs nothing beyond the name.
+func (e *Engine) cacheDir(releaseID string) (string, error) {
 	base, err := os.UserCacheDir()
 	if err != nil {
 		base = filepath.Join(os.TempDir(), "shunt-cache")
 	}
-	d := filepath.Join(base, "shunt", e.M.Project)
+	d := filepath.Join(base, "shunt", e.M.Project, releaseID)
 	return d, os.MkdirAll(d, 0o755)
+}
+
+// pruneCacheDirs keeps the most recent export directories and drops the rest.
+//
+// A few are kept rather than one, so a concurrent deploy's layout is never
+// deleted out from under it while it is still transferring.
+func (e *Engine) pruneCacheDirs(keep int) {
+	base, err := os.UserCacheDir()
+	if err != nil {
+		base = filepath.Join(os.TempDir(), "shunt-cache")
+	}
+	root := filepath.Join(base, "shunt", e.M.Project)
+	ents, err := os.ReadDir(root)
+	if err != nil {
+		return
+	}
+	var dirs []string
+	for _, d := range ents {
+		if d.IsDir() {
+			dirs = append(dirs, d.Name())
+		}
+	}
+	// Release ids sort lexically by time.
+	slices.Sort(dirs)
+	slices.Reverse(dirs)
+	for i := keep; i < len(dirs); i++ {
+		os.RemoveAll(filepath.Join(root, dirs[i]))
+	}
 }
 
 func sortedKeys[T any](m map[string]T) []string {

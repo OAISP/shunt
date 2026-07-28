@@ -114,6 +114,33 @@ func (c *Client) Stream(ctx context.Context, in io.Reader, out, errw io.Writer, 
 	return cmd.Run()
 }
 
+// StartSession launches a long-running remote command and hands back its stdin
+// and stdout without waiting for it.
+//
+// This is what lets the CLI hold a lock on the host for the duration of a
+// deploy: the remote process lives as long as the session, and the kernel
+// releases whatever it held the moment the session ends — including when the
+// network drops or the CLI is killed. Callers own the returned Cmd.
+func (c *Client) StartSession(ctx context.Context, argv ...string) (*exec.Cmd, io.WriteCloser, io.Reader, error) {
+	args := append(c.baseArgs(), c.Host, "--")
+	args = append(args, quoteAll(argv)...)
+	cmd := exec.CommandContext(ctx, "ssh", args...)
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		return nil, nil, nil, err
+	}
+	return cmd, stdin, stdout, nil
+}
+
 // Upload copies a local file to the host with the given mode, via a single
 // `cat > file` over the multiplexed connection. Used for the helper binary and
 // nothing else; bulk data goes through rsync.

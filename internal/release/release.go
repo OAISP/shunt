@@ -52,6 +52,13 @@ type Spec struct {
 	// Secrets are applied to every service and stage via an --env-file written
 	// 0600 on the host. Values never appear in argv or in `docker inspect`.
 	Secrets map[string]string `json:"secrets,omitempty"`
+
+	// ExpectedCurrent is the release the host was serving when this plan was
+	// built. The helper refuses to apply a spec whose assumption no longer
+	// holds, so a plan computed against one state cannot be applied to another.
+	// Empty means "no expectation" — a first deploy, or a caller that did not
+	// read the host first.
+	ExpectedCurrent string `json:"expected_current,omitempty"`
 }
 
 type ImageRef struct {

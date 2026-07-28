@@ -33,6 +33,15 @@ func apply(spec *release.Spec) error {
 	if err := ensureSalt(ledger); err != nil {
 		return err
 	}
+	// Checked under the lock, against the state the plan was computed from. The
+	// build can take minutes, so the host may have moved on between planning and
+	// applying — and applying a plan whose premise has expired is how one deploy
+	// silently reverts another.
+	if spec.ExpectedCurrent != "" && ledger.Current != "" && spec.ExpectedCurrent != ledger.Current {
+		return fmt.Errorf("this plan was built when %s was serving, but %s is serving now — "+
+			"another deploy or rollback landed in between\n  rerun `shunt up` to plan against the current state",
+			spec.ExpectedCurrent, ledger.Current)
+	}
 	entry := release.Entry{
 		ID:        spec.ID,
 		Status:    release.StatusFailed, // pessimistic until proven otherwise
