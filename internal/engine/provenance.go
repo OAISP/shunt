@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"context"
 	"os"
 	"os/exec"
 	"os/user"
@@ -66,5 +65,3 @@ func shortSHA(sha string) string {
 func (e *Engine) WithProvenance(spec *release.Spec, cliVersion string) {
 	spec.Provenance = collectProvenance(e.M, cliVersion)
 }
-
-var _ = context.Background

@@ -36,9 +36,33 @@ ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; pass=$((pass + 1)); }
 bad()  { printf '  \033[31m✗\033[0m %s\n' "$1"; fail=$((fail + 1)); }
 step() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 
-check() { # check <description> <condition-command...>
+# Assertions are written as if/else rather than `A && B || C`: that idiom runs
+# C when B fails, not only when A does, which in a test harness means a silent
+# double-report rather than the result you asked for.
+succeeds() { # succeeds <description> <command...>
   local desc="$1"; shift
   if "$@" >/dev/null 2>&1; then ok "$desc"; else bad "$desc"; fi
+}
+
+fails() { # fails <description> <command...>
+  local desc="$1"; shift
+  if "$@" >/dev/null 2>&1; then bad "$desc"; else ok "$desc"; fi
+}
+
+eq() { # eq <description> <got> <want>
+  if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 — got '$2', want '$3'"; fi
+}
+
+neq() { # neq <description> <got> <unwanted>
+  if [ "$2" != "$3" ]; then ok "$1"; else bad "$1 — got '$2', wanted anything else"; fi
+}
+
+# exits <description> <expected-code> <command...>
+exits() {
+  local desc="$1" want="$2"; shift 2
+  local got=0
+  "$@" >/dev/null 2>&1 || got=$?
+  eq "$desc" "$got" "$want"
 }
 
 # ---------------------------------------------------------------- fixture ----
@@ -77,43 +101,34 @@ current() { "$SHUNT" status --json </dev/null 2>/dev/null | grep -o '"current":"
 
 # ------------------------------------------------------------- offline ----
 step "offline checks"
-check "validate accepts a good manifest" "$SHUNT" validate
-check "audit reports the host is deployable" "$SHUNT" audit
+succeeds "validate accepts a good manifest" "$SHUNT" validate
+succeeds "audit reports the host is deployable" "$SHUNT" audit
 
 # ------------------------------------------------------------- first deploy --
 step "first deploy"
 "$SHUNT" up -y </dev/null
-[ "$(served)" = "v1" ] && ok "the app serves v1" || bad "the app serves v1"
+eq "the app serves v1" "$(served)" "v1"
 R1="$(current)"
-[ -n "$R1" ] && ok "a release was recorded" || bad "a release was recorded"
+neq "a release was recorded" "$R1" ""
 
 # ------------------------------------------------------------------- no-op ---
 step "no-op"
 # plan exits 2 when there are changes, 0 when there are none.
-set +e
-"$SHUNT" plan </dev/null >/dev/null 2>&1; code=$?
-set -e
-[ "$code" -eq 0 ] && ok "plan exits 0 when the host already matches" \
-                  || bad "plan exits 0 when the host already matches (got $code)"
+exits "plan exits 0 when the host already matches" 0 "$SHUNT" plan
 
 # --json must not redeploy when nothing changed.
-"$SHUNT" up -y --json </dev/null >/dev/null 2>&1
-[ "$(current)" = "$R1" ] && ok "up --json does not redeploy a no-op" \
-                         || bad "up --json does not redeploy a no-op"
+"$SHUNT" up -y --json </dev/null >/dev/null 2>&1 || true
+eq "up --json does not redeploy a no-op" "$(current)" "$R1"
 
 # ------------------------------------------------------------ code change ----
 step "code change"
 echo "v2" > index.html
 "$SHUNT" up -y </dev/null >/dev/null
-[ "$(served)" = "v2" ] && ok "the app serves v2" || bad "the app serves v2"
+eq "the app serves v2" "$(served)" "v2"
 R2="$(current)"
-[ "$R2" != "$R1" ] && ok "a new release was recorded" || bad "a new release was recorded"
+neq "a new release was recorded" "$R2" "$R1"
 
-set +e
-"$SHUNT" plan </dev/null >/dev/null 2>&1; code=$?
-set -e
-[ "$code" -eq 0 ] && ok "plan is clean again after deploying" \
-                  || bad "plan is clean again after deploying (got $code)"
+exits "plan is clean again after deploying" 0 "$SHUNT" plan
 
 # ------------------------------------------------------------ failed stage ---
 # The safety invariant of the whole tool: a stage that fails must leave the
@@ -129,48 +144,53 @@ command = ["sh", "-c", "exit 1"]
 EOF
 echo "v3-must-not-be-served" > index.html
 
-set +e
-"$SHUNT" up -y </dev/null >/dev/null 2>&1; code=$?
-set -e
-[ "$code" -ne 0 ] && ok "the deploy failed" || bad "the deploy failed"
-[ "$(served)" = "v2" ] && ok "the old release is still serving" || bad "the old release is still serving"
-[ "$(current)" = "$R2" ] && ok "the serving release did not move" || bad "the serving release did not move"
+fails "the deploy failed" "$SHUNT" up -y
+eq "the old release is still serving" "$(served)" "v2"
+eq "the serving release did not move" "$(current)" "$R2"
 
-"$SHUNT" status </dev/null 2>&1 | grep -q "last attempt" \
-  && ok "status reports the failed attempt separately" \
-  || bad "status reports the failed attempt separately"
+if "$SHUNT" status </dev/null 2>&1 | grep -q "last attempt"; then
+  ok "status reports the failed attempt separately"
+else
+  bad "status reports the failed attempt separately"
+fi
 
 mv shunt.toml.bak shunt.toml
 echo "v3" > index.html
 "$SHUNT" up -y </dev/null >/dev/null
 R3="$(current)"
+neq "the host recovers once the stage is fixed" "$R3" "$R2"
+eq "the recovered release serves v3" "$(served)" "v3"
 
 # --------------------------------------------------------------- rollback ----
 step "rollback"
 "$SHUNT" rollback "$R2" -y </dev/null >/dev/null
-[ "$(served)" = "v2" ] && ok "rollback restored v2" || bad "rollback restored v2"
-[ "$(current)" = "$R2" ] && ok "the ledger points at the restored release" \
-                         || bad "the ledger points at the restored release"
+eq "rollback restored v2" "$(served)" "v2"
+eq "the ledger points at the restored release" "$(current)" "$R2"
 
 # ------------------------------------------------------------------- drift ---
 # A plan built from the ledger alone would call this "unchanged".
 step "drift detection"
-ssh -o BatchMode=yes "$HOST" "docker rm -f $PROJECT-worker" >/dev/null 2>&1
-set +e
-"$SHUNT" plan </dev/null >/dev/null 2>&1; code=$?
-set -e
-[ "$code" -eq 2 ] && ok "a hand-deleted container is reported as work" \
-                  || bad "a hand-deleted container is reported as work (got $code)"
+ssh -o BatchMode=yes "$HOST" "docker rm -f $PROJECT-worker" >/dev/null 2>&1 || true
+exits "a hand-deleted container is reported as work" 2 "$SHUNT" plan
 "$SHUNT" up -y </dev/null >/dev/null
-ssh -o BatchMode=yes "$HOST" "docker ps --filter name=$PROJECT-worker --format '{{.Names}}'" | grep -q worker \
-  && ok "the missing container was restored" || bad "the missing container was restored"
+if ssh -o BatchMode=yes "$HOST" "docker ps --filter name=$PROJECT-worker --format '{{.Names}}'" | grep -q worker; then
+  ok "the missing container was restored"
+else
+  bad "the missing container was restored"
+fi
 
 # ------------------------------------------------------------------ exec -----
 step "exec and logs"
-"$SHUNT" exec app -- cat /srv/index.html </dev/null 2>/dev/null | grep -q . \
-  && ok "exec runs in the serving container" || bad "exec runs in the serving container"
-"$SHUNT" logs --tail 5 </dev/null 2>/dev/null | grep -q "worker" \
-  && ok "logs cover every service, prefixed" || bad "logs cover every service, prefixed"
+if "$SHUNT" exec app -- cat /srv/index.html </dev/null 2>/dev/null | grep -q .; then
+  ok "exec runs in the serving container"
+else
+  bad "exec runs in the serving container"
+fi
+if "$SHUNT" logs --tail 5 </dev/null 2>/dev/null | grep -q "worker"; then
+  ok "logs cover every service, prefixed"
+else
+  bad "logs cover every service, prefixed"
+fi
 
 # ----------------------------------------------------------------- retire ----
 step "retire"
@@ -181,14 +201,17 @@ s = p.read_text()
 s = s.split("[services.worker]")[0]
 p.write_text(s)
 PY
-set +e
-"$SHUNT" plan </dev/null 2>&1 | grep -q "orphaned"; orph=$?
-set -e
-[ "$orph" -eq 0 ] && ok "a dropped service is reported as orphaned" \
-                  || bad "a dropped service is reported as orphaned"
+if "$SHUNT" plan </dev/null 2>&1 | grep -q "orphaned"; then
+  ok "a dropped service is reported as orphaned"
+else
+  bad "a dropped service is reported as orphaned"
+fi
 "$SHUNT" retire worker -y </dev/null >/dev/null
-ssh -o BatchMode=yes "$HOST" "docker ps -aq --filter name=$PROJECT-worker" | grep -q . \
-  && bad "retire removed the orphan" || ok "retire removed the orphan"
+if ssh -o BatchMode=yes "$HOST" "docker ps -aq --filter name=$PROJECT-worker" | grep -q .; then
+  bad "retire removed the orphan"
+else
+  ok "retire removed the orphan"
+fi
 
 # ----------------------------------------------------------------- summary ---
 printf '\n\033[1m%d passed, %d failed\033[0m\n\n' "$pass" "$fail"
