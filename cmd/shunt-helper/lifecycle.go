@@ -207,7 +207,18 @@ func cmdBoot(in io.Reader, args []string) error {
 // data that stages or artifacts already changed is not reverted, and pretending
 // otherwise is how a "helpful" rollback loses a database.
 func autoRollback(spec *release.Spec, ledger *release.Ledger) error {
-	target := ledger.Previous()
+	// The release to restore is the one that was *serving* when this deploy
+	// started — which is still ledger.Current, because the failing attempt is
+	// only appended to the ledger afterwards.
+	//
+	// Not Previous(): that answers "the release before the one serving", which is
+	// what `shunt rollback` wants and is one step too far here. Getting this
+	// wrong restores a release older than the one the operator was running,
+	// silently reverting work that had nothing to do with the failure.
+	target := ledger.Find(ledger.Current)
+	if target == nil || !target.Healthy() {
+		target = ledger.Previous()
+	}
 	if target == nil {
 		return errors.New("no previous successful release to restore")
 	}

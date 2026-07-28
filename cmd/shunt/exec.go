@@ -107,13 +107,24 @@ func resolveContainer(ctx context.Context, e *engine.Engine, service string) (st
 	if err != nil {
 		return "", err
 	}
+	name, err := pickContainer(state, service)
+	if err != nil {
+		return "", fmt.Errorf("%w on %s%s", err, e.M.Host, knownServices(e))
+	}
+	return name, nil
+}
+
+// pickContainer chooses which of a service's containers to attach to.
+//
+// Split out from the host round trip so it is testable, and because the choice
+// matters: during a blue/green overlap two containers carry the same service
+// label, and attaching to the one being retired would show an operator the code
+// they are in the middle of replacing.
+func pickContainer(state *engine.RemoteState, service string) (string, error) {
 	found := state.ServiceContainers(service)
 	if len(found) == 0 {
-		known := knownServices(e)
-		return "", fmt.Errorf("no container on %s for service %q%s", e.M.Host, service, known)
+		return "", fmt.Errorf("no container for service %q", service)
 	}
-	// During a blue/green overlap two containers can match; prefer the one from
-	// the active release, then any running one.
 	if state.Ledger != nil {
 		for _, ct := range found {
 			if ct.Release == state.Ledger.Current && ct.Running() {
@@ -126,7 +137,7 @@ func resolveContainer(ctx context.Context, e *engine.Engine, service string) (st
 			return ct.Name, nil
 		}
 	}
-	return "", fmt.Errorf("no running container for %q on %s (found %d stopped)", service, e.M.Host, len(found))
+	return "", fmt.Errorf("no running container for %q (%d stopped)", service, len(found))
 }
 
 func knownServices(e *engine.Engine) string {

@@ -280,3 +280,67 @@ func TestDependedOnIgnoresAccessories(t *testing.T) {
 		t.Error("nothing requires web or worker")
 	}
 }
+
+// Auto-rollback restores the release that was *serving*, which is still
+// ledger.Current when it runs — the failing attempt is appended afterwards.
+//
+// Using Previous() here, as `shunt rollback` correctly does, goes one step too
+// far and silently reverts a release the operator was happily running. Caught
+// by deploying for real; the unit test would have shared the wrong assumption.
+func TestAutoRollbackRestoresTheReleaseThatWasServing(t *testing.T) {
+	f := newFake().on("ps -aq --filter name=", "cid\n", nil)
+	withFake(t, f)
+
+	serving := &release.Spec{
+		ID: "r2", Project: "demo", Network: "demo-net",
+		Images:   map[string]release.ImageRef{"app": {Ref: "shunt/demo-app:r2"}},
+		Services: map[string]release.Service{"app": {Image: "app", Restart: "always"}},
+		Order:    []string{"app"},
+	}
+	ledger := &release.Ledger{
+		Project: "demo",
+		Current: "r2",
+		Releases: []release.Entry{
+			{ID: "r1", Status: release.StatusSuperseded, Spec: &release.Spec{ID: "r1"},
+				Images: map[string]release.ImageRef{"app": {Ref: "shunt/demo-app:r1"}}},
+			{ID: "r2", Status: release.StatusActive, Spec: serving,
+				Images: map[string]release.ImageRef{"app": {Ref: "shunt/demo-app:r2"}}},
+		},
+	}
+
+	failing := &release.Spec{ID: "r3", Project: "demo", Network: "demo-net"}
+	if err := autoRollback(failing, ledger); err != nil {
+		t.Fatal(err)
+	}
+	if ledger.Current != "r2" {
+		t.Fatalf("restored %q, want r2 — the release that was serving, not the one before it", ledger.Current)
+	}
+	if !f.did("--name demo-app", "shunt/demo-app:r2") {
+		t.Fatalf("r2's image was not the one started; calls:\n%s", strings.Join(f.calls, "\n"))
+	}
+}
+
+// When the serving release is itself unusable — a degraded host being retried —
+// fall back to the last one that was healthy.
+func TestAutoRollbackFallsBackWhenCurrentIsNotHealthy(t *testing.T) {
+	withFake(t, newFake().on("ps -aq --filter name=", "cid\n", nil))
+
+	ledger := &release.Ledger{
+		Project: "demo",
+		Current: "r2",
+		Releases: []release.Entry{
+			{ID: "r1", Status: release.StatusSuperseded,
+				Spec:   &release.Spec{ID: "r1", Project: "demo", Services: map[string]release.Service{}},
+				Images: map[string]release.ImageRef{"app": {Ref: "shunt/demo-app:r1"}}},
+			{ID: "r2", Status: release.StatusDegraded,
+				Spec:   &release.Spec{ID: "r2", Project: "demo", Services: map[string]release.Service{}},
+				Images: map[string]release.ImageRef{"app": {Ref: "shunt/demo-app:r2"}}},
+		},
+	}
+	if err := autoRollback(&release.Spec{ID: "r3", Project: "demo"}, ledger); err != nil {
+		t.Fatal(err)
+	}
+	if ledger.Current != "r1" {
+		t.Fatalf("restored %q, want r1 — r2 was degraded and is not a safe target", ledger.Current)
+	}
+}

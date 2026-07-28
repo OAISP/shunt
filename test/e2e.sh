@@ -192,6 +192,38 @@ else
   bad "logs cover every service, prefixed"
 fi
 
+# ------------------------------------------------------- rollback on failure --
+# A deploy that fails *after* replacing a container leaves the host running a
+# mix. Opt-in recovery has to actually put the previous release back.
+step "up --rollback-on-failure restores the previous release"
+BEFORE="$(current)"
+cp shunt.toml shunt.toml.bak
+# Deployable but unhealthy: it stays up, so this is not an "exited during
+# startup" shortcut, and nothing listens on the exposed port, so the health
+# probe genuinely fails — after `app` has already been swapped, which is what
+# makes the host degraded and gives the rollback something to undo.
+cat >> shunt.toml <<'TOML'
+
+[services.broken]
+image   = "app"
+command = ["sh", "-c", "while true; do sleep 5; done"]
+expose  = 9999
+
+[services.broken.health]
+url      = "/"
+retries  = 2
+interval = "200ms"
+TOML
+echo "v4-should-be-rolled-back" > index.html
+
+fails "the deploy failed" "$SHUNT" up -y --rollback-on-failure
+eq "the previous release is serving again" "$(current)" "$BEFORE"
+eq "it serves the previous content" "$(served)" "v3"
+
+mv shunt.toml.bak shunt.toml
+echo "v3" > index.html
+"$SHUNT" up -y </dev/null >/dev/null 2>&1 || true
+
 # ----------------------------------------------------------------- retire ----
 step "retire"
 python3 - <<'PY'

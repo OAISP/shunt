@@ -206,7 +206,9 @@ image   = "app"             # same image, different command
 command = ["npm", "run", "worker"]
 ```
 
-`requires = ["other"]` orders startup when it matters.
+`requires = ["other"]` orders startup when it matters, and waits: a service that
+something else requires is health-checked before its dependents start, so
+`requires` is a readiness edge rather than only an ordering one.
 
 ### Secret values
 
@@ -474,6 +476,39 @@ Measured through Traefik, hammering the app throughout a deploy:
 | blue/green, app ignores SIGTERM | 4031 | 3 |
 | blue/green, graceful SIGTERM | 4018 | 2 |
 | blue/green, graceful + retry | 4130 | **0** |
+
+### When the proxy cannot gate readiness
+
+A proxied service is put into rotation by the proxy, not by shunt, so the proxy
+needs something it can poll to know the new container is ready. shunt emits an
+active health check — for Traefik and for caddy — whenever the health block
+gives it a path to poll, including an absolute url, from which it takes the path.
+
+A **command** health check cannot be expressed to either proxy. Such a service
+still overlaps, and `retry` still covers a backend that is not listening yet,
+but nothing covers one that is listening and still warming up. `shunt plan` says
+so on the affected service rather than leaving it implicit:
+
+```
+~ app            blue/green  (starts alongside; proxy cannot poll this health check)
+```
+
+Give the service a `url` health check to close that gap.
+
+### Recovering from a partial failure
+
+A deploy that fails *after* replacing a container leaves the host running a mix
+of releases. `shunt status` reports that as `degraded` and prints the recovery
+command. To have it recovered for you:
+
+```sh
+shunt up --rollback-on-failure
+```
+
+It restores the release that was serving, inside the same operation and under
+the same lock, so nothing can land in between. Opt-in on purpose: it is right
+for a stateless app and wrong for a release whose stages already migrated a
+database — the code would go back and the schema would not.
 
 ### What your app has to do
 
