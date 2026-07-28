@@ -170,10 +170,26 @@ func promote(spec *release.Spec, a release.Artifact) (promotion, error) {
 		switch {
 		case a.Dir:
 			// A directory cannot be hard-linked, and rename refuses to replace a
-			// non-empty one — so the old tree has to move aside first. That leaves
-			// a window, one rename syscall wide, in which the destination does not
-			// exist. Unavoidable without symlinking the destination, which would
-			// change what `volumes = [...]` mounts.
+			// non-empty one. RENAME_EXCHANGE swaps the two entries in one atomic
+			// step: afterwards the destination holds the new tree and the staged
+			// path holds the old one, with no moment in between where the
+			// destination is absent. Renaming the old tree aside first — the only
+			// other option — leaves exactly that window, and an app that opens a
+			// path inside it gets ENOENT.
+			if err := renameExchange(a.Staged, a.Dest); err == nil {
+				// The staged path now holds the previous tree; keep it as the backup.
+				if err := os.Rename(a.Staged, prev); err != nil {
+					return p, fmt.Errorf("keeping the previous copy: %w", err)
+				}
+				p.prev = prev
+				info(fmt.Sprintf("previous %s kept as %s", filepath.Base(a.Dest), filepath.Base(prev)))
+				return p, nil
+			}
+			// Pre-3.15 kernel, or a filesystem without renameat2. Fall back to
+			// moving the old tree aside, and say that the guarantee is weaker here
+			// rather than quietly offering less than the docs promise.
+			info(fmt.Sprintf("%s: this filesystem cannot swap directories atomically; %s is briefly absent during the swap",
+				a.Name, a.Dest))
 			if err := os.Rename(a.Dest, prev); err != nil {
 				return p, fmt.Errorf("keeping the previous copy: %w", err)
 			}

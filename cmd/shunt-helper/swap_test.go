@@ -2,6 +2,8 @@ package main
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -342,5 +344,72 @@ func TestAutoRollbackFallsBackWhenCurrentIsNotHealthy(t *testing.T) {
 	}
 	if ledger.Current != "r1" {
 		t.Fatalf("restored %q, want r1 — r2 was degraded and is not a safe target", ledger.Current)
+	}
+}
+
+// A directory artifact must never leave its destination absent, even for the
+// instant between two renames — an app that opens the path in that window gets
+// ENOENT. RENAME_EXCHANGE closes it.
+func TestRenameExchangeSwapsTwoDirectoriesAtomically(t *testing.T) {
+	dir := t.TempDir()
+	a := filepath.Join(dir, "live")
+	b := filepath.Join(dir, "staged")
+	for path, content := range map[string]string{a: "old", b: "new"} {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "marker"), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := renameExchange(b, a); err != nil {
+		t.Skipf("this filesystem does not support RENAME_EXCHANGE: %v", err)
+	}
+	if got := readFile(t, filepath.Join(a, "marker")); got != "new" {
+		t.Fatalf("live = %q, want the new tree", got)
+	}
+	if got := readFile(t, filepath.Join(b, "marker")); got != "old" {
+		t.Fatalf("staged = %q, want the old tree", got)
+	}
+}
+
+// Swapping against a path that does not exist has to fail rather than create
+// something, so the caller falls back to the plain rename.
+func TestRenameExchangeFailsWhenAPathIsMissing(t *testing.T) {
+	dir := t.TempDir()
+	present := filepath.Join(dir, "here")
+	if err := os.MkdirAll(present, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := renameExchange(present, filepath.Join(dir, "absent")); err == nil {
+		t.Fatal("renameExchange succeeded against a missing path")
+	}
+}
+
+// The whole-swap behaviour, through promote: the destination ends up holding
+// the new tree and the backup holds the old one.
+func TestPromoteSwapsADirectoryAndKeepsTheOld(t *testing.T) {
+	dir := t.TempDir()
+	a := dirArtifact(t, dir, "weights", map[string]string{"model.bin": "new-weights"})
+	if err := os.MkdirAll(a.Dest, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(a.Dest, "model.bin"), []byte("old-weights"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p, err := promote(&release.Spec{ID: testRelease}, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, filepath.Join(a.Dest, "model.bin")); got != "new-weights" {
+		t.Fatalf("dest = %q, want the new tree", got)
+	}
+	if p.prev == "" {
+		t.Fatal("no backup was recorded")
+	}
+	if got := readFile(t, filepath.Join(p.prev, "model.bin")); got != "old-weights" {
+		t.Fatalf("backup = %q, want the old tree", got)
 	}
 }

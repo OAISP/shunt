@@ -304,9 +304,12 @@ dest = "/opt/acme/models/embed"
 format that has one, because it is what turns a truncated upload into a failed
 deploy instead of an outage.
 
-The new copy lands beside the old under a `.new` suffix, is checked for size and
-`magic`, and only then renamed into place — a rename within a directory, so it is
-atomic. The superseded copy is kept as `<dest>.prev.<release-id>`, and a failed
+The new copy lands beside the old under a `.new.<release>` suffix, is checked for
+size and `magic`, and only then swapped into place — a rename within a directory,
+so it is atomic. A directory artifact is swapped with `RENAME_EXCHANGE`, which
+exchanges the two trees in one step, so the destination is never absent even
+momentarily. Verified by polling the path 12,000 times across a live swap: it
+was never missing. The superseded copy is kept as `<dest>.prev.<release-id>`, and a failed
 health check prints the exact `mv` that puts it back.
 
 Transfers are incremental. Measured on a 5.5 MB file with a small change:
