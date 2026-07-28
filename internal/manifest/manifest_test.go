@@ -499,3 +499,127 @@ url = "/health"
 		t.Fatalf("err = %v, want an expose/publish error", err)
 	}
 }
+
+// load parses a manifest from inline TOML, failing the test on error.
+func load(t *testing.T, toml string) *Manifest {
+	t.Helper()
+	m, err := Load(write(t, toml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+// loadErr parses a manifest and returns the error for tests that expect one.
+func loadErr(t *testing.T, toml string) (*Manifest, error) {
+	t.Helper()
+	return Load(write(t, toml))
+}
+
+// A target changes where a release goes, never what it contains.
+func TestSelectTargetSwitchesHostAndNamespacesTheProject(t *testing.T) {
+	m := load(t, `
+project = "acme"
+host    = "prod@example.com"
+
+[images.app]
+context = "."
+
+[services.app]
+image = "app"
+
+[targets.staging]
+host = "staging@example.com"
+`)
+	if err := m.SelectTarget("staging"); err != nil {
+		t.Fatal(err)
+	}
+	if m.Host != "staging@example.com" {
+		t.Errorf("Host = %q, want the target's host", m.Host)
+	}
+	// Namespaced by default: staging and production sharing a host must not
+	// collide on container names, networks or the ledger.
+	if m.Project != "acme-staging" {
+		t.Errorf("Project = %q, want acme-staging", m.Project)
+	}
+	if m.Network != "acme-staging-net" {
+		t.Errorf("Network = %q, want it re-derived from the target project", m.Network)
+	}
+	// What gets deployed is untouched.
+	if len(m.Services) != 1 || m.Services["app"].Image != "app" {
+		t.Errorf("selecting a target changed the services: %+v", m.Services)
+	}
+}
+
+func TestSelectTargetHonoursAnExplicitProject(t *testing.T) {
+	m := load(t, `
+project = "acme"
+host    = "prod@example.com"
+[images.app]
+context = "."
+[services.app]
+image = "app"
+[targets.staging]
+host    = "staging@example.com"
+project = "acme-stg"
+`)
+	if err := m.SelectTarget("staging"); err != nil {
+		t.Fatal(err)
+	}
+	if m.Project != "acme-stg" || m.Network != "acme-stg-net" {
+		t.Errorf("project/network = %q/%q, want acme-stg/acme-stg-net", m.Project, m.Network)
+	}
+}
+
+func TestSelectTargetRejectsAnUnknownName(t *testing.T) {
+	m := load(t, `
+project = "acme"
+host    = "prod@example.com"
+[images.app]
+context = "."
+[services.app]
+image = "app"
+[targets.staging]
+host = "staging@example.com"
+`)
+	err := m.SelectTarget("nope")
+	if err == nil {
+		t.Fatal("SelectTarget accepted an undeclared target")
+	}
+	if !strings.Contains(err.Error(), "staging") {
+		t.Errorf("error should list the declared targets, got: %v", err)
+	}
+}
+
+func TestSelectTargetIsANoOpWhenEmpty(t *testing.T) {
+	m := load(t, `
+project = "acme"
+host    = "prod@example.com"
+[images.app]
+context = "."
+[services.app]
+image = "app"
+`)
+	if err := m.SelectTarget(""); err != nil {
+		t.Fatal(err)
+	}
+	if m.Host != "prod@example.com" || m.Project != "acme" {
+		t.Errorf("empty target changed the manifest: %s / %s", m.Host, m.Project)
+	}
+}
+
+// Listing secrets a service cannot receive is a typo worth catching at load.
+func TestServiceSecretsNeedASecretsBlock(t *testing.T) {
+	_, err := loadErr(t, `
+project = "acme"
+host    = "prod@example.com"
+[images.app]
+context = "."
+[services.app]
+image   = "app"
+secrets = ["DATABASE_URL"]
+`)
+	if err == nil || !strings.Contains(err.Error(), "no [secrets] block") {
+		t.Fatalf("expected a complaint about the missing secrets block, got: %v", err)
+	}
+}

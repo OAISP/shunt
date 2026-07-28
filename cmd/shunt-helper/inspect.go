@@ -261,7 +261,11 @@ func pruneEnvFiles(project string, keepIDs map[string]bool) {
 		if e.IsDir() {
 			continue
 		}
-		if id := strings.TrimSuffix(e.Name(), ".env"); !keepIDs[id] {
+		// A file is either "<id>.env" or, for a service that narrowed its
+		// secrets, "<id>.<scope>.env". The release id is the leading segment in
+		// both, and keying on anything else deletes every scoped file on sight.
+		id, _, _ := strings.Cut(strings.TrimSuffix(e.Name(), ".env"), ".")
+		if !keepIDs[id] {
 			os.Remove(filepath.Join(dir, e.Name()))
 		}
 	}

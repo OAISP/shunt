@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"maps"
 	"os"
@@ -16,11 +18,50 @@ import (
 	"github.com/OAISP/shunt/internal/ui"
 )
 
-// writeEnvFile materialises the resolved secrets plus nothing else, 0600, owned
-// by the deploying user. Containers get it via --env-file, so values never
-// appear in argv or in `docker inspect`.
+// writeEnvFileScoped materialises the release's secrets for a given scope,
+// 0600 and owned by the deploying user.
+//
+// scope names the subset a service asked for; empty means all of them. A
+// separate file per distinct scope is what keeps a worker from holding the
+// payment credentials merely because the web app needs them — docker copies
+// --env-file into the container config, so narrowing it at the file is the
+// only place the narrowing actually takes effect.
+func writeEnvFileScoped(spec *release.Spec, scope []string) (string, error) {
+	if len(scope) == 0 {
+		return writeEnvFile(spec)
+	}
+	sub := *spec
+	sub.Secrets = map[string]string{}
+	var missing []string
+	for _, k := range scope {
+		v, ok := spec.Secrets[k]
+		if !ok {
+			missing = append(missing, k)
+			continue
+		}
+		sub.Secrets[k] = v
+	}
+	if len(missing) > 0 {
+		return "", fmt.Errorf("secrets %s are not provided by this release", strings.Join(missing, ", "))
+	}
+	return writeEnvFileAt(&sub, envScopePath(spec.Project, spec.ID, scope))
+}
+
+// envScopePath names a scoped env-file after a digest of the keys it holds, so
+// two services asking for the same subset share one file and a third asking for
+// a different subset gets its own.
+func envScopePath(project, id string, scope []string) string {
+	keys := append([]string(nil), scope...)
+	sort.Strings(keys)
+	sum := sha256.Sum256([]byte(strings.Join(keys, "\x00")))
+	return filepath.Join(projectDir(project), "env", id+"."+hex.EncodeToString(sum[:])[:8]+".env")
+}
+
 func writeEnvFile(spec *release.Spec) (string, error) {
-	p := envFilePath(spec.Project, spec.ID)
+	return writeEnvFileAt(spec, envFilePath(spec.Project, spec.ID))
+}
+
+func writeEnvFileAt(spec *release.Spec, p string) (string, error) {
 	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return "", err
 	}

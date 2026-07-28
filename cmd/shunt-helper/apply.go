@@ -43,11 +43,12 @@ func apply(spec *release.Spec) error {
 			spec.ExpectedCurrent, ledger.Current)
 	}
 	entry := release.Entry{
-		ID:        spec.ID,
-		Status:    release.StatusFailed, // pessimistic until proven otherwise
-		StartedAt: time.Now().UTC(),
-		Images:    spec.Images,
-		Spec:      redactSecrets(spec, ledger.Salt),
+		ID:         spec.ID,
+		Status:     release.StatusFailed, // pessimistic until proven otherwise
+		StartedAt:  time.Now().UTC(),
+		Images:     spec.Images,
+		Provenance: spec.Provenance,
+		Spec:       redactSecrets(spec, ledger.Salt),
 	}
 
 	// mutated records whether any running container was replaced. It is what

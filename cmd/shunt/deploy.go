@@ -34,13 +34,22 @@ func cmdPlan(ctx context.Context, args []string) error {
 		return err
 	}
 	if c.asJSON {
-		return json.NewEncoder(os.Stdout).Encode(p)
-	}
-	p.Render(os.Stdout, c.out())
-	if p.Changed() {
-		fmt.Println("  run `shunt up` to apply")
+		if err := json.NewEncoder(os.Stdout).Encode(p); err != nil {
+			return err
+		}
 	} else {
-		fmt.Println("  nothing to do — the host already matches this manifest")
+		p.Render(os.Stdout, c.out())
+		if p.Changed() {
+			fmt.Println("  run `shunt up` to apply")
+		} else {
+			fmt.Println("  nothing to do — the host already matches this manifest")
+		}
+	}
+	// Distinct exit codes so CI can branch on "is there anything to deploy"
+	// without parsing prose: 0 means the host already matches, 2 means it does
+	// not. Errors keep 1, so a broken plan is never mistaken for a clean one.
+	if p.Changed() {
+		return errExitChanges
 	}
 	return nil
 }
@@ -102,6 +111,7 @@ func cmdUp(ctx context.Context, args []string) error {
 	// Another deploy may have landed while we waited for the lock, so the plan's
 	// premise is re-stated for the helper to check under its own lock.
 	b.spec.ExpectedCurrent = b.state.ExpectedCurrent()
+	b.engine.WithProvenance(b.spec, version)
 
 	if err := ship(ctx, b, &c); err != nil {
 		return err

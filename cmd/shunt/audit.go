@@ -45,7 +45,7 @@ func cmdAudit(ctx context.Context, args []string) error {
 	var checks []check
 	add := func(ch check) { checks = append(checks, ch) }
 
-	m, manifestErr := loadManifest(c.file)
+	m, manifestErr := loadManifest(c.file, c.target)
 	if manifestErr != nil {
 		add(check{"manifest", statusFail, manifestErr.Error(), "fix shunt.toml, or run `shunt init`"})
 	} else {
@@ -249,7 +249,7 @@ func cmdValidate(_ context.Context, args []string) error {
 	if err := parseArgs(fs, args); err != nil {
 		return err
 	}
-	m, err := loadManifest(c.file)
+	m, err := loadManifest(c.file, c.target)
 	if err != nil {
 		if c.asJSON {
 			json.NewEncoder(os.Stdout).Encode(map[string]any{"valid": false, "error": err.Error()})

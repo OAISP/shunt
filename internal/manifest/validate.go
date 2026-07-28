@@ -50,6 +50,9 @@ func (m *Manifest) Validate() error {
 				add("service %q: requires unknown service or accessory %q", name, dep)
 			}
 		}
+		if len(svc.Secrets) > 0 && m.Secrets == nil {
+			add("service %q: lists secrets but the manifest declares no [secrets] block", name)
+		}
 		if svc.Health != nil && svc.Health.URL == "" && len(svc.Health.Command) == 0 {
 			add("service %q: health block needs either url or command", name)
 		}
@@ -154,6 +157,34 @@ func (m *Manifest) Validate() error {
 			add("secrets: provider is required")
 		default:
 			add("secrets: unknown provider %q (want file, env, or sops)", m.Secrets.Provider)
+		}
+	}
+
+	for name, t := range m.Targets {
+		if !nameRE.MatchString(name) {
+			add("target %q: name must be lowercase alphanumeric with - or _", name)
+		}
+		if t.Host == "" {
+			add("target %q: host is required", name)
+		}
+		if t.Project != "" && !nameRE.MatchString(t.Project) {
+			add("target %q: project %q must be lowercase alphanumeric with - or _", name, t.Project)
+		}
+		if t.Secrets != nil {
+			switch t.Secrets.Provider {
+			case "file", "sops":
+				if t.Secrets.Path == "" {
+					add("target %q: secrets provider %q requires path", name, t.Secrets.Provider)
+				}
+			case "env":
+				if len(t.Secrets.Keys) == 0 {
+					add("target %q: secrets provider \"env\" requires keys", name)
+				}
+			case "":
+				add("target %q: secrets provider is required", name)
+			default:
+				add("target %q: unknown secrets provider %q", name, t.Secrets.Provider)
+			}
 		}
 	}
 

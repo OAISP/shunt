@@ -27,11 +27,17 @@ const protocolVersion = release.Protocol
 // one explanation instead of two.
 var errReported = errors.New("already reported")
 
+// errExitChanges makes `shunt plan` exit 2 when the host does not match the
+// manifest. It is not a failure — it is the answer to the question — but a
+// distinct code lets CI branch on it without parsing output.
+var errExitChanges = errors.New("plan has changes")
+
 // commonFlags are accepted by every command that talks to a host.
 type commonFlags struct {
 	file    string
 	verbose bool
 	asJSON  bool
+	target  string
 }
 
 func newFlagSet(name string, c *commonFlags) *flag.FlagSet {
@@ -41,6 +47,8 @@ func newFlagSet(name string, c *commonFlags) *flag.FlagSet {
 	fs.BoolVar(&c.verbose, "v", false, "verbose output")
 	fs.BoolVar(&c.verbose, "verbose", false, "verbose output")
 	fs.BoolVar(&c.asJSON, "json", false, "machine-readable output")
+	fs.StringVar(&c.target, "t", "", "deploy target from [targets.*]")
+	fs.StringVar(&c.target, "target", "", "deploy target from [targets.*]")
 	return fs
 }
 
@@ -109,8 +117,9 @@ func isBoolFlag(f *flag.Flag) bool {
 	return ok && b.IsBoolFlag()
 }
 
-// loadManifest resolves -f/--file or walks up from the working directory.
-func loadManifest(path string) (*manifest.Manifest, error) {
+// loadManifest resolves -f/--file or walks up from the working directory, then
+// points the manifest at the selected target.
+func loadManifest(path, target string) (*manifest.Manifest, error) {
 	if path == "" {
 		wd, err := os.Getwd()
 		if err != nil {
@@ -120,13 +129,20 @@ func loadManifest(path string) (*manifest.Manifest, error) {
 			return nil, err
 		}
 	}
-	return manifest.Load(path)
+	m, err := manifest.Load(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.SelectTarget(target); err != nil {
+		return nil, err
+	}
+	return m, nil
 }
 
 // connect loads the manifest and opens the host connection, which is what every
 // command except init needs first.
-func connect(ctx context.Context, file string) (*engine.Engine, error) {
-	m, err := loadManifest(file)
+func connect(ctx context.Context, file, target string) (*engine.Engine, error) {
+	m, err := loadManifest(file, target)
 	if err != nil {
 		return nil, err
 	}
@@ -153,7 +169,7 @@ type buildOut struct {
 // prepare connects, builds every image, assembles the release spec and reads the
 // host's current state. Callers own closing the engine on success.
 func prepare(ctx context.Context, c *commonFlags, noCache bool) (*buildOut, error) {
-	e, err := connect(ctx, c.file)
+	e, err := connect(ctx, c.file, c.target)
 	if err != nil {
 		return nil, err
 	}

@@ -563,6 +563,7 @@ func convertServices(in map[string]manifest.Service) (map[string]release.Service
 		}
 		rs := release.Service{
 			Image:    s.Image,
+			Secrets:  s.Secrets,
 			Command:  s.Command,
 			Env:      env,
 			Publish:  s.Publish,

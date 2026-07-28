@@ -53,12 +53,51 @@ type Spec struct {
 	// 0600 on the host. Values never appear in argv or in `docker inspect`.
 	Secrets map[string]string `json:"secrets,omitempty"`
 
+	// Provenance records where this release came from. It is carried on the
+	// spec so the host can store it with the release, which is what lets
+	// `shunt status` answer "which commit is production running" without the
+	// operator holding a mapping in their head.
+	Provenance Provenance `json:"provenance,omitzero"`
+
 	// ExpectedCurrent is the release the host was serving when this plan was
 	// built. The helper refuses to apply a spec whose assumption no longer
 	// holds, so a plan computed against one state cannot be applied to another.
 	// Empty means "no expectation" — a first deploy, or a caller that did not
 	// read the host first.
 	ExpectedCurrent string `json:"expected_current,omitempty"`
+}
+
+// Provenance is the origin of a release: which commit, built by whom, with
+// which shunt. Every field is best-effort — a project deployed from a tarball
+// has no git metadata and must still deploy.
+type Provenance struct {
+	Commit   string `json:"commit,omitempty"`
+	Short    string `json:"short,omitempty"`
+	Branch   string `json:"branch,omitempty"`
+	Dirty    bool   `json:"dirty,omitempty"`
+	CLI      string `json:"cli,omitempty"`
+	Deployer string `json:"deployer,omitempty"`
+}
+
+// Describe renders provenance for a human, or "" when nothing is known.
+func (p Provenance) Describe() string {
+	if p.Short == "" {
+		if p.Deployer == "" {
+			return ""
+		}
+		return "by " + p.Deployer
+	}
+	s := p.Short
+	if p.Branch != "" {
+		s = p.Branch + "@" + s
+	}
+	if p.Dirty {
+		s += " (dirty tree)"
+	}
+	if p.Deployer != "" {
+		s += " by " + p.Deployer
+	}
+	return s
 }
 
 type ImageRef struct {
@@ -83,6 +122,10 @@ type Service struct {
 	Expose int    `json:"expose,omitempty"`
 	Drain  string `json:"drain,omitempty"`
 	Proxy  *Proxy `json:"proxy,omitempty"`
+
+	// Secrets narrows which of the release's secrets this service receives.
+	// Empty means all of them.
+	Secrets []string `json:"secrets,omitempty"`
 }
 
 // Proxy carries what the helper needs to emit discovery labels for an external
@@ -225,6 +268,11 @@ type Entry struct {
 	// Spec is retained so a rollback can re-apply the exact previous release
 	// without needing the manifest that produced it.
 	Spec *Spec `json:"spec,omitempty"`
+
+	// Provenance and the transfer cost are lifted out of the spec so `status`
+	// and the JSON contract can read them without unpacking a whole release.
+	Provenance Provenance `json:"provenance,omitzero"`
+	Bytes      int64      `json:"bytes,omitempty"`
 }
 
 // HashSecret is the one-way form a secret value takes once it is written to the

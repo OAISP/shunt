@@ -21,7 +21,7 @@ func cmdStatus(ctx context.Context, args []string) error {
 	if err := parseArgs(fs, args); err != nil {
 		return err
 	}
-	e, err := connect(ctx, c.file)
+	e, err := connect(ctx, c.file, c.target)
 	if err != nil {
 		return err
 	}
@@ -62,6 +62,9 @@ func printCurrent(l *release.Ledger, s ui.Style) {
 	}
 	fmt.Printf("  %s %s  %s\n", mark, cur.Status,
 		s.Dim(cur.FinishedAt.Local().Format("2006-01-02 15:04:05")))
+	if prov := cur.Provenance.Describe(); prov != "" {
+		fmt.Printf("  %s %s\n", s.Dim("from    "), prov)
+	}
 	if cur.Error != "" {
 		fmt.Printf("  %s\n", s.Red(ui.FirstLine(cur.Error)))
 	}
@@ -135,7 +138,7 @@ func cmdLogs(ctx context.Context, args []string) error {
 	if err := parseArgs(fs, args); err != nil {
 		return err
 	}
-	e, err := connect(ctx, c.file)
+	e, err := connect(ctx, c.file, c.target)
 	if err != nil {
 		return err
 	}
@@ -149,7 +152,7 @@ func cmdPrune(ctx context.Context, args []string) error {
 	if err := parseArgs(fs, args); err != nil {
 		return err
 	}
-	e, err := connect(ctx, c.file)
+	e, err := connect(ctx, c.file, c.target)
 	if err != nil {
 		return err
 	}

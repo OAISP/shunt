@@ -21,7 +21,7 @@ func cmdRollback(ctx context.Context, args []string) error {
 	}
 	target := fs.Arg(0)
 
-	e, err := connect(ctx, c.file)
+	e, err := connect(ctx, c.file, c.target)
 	if err != nil {
 		return err
 	}
@@ -80,7 +80,7 @@ func cmdRetire(ctx context.Context, args []string) error {
 		return fmt.Errorf("usage: shunt retire <service>")
 	}
 
-	e, err := connect(ctx, c.file)
+	e, err := connect(ctx, c.file, c.target)
 	if err != nil {
 		return err
 	}
@@ -138,7 +138,7 @@ func cmdBoot(ctx context.Context, args []string) error {
 		return fmt.Errorf("usage: shunt boot <accessory>")
 	}
 
-	e, err := connect(ctx, c.file)
+	e, err := connect(ctx, c.file, c.target)
 	if err != nil {
 		return err
 	}

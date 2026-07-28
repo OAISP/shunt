@@ -14,44 +14,57 @@ import (
 	"github.com/OAISP/shunt/internal/transport"
 )
 
+// PlanSchema versions the machine-readable plan.
+//
+// `--json` previously emitted whatever Go field names happened to be, which is
+// not a contract: renaming a field would have silently broken every consumer.
+// The version is what lets a consumer notice a change instead of misreading one.
+const PlanSchema = 1
+
 // Plan is the diff between what the host is running and what the manifest says
 // it should run. Printing this before mutating anything is the difference
 // between a deploy tool and a script you hope works.
 type Plan struct {
-	ReleaseID   string
-	Current     *release.Entry
-	Images      []ImageChange
-	Accessories []ServiceChange
-	Services    []ServiceChange
-	Artifacts   []ArtifactChange
-	Stages      []StageChange
-	Secrets     SecretChange
-	Transfer    TransferEstimate
+	// Schema is the version of this document's shape.
+	Schema      int              `json:"schema"`
+	ReleaseID   string           `json:"release_id"`
+	Current     *release.Entry   `json:"current"`
+	Images      []ImageChange    `json:"images"`
+	Accessories []ServiceChange  `json:"accessories"`
+	Services    []ServiceChange  `json:"services"`
+	Artifacts   []ArtifactChange `json:"artifacts"`
+	Stages      []StageChange    `json:"stages"`
+	Secrets     SecretChange     `json:"secrets"`
+	Transfer    TransferEstimate `json:"transfer"`
+
+	// Changed is materialised into the document so a consumer does not have to
+	// re-derive shunt's own notion of "is there work to do".
+	HasChanges bool `json:"has_changes"`
 }
 
 type ImageChange struct {
-	Name     string
-	Action   string // create | update | unchanged | pull
-	OldDgst  string
-	NewDgst  string
-	External bool
+	Name     string `json:"name"`
+	Action   string `json:"action"` // create | update | unchanged | pull
+	OldDgst  string `json:"old_digest,omitempty"`
+	NewDgst  string `json:"new_digest,omitempty"`
+	External bool   `json:"external,omitempty"`
 }
 
 type ServiceChange struct {
-	Name    string
-	Action  string // create | update | unchanged | remove | drift
-	Reasons []string
+	Name    string   `json:"name"`
+	Action  string   `json:"action"` // create | update | unchanged | orphaned | drift
+	Reasons []string `json:"reasons,omitempty"`
 
 	// ZeroDowntime is true for proxied services, which start alongside the
 	// running release instead of replacing it in place.
-	ZeroDowntime bool
+	ZeroDowntime bool `json:"zero_downtime,omitempty"`
 }
 
 // StageChange is one one-shot container the deploy would run, and whether the
 // manifest changed it.
 type StageChange struct {
-	Name   string
-	Action string // run | create | update | remove
+	Name   string `json:"name"`
+	Action string `json:"action"` // run | create | update | remove
 }
 
 // diffStages compares the stage pipeline against the one last deployed.
@@ -95,18 +108,20 @@ func diffStages(old, nw *release.Spec) []StageChange {
 }
 
 type SecretChange struct {
-	Added, Removed, Changed []string
-	Total                   int
+	Added   []string `json:"added,omitempty"`
+	Removed []string `json:"removed,omitempty"`
+	Changed []string `json:"changed,omitempty"`
+	Total   int      `json:"total"`
 }
 
 // ArtifactChange is one data file the deploy would ship.
 type ArtifactChange struct {
-	Name       string
-	Dest       string
-	LocalBytes int64
-	LocalMTime int64
-	HostBytes  int64 // -1 when the host has no copy yet
-	HostMTime  int64
+	Name       string `json:"name"`
+	Dest       string `json:"dest"`
+	LocalBytes int64  `json:"local_bytes"`
+	LocalMTime int64  `json:"local_mtime"`
+	HostBytes  int64  `json:"host_bytes"` // -1 when the host has no copy yet
+	HostMTime  int64  `json:"host_mtime"`
 }
 
 // Differs reports whether the host's copy needs replacing, using size and mtime
@@ -128,9 +143,9 @@ func (a ArtifactChange) Action() string {
 }
 
 type TransferEstimate struct {
-	Total   int64 // logical size of all layouts
-	Missing int64 // bytes the host does not have yet
-	Blobs   int   // number of blobs to send
+	Total   int64 `json:"total"`   // logical size of all layouts
+	Missing int64 `json:"missing"` // bytes the host does not have yet
+	Blobs   int   `json:"blobs"`   // number of blobs to send
 }
 
 // CachedPercent is the share of the image the host already holds.
@@ -193,7 +208,7 @@ func (p *Plan) Changed() bool {
 
 // BuildPlan diffs a freshly-built spec against the host's ledger.
 func (e *Engine) BuildPlan(ctx context.Context, spec *release.Spec, built map[string]*build.Result, state *RemoteState) (*Plan, error) {
-	p := &Plan{ReleaseID: spec.ID}
+	p := &Plan{Schema: PlanSchema, ReleaseID: spec.ID}
 	if state != nil && state.Ledger != nil && state.Ledger.Current != "" {
 		p.Current = state.Ledger.Find(state.Ledger.Current)
 	}
@@ -290,6 +305,8 @@ func (e *Engine) BuildPlan(ctx context.Context, spec *release.Spec, built map[st
 		salt = state.Ledger.Salt
 	}
 	p.Secrets = diffSecrets(oldSpec, spec, salt)
+
+	defer func() { p.HasChanges = p.Changed() }()
 
 	est, err := e.estimate(ctx, built)
 	if err != nil {

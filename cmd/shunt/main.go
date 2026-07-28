@@ -61,6 +61,11 @@ common flags:
   -v, --verbose       show build output and per-step detail
       --json          emit machine-readable events instead of prose
 
+exit codes:
+  0  success, or "shunt plan" found nothing to do
+  1  the command failed
+  2  "shunt plan" found changes to apply (and bad usage)
+
 Set SHUNT_NO_BANNER=1 to suppress the banner, NO_COLOR=1 to suppress colour.
 `
 
@@ -126,6 +131,9 @@ func main() {
 func exit(err error) {
 	if err == nil {
 		return
+	}
+	if errors.Is(err, errExitChanges) {
+		os.Exit(2)
 	}
 	if errors.Is(err, errReported) {
 		os.Exit(1)

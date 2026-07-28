@@ -113,6 +113,14 @@ func startContainer(spec *release.Spec, name string, svc release.Service, envFil
 	if spec.Network != "" {
 		args = append(args, "--network", spec.Network, "--network-alias", name)
 	}
+	// A service that narrowed its secrets gets a file holding only those.
+	if len(svc.Secrets) > 0 {
+		scoped, err := writeEnvFileScoped(spec, svc.Secrets)
+		if err != nil {
+			return fmt.Errorf("service %s: %w", name, err)
+		}
+		envFile = scoped
+	}
 	if envFile != "" {
 		args = append(args, "--env-file", envFile)
 	}
@@ -136,6 +144,11 @@ func startContainer(spec *release.Spec, name string, svc release.Service, envFil
 		// compares it against the manifest, which is what lets a plan describe
 		// the host rather than merely replaying the ledger.
 		"--label", "shunt.config="+release.HashService(svc))
+	// The commit on the container itself, so `docker inspect` answers "what is
+	// this running" without going through shunt at all.
+	if spec.Provenance.Short != "" {
+		args = append(args, "--label", "shunt.commit="+spec.Provenance.Short)
+	}
 	args = append(args, proxyLabels(spec, name, svc)...)
 	args = append(args, ref)
 	args = append(args, svc.Command...)

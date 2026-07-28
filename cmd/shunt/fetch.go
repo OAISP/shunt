@@ -36,7 +36,7 @@ func cmdFetch(ctx context.Context, args []string) error {
 	}
 	name := fs.Arg(0)
 
-	e, err := connect(ctx, c.file)
+	e, err := connect(ctx, c.file, c.target)
 	if err != nil {
 		return err
 	}

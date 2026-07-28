@@ -30,7 +30,7 @@ func cmdExec(ctx context.Context, args []string) error {
 		command = []string{"sh"}
 	}
 
-	e, err := connect(ctx, c.file)
+	e, err := connect(ctx, c.file, c.target)
 	if err != nil {
 		return err
 	}
@@ -66,7 +66,7 @@ func cmdRun(ctx context.Context, args []string) error {
 		return fmt.Errorf("shunt run needs a command, e.g. `shunt run app -- bin/rails console`")
 	}
 
-	e, err := connect(ctx, c.file)
+	e, err := connect(ctx, c.file, c.target)
 	if err != nil {
 		return err
 	}
