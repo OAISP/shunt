@@ -185,3 +185,60 @@ func contains(h, n string) bool {
 	}
 	return false
 }
+
+// The check that explains the most common first-build failure used to look for
+// "Driver: docker" with a single space. buildx pads its labels into a column,
+// so it never matched, and the one error message that could have named the fix
+// stayed silent. These are verbatim outputs.
+func TestParseBuildxDriver(t *testing.T) {
+	const defaultDriver = `Name:          default
+Driver:        docker
+Last Activity: 2026-07-28 12:43:12 +0000 UTC
+
+Nodes:
+Name:             default
+Endpoint:         default
+Status:           running
+BuildKit version: v0.30.0
+`
+	const container = `Name:   shunt
+Driver: docker-container
+
+Nodes:
+Name:      shunt0
+Endpoint:  unix:///var/run/docker.sock
+Status:    running
+`
+	for _, tc := range []struct{ name, out, want string }{
+		{"padded default driver", defaultDriver, "docker"},
+		{"single-space container driver", container, "docker-container"},
+		{"no driver line", "Name: default\n", ""},
+		{"empty", "", ""},
+	} {
+		if got := parseBuildxDriver(tc.out); got != tc.want {
+			t.Errorf("%s: parseBuildxDriver = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// The rule is the combination, not the driver alone: the classic docker driver
+// exports a layout perfectly well once the daemon runs the containerd image
+// store, and refuses outright when it does not.
+func TestOCIExportOKIsTheCombination(t *testing.T) {
+	for _, tc := range []struct {
+		driver     string
+		containerd bool
+		want       bool
+	}{
+		{"docker", false, false}, // the CI runner, and most laptops
+		{"docker", true, true},   // containerd image store turned on
+		{"docker-container", false, true},
+		{"remote", false, true},
+		{"", false, true}, // undeterminable must never block a deploy
+	} {
+		got := OCIExport{Driver: tc.driver, Containerd: tc.containerd}.supported()
+		if got != tc.want {
+			t.Errorf("driver=%q containerd=%v: OK = %v, want %v", tc.driver, tc.containerd, got, tc.want)
+		}
+	}
+}

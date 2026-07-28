@@ -70,7 +70,14 @@ COPY id_ed25519.pub /root/.ssh/authorized_keys
 RUN chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys
 CMD ["/usr/sbin/sshd", "-D", "-e"]
 EOF
-  docker build -q -f "$WORK/Dockerfile.host" -t shunt-compat-host-img "$WORK" >/dev/null
+  # --load, because this image has to end up in the daemon for `docker run`
+  # below to find it. With a docker-container builder selected — which is what
+  # shunt tells you to create when the default one cannot export an OCI layout,
+  # and therefore what CI and plenty of developer machines have — a build with
+  # no output named leaves the result in the build cache and nowhere else. The
+  # failure is not a build error: it is this host never accepting ssh, because
+  # `docker run` quietly got a stale image or none at all.
+  docker build -q --load -f "$WORK/Dockerfile.host" -t shunt-compat-host-img "$WORK" >/dev/null
 
   docker run -d --name "$CONTAINER" -p "127.0.0.1:$SSH_PORT:22" \
     -v /var/run/docker.sock:/var/run/docker.sock \

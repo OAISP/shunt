@@ -34,8 +34,14 @@ jobs:
           bundler-cache: true
           working-directory: docs
 
+      # enablement turns Pages on for the repository if it is not already, via
+      # the API. Without it this step fails with a bare "Not Found" on a repo
+      # whose Pages source has never been set to GitHub Actions, which reads as
+      # a broken workflow rather than an unset switch. Harmless once it is on.
       - id: pages
         uses: actions/configure-pages@v5
+        with:
+          enablement: true
 
       # The base path comes from the Pages configuration rather than being
       # hardcoded, so the site is correct whether it is served from a project

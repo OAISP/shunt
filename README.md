@@ -59,7 +59,8 @@ Or `go install github.com/OAISP/shunt/cmd/shunt@latest`, or grab a release
 archive. See [Getting started](https://oaisp.github.io/shunt/getting-started/)
 for the other options and the full requirements.
 
-**Your machine:** docker (with buildx), rsync, ssh.
+**Your machine:** docker (with a buildx builder that can export an OCI layout),
+rsync, ssh.
 **The server:** docker, rsync, curl, and an ssh account that can reach the docker
 socket. Nothing else — shunt uploads its own helper.
 

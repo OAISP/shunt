@@ -102,6 +102,14 @@ jobs:
       - name: build
         run: make build
 
+      # The runner's default builder uses the `docker` driver, which cannot
+      # write an OCI layout unless the daemon runs the containerd image store —
+      # and the runner's does not. That layout is the whole transport, so a
+      # builder that can export one is a prerequisite for any deploy, here and
+      # on a developer machine. This is the same command `shunt audit` prints.
+      - name: builder that can export an OCI layout
+        run: docker buildx create --use --name shunt --driver docker-container
+
       - name: enable ssh to localhost
         run: |
           set -euo pipefail
@@ -131,6 +139,10 @@ jobs:
 
       - name: build
         run: make build
+
+      # Same prerequisite as e2e: compat deploys for real, so it builds for real.
+      - name: builder that can export an OCI layout
+        run: docker buildx create --use --name shunt --driver docker-container
 
       - name: compat
         run: test/compat.sh

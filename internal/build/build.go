@@ -192,13 +192,80 @@ func Retag(dir, ref string) error {
 	return os.WriteFile(p, out, 0o644)
 }
 
-func buildxHint() string {
-	out, err := exec.Command("docker", "buildx", "inspect").CombinedOutput()
+// OCIExport describes whether the local builder can write the OCI layout every
+// part of shunt's transport depends on.
+//
+// The rule is not "which driver" — that is what the previous version of this
+// check got wrong, in both directions. The classic `docker` driver exports a
+// layout perfectly well once the daemon uses the containerd image store, and
+// refuses outright when it does not. So both have to be read, and only the one
+// combination is a real problem.
+type OCIExport struct {
+	Driver     string // buildx driver: docker, docker-container, remote, kubernetes
+	Containerd bool   // whether the daemon uses the containerd image store
+	OK         bool
+}
+
+// CheckOCIExport reads the active builder and the daemon's image store.
+//
+// Anything it cannot determine is reported as OK. This gates a deploy and sits
+// in `shunt audit`, and refusing to build because a `docker buildx inspect`
+// output could not be parsed would be far worse than the error the build itself
+// would print.
+func CheckOCIExport() OCIExport {
+	c := OCIExport{OK: true}
+
+	out, err := exec.Command("docker", "buildx", "inspect").Output()
 	if err != nil {
-		return ""
+		return c
 	}
-	if strings.Contains(string(out), "docker-container") || strings.Contains(string(out), "Driver: docker\n") {
-		return "\n  hint: this builder may not support OCI export — try `docker buildx create --use --name shunt`"
+	c.Driver = parseBuildxDriver(string(out))
+
+	// The containerd image store reports itself in the daemon's driver status,
+	// not as a storage driver name — overlayfs backed by containerd and
+	// overlay2 backed by the classic store are both called "overlay"-something.
+	if status, err := exec.Command("docker", "info", "-f", "{{json .DriverStatus}}").Output(); err == nil {
+		c.Containerd = strings.Contains(string(status), "io.containerd.snapshotter.v1")
+	}
+
+	c.OK = c.supported()
+	return c
+}
+
+// supported is the rule, kept apart from the two subprocesses that feed it so
+// it can be exercised for combinations this machine does not have.
+//
+// An undeterminable driver reads as supported for the same reason the whole
+// check defaults open: this gates a deploy.
+func (c OCIExport) supported() bool { return c.Driver != "docker" || c.Containerd }
+
+// parseBuildxDriver picks the driver out of `docker buildx inspect`.
+//
+// Split out so it can be tested against the real output, which is what the
+// previous version of this check needed and did not have: it looked for
+// "Driver: docker" with a single space, and buildx pads its labels into a
+// column. The check that existed to explain the most common first-build failure
+// therefore never fired.
+func parseBuildxDriver(out string) string {
+	for _, ln := range strings.Split(out, "\n") {
+		if rest, found := strings.CutPrefix(strings.TrimSpace(ln), "Driver:"); found {
+			return strings.TrimSpace(rest)
+		}
+	}
+	return ""
+}
+
+// Fix names the two ways out, in the order most people should take them. One
+// line, because both callers render it into their own indentation.
+func (c OCIExport) Fix() string {
+	return "`docker buildx create --use --name shunt --driver docker-container`, " +
+		"or turn on the containerd image store in the Docker daemon"
+}
+
+func buildxHint() string {
+	if c := CheckOCIExport(); !c.OK {
+		return "\n  hint: the " + c.Driver + " buildx driver cannot export an OCI layout, which is how shunt ships images" +
+			"\n  " + c.Fix()
 	}
 	return ""
 }

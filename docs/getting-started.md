@@ -49,10 +49,23 @@ make install    # builds ./shunt with helpers embedded, installs to ~/.local/bin
 
 ## Requirements
 
-**Your machine:** docker with buildx, rsync, ssh.
+**Your machine:** docker with a buildx builder that can export an OCI layout,
+rsync, ssh.
 
 **The server:** docker, rsync, curl, and an ssh account that can reach the
 docker socket. Nothing else — shunt uploads its own helper.
+
+That OCI layout is how shunt ships an image, so exporting one is not optional.
+Docker's default `docker` builder can only do it when the daemon runs the
+containerd image store; without that it refuses outright. Either fix works:
+
+```sh
+docker buildx create --use --name shunt --driver docker-container
+```
+
+`shunt audit` reports which of the two you have and names the fix if you have
+neither — worth running once before your first deploy, since otherwise this
+surfaces as a build error on the very first `shunt up`.
 
 `curl` runs url health checks. It is present on essentially every distro image
 but not on some minimal ones, so `shunt audit` checks for it, and so does every
@@ -62,10 +75,11 @@ rsync 3.2 or newer on *both* ends gets zstd transfer compression. Older versions
 still work: Ubuntu 20.04 ships 3.1.3 and macOS ships 2.6.9 as `/usr/bin/rsync`,
 and shunt detects both and falls back rather than failing.
 
-Either image store works on either end. shunt writes a layout that both the
-containerd snapshotter and the classic overlay2 store can load, so a laptop
-running the newer store can deploy to a server running the older one with no
-daemon configuration.
+Either image store works **on the server**. shunt writes a layout that both the
+containerd snapshotter and the classic overlay2 store can load, so a laptop can
+deploy to a server running either one with no daemon configuration there. The
+builder side is the asymmetric one, for the reason above: loading a layout works
+everywhere, producing one does not.
 
 ## A first deploy
 

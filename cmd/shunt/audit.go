@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strings"
 
+	"github.com/OAISP/shunt/internal/build"
 	"github.com/OAISP/shunt/internal/engine"
 	"github.com/OAISP/shunt/internal/manifest"
 	"github.com/OAISP/shunt/internal/ui"
@@ -81,11 +82,22 @@ func localChecks() []check {
 
 	// A builder without OCI export cannot produce the layout the whole design
 	// rests on, and the failure otherwise appears only after a full build.
+	//
+	// Checking that buildx merely exists is not enough, and used to be all this
+	// did: the default `docker` driver is present on every machine and still
+	// refuses to export a layout unless the daemon runs the containerd image
+	// store. So audit passed, and the very next command died on the first build.
 	if outb, err := exec.Command("docker", "buildx", "version").Output(); err != nil {
 		out = append(out, check{"local buildx", statusFail, "not available",
 			"install docker buildx; shunt exports an OCI layout with it"})
 	} else {
 		out = append(out, check{"local buildx", statusOK, strings.TrimSpace(string(outb)), ""})
+		if c := build.CheckOCIExport(); !c.OK {
+			out = append(out, check{"local oci export", statusFail,
+				"the " + c.Driver + " driver cannot export an OCI layout", c.Fix()})
+		} else {
+			out = append(out, check{"local oci export", statusOK, ociExportDetail(c), ""})
+		}
 	}
 
 	// zstd on this side is half of the transfer-compression story; the host is
@@ -191,6 +203,20 @@ func platformCheck(m *manifest.Manifest, hostArch string) check {
 			"set platform = \"linux/" + hostArch + "\" in [images.*]"}
 	}
 	return check{"image platform", statusOK, "matches the host (" + hostArch + ")", ""}
+}
+
+// ociExportDetail names which of the two workable configurations this machine
+// has, since "supported" alone does not tell someone debugging a colleague's
+// failure which one they are looking at.
+func ociExportDetail(c build.OCIExport) string {
+	switch {
+	case c.Driver == "":
+		return "supported"
+	case c.Driver == "docker" && c.Containerd:
+		return "supported (docker driver, containerd image store)"
+	default:
+		return "supported (" + c.Driver + " driver)"
+	}
 }
 
 func localArch() string {
