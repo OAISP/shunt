@@ -63,20 +63,33 @@ func loadImages(spec *release.Spec) error {
 		if err != nil {
 			return fmt.Errorf("image %s: %w", name, err)
 		}
-		if err := dockerLoadDir(dir, fresh); err != nil {
-			return fmt.Errorf("image %s: %w", name, err)
+
+		// A partial load is an optimisation, never a requirement, and a daemon
+		// declines one in either of two ways: it errors on a manifest naming a
+		// blob the archive does not carry, or it accepts the archive and produces
+		// no image. Both mean the same thing and both have the same answer, so
+		// both fall through to sending the whole layout.
+		//
+		// Treating only the second as recoverable is what made this fallback
+		// unreachable on the store that actually needs it: the classic overlay2
+		// importer resolves every layer path out of the archive rather than out
+		// of the layers it already holds, so it fails loudly rather than quietly.
+		if fresh != nil {
+			if err := loadLayout(dir, fresh); err != nil {
+				info("this daemon will not load a partial layout (" + firstLine(err.Error()) + "); sending the whole layout")
+				fresh = nil
+			} else if !docker.Ok("docker", "image", "inspect", img.Ref) {
+				info("partial load did not produce " + img.Ref + "; sending the whole layout")
+				fresh = nil
+			}
 		}
-		if !docker.Ok("docker", "image", "inspect", img.Ref) {
-			// A partial load is an optimisation, never a requirement. If the
-			// daemon did not accept one — an older version, a store that wants
-			// every layer present — send the whole layout and carry on.
-			info("partial load did not produce " + img.Ref + "; sending the whole layout")
-			if err := dockerLoadDir(dir, nil); err != nil {
+		if fresh == nil {
+			if err := loadLayout(dir, nil); err != nil {
 				return fmt.Errorf("image %s: %w", name, err)
 			}
-			if !docker.Ok("docker", "image", "inspect", img.Ref) {
-				return fmt.Errorf("image %s: %s is not present after load — the layout may be tagged differently", name, img.Ref)
-			}
+		}
+		if !docker.Ok("docker", "image", "inspect", img.Ref) {
+			return fmt.Errorf("image %s: %s is not present after load — the layout may be tagged differently", name, img.Ref)
 		}
 		ok("load", img.Ref)
 	}
@@ -171,13 +184,31 @@ func saveVerified(dir string, m map[string]verifiedRecord) {
 	}
 }
 
+// loadLayout is the seam tests replace. The load streams a tar into a pipe, so
+// it cannot go through the `runner` interface the rest of the helper uses — and
+// the fallback around it is precisely the logic that most needs asserting.
+var loadLayout = dockerLoadDir
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
 // dockerLoadDir streams the OCI layout into `docker load`.
 //
 // onlyBlobs names the blobs rsync rewrote this transfer; every other layer is
-// left out, because the daemon already holds it. Both the containerd and the
-// classic overlay2 store accept a layout whose known layers are absent —
-// measured at 404 MB of tar becoming 40 KB. A nil map sends everything, which is
-// what a first deploy and the fallback do.
+// left out, because the daemon already holds it. Measured at 404 MB of tar
+// becoming 40 KB. A nil map sends everything, which is what a first deploy and
+// the fallback do.
+//
+// Whether a daemon accepts this is not something to assert: the containerd
+// snapshotter resolves the missing layers out of its own content store, while
+// the classic overlay2 importer resolves every path out of the archive and
+// fails on the first one that is not there. The caller therefore treats a
+// partial load as an attempt rather than a step, and both of its failure shapes
+// as the same answer.
 //
 // Built here rather than shelled out to `tar`, which is how the filtering is
 // expressed and why the host no longer needs tar.

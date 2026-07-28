@@ -45,14 +45,22 @@ work rather than read as "unchanged".
 
 ## Only the delta is loaded
 
-The daemon accepts an OCI layout whose already-known layers are absent, on both
-the containerd snapshotter and the classic overlay2 store. Since verification
-already knows exactly which blobs rsync rewrote this transfer — which is
-precisely the set the daemon cannot hold — those are the only layer blobs the
-load archive carries. Measured at 404 MB of tar becoming 40 KB.
+Verification already knows exactly which blobs rsync rewrote this transfer,
+which is precisely the set the daemon cannot already hold — so those are the
+only layer blobs the load archive carries. Measured at 404 MB of tar becoming
+40 KB.
 
-A partial load that does not produce the image falls back to sending the whole
-layout, so this is an optimisation and never a requirement.
+Whether a daemon will take that depends on its image store, and shunt does not
+try to know in advance. The containerd snapshotter resolves the absent layers
+out of its own content store. The classic overlay2 importer resolves every layer
+path out of the archive and fails on the first one missing, which is most
+servers — so on those the attempt is refused and the whole layout follows.
+
+That is why the partial load is an attempt rather than a step. A daemon declines
+it in two shapes — an error, or a success that produces no image — and both mean
+the same thing, so both fall through to sending everything. Treating only the
+second as recoverable is a bug that hides until you meet the store that produces
+the first, at which point nothing deploys at all.
 
 The archive is built in Go rather than shelled out to `tar`, which is how the
 filtering is expressed and why the host does not need `tar` at all.

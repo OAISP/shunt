@@ -925,3 +925,117 @@ func TestSecretFilesRejectAScopeTheReleaseDoesNotProvide(t *testing.T) {
 		t.Fatal("writeSecretFiles accepted a key the release does not have")
 	}
 }
+
+// withLoader installs a fake layout loader and records, for each load, whether
+// it was a partial one.
+func withLoader(t *testing.T, fn func(only map[string]bool) error) *[]bool {
+	t.Helper()
+	var partial []bool
+	prev := loadLayout
+	loadLayout = func(_ string, only map[string]bool) error {
+		partial = append(partial, only != nil)
+		return fn(only)
+	}
+	t.Cleanup(func() { loadLayout = prev })
+	return &partial
+}
+
+// layoutSpec writes a minimal OCI layout — one blob named after its own
+// contents, which is what verifyLayout checks — and returns a spec pointing at
+// it.
+func layoutSpec(t *testing.T) *release.Spec {
+	t.Helper()
+	store := t.TempDir()
+	dir := filepath.Join(store, "app", "blobs", "sha256")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"schemaVersion":2}`)
+	sum := sha256.Sum256(body)
+	if err := os.WriteFile(filepath.Join(dir, hex.EncodeToString(sum[:])), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return &release.Spec{
+		Project: "demo", ID: testRelease, StorePath: store,
+		Images: map[string]release.ImageRef{"app": {Ref: "shunt/demo-app:" + testRelease}},
+	}
+}
+
+// absentUntil answers `image inspect` as missing for the first n calls, then as
+// present — which is how a load that finally worked looks from outside.
+func absentUntil(t *testing.T, n int) {
+	t.Helper()
+	calls := 0
+	prev := docker
+	docker = runnerFunc(func(_ string, args ...string) (string, error) {
+		if strings.Contains(strings.Join(args, " "), "image inspect") {
+			calls++
+			if calls <= n {
+				return "", errors.New("no such image")
+			}
+		}
+		return "", nil
+	})
+	t.Cleanup(func() { docker = prev })
+}
+
+// A daemon declines a partial layout in one of two ways, and only one of them
+// used to be recoverable. The classic overlay2 importer resolves every layer
+// path out of the archive rather than out of the layers it already holds, so it
+// errors — and that error returned before the fallback could run, which left
+// the fallback unreachable on the only store that needs it.
+func TestPartialLoadFailureFallsBackToTheWholeLayout(t *testing.T) {
+	// The error path never asks whether the partial load produced anything —
+	// it already knows — so the only inspects are the pre-check and the final one.
+	absentUntil(t, 1)
+	loads := withLoader(t, func(only map[string]bool) error {
+		if only != nil {
+			return errors.New("open blobs/sha256/31bc: no such file or directory")
+		}
+		return nil
+	})
+
+	if err := loadImages(layoutSpec(t)); err != nil {
+		t.Fatalf("a daemon that rejects a partial layout must still deploy: %v", err)
+	}
+	if len(*loads) != 2 || !(*loads)[0] || (*loads)[1] {
+		t.Fatalf("loads = %v, want a partial attempt then the whole layout", *loads)
+	}
+}
+
+// The other shape: the daemon takes the archive and produces no image.
+func TestPartialLoadProducingNothingFallsBack(t *testing.T) {
+	absentUntil(t, 2)
+	loads := withLoader(t, func(map[string]bool) error { return nil })
+
+	if err := loadImages(layoutSpec(t)); err != nil {
+		t.Fatal(err)
+	}
+	if len(*loads) != 2 || (*loads)[1] {
+		t.Fatalf("loads = %v, want the whole layout after the partial produced nothing", *loads)
+	}
+}
+
+// The optimisation must not cost a round trip when it worked.
+func TestPartialLoadThatWorksSendsNothingFurther(t *testing.T) {
+	absentUntil(t, 1) // absent for the pre-check, present once loaded
+	loads := withLoader(t, func(map[string]bool) error { return nil })
+
+	if err := loadImages(layoutSpec(t)); err != nil {
+		t.Fatal(err)
+	}
+	if len(*loads) != 1 || !(*loads)[0] {
+		t.Fatalf("loads = %v, want one partial load and no fallback", *loads)
+	}
+}
+
+// If the whole layout fails too there is nothing left to try, and the deploy
+// must fail rather than carry on to a container swap with no image.
+func TestFullLoadFailureIsFatal(t *testing.T) {
+	absentUntil(t, 99)
+	withLoader(t, func(map[string]bool) error { return errors.New("no space left on device") })
+
+	if err := loadImages(layoutSpec(t)); err == nil {
+		t.Fatal("loadImages succeeded with no image loaded")
+	}
+}

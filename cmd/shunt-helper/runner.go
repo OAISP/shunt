@@ -90,3 +90,13 @@ func (f *fakeRunner) did(parts ...string) bool {
 	}
 	return false
 }
+
+// runnerFunc adapts a function to the runner interface, for tests that need a
+// reply to depend on how many times it has been asked.
+type runnerFunc func(name string, args ...string) (string, error)
+
+func (r runnerFunc) Run(name string, args ...string) (string, error) { return r(name, args...) }
+func (r runnerFunc) Ok(name string, args ...string) bool {
+	_, err := r(name, args...)
+	return err == nil
+}
