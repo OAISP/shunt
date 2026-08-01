@@ -167,7 +167,7 @@ func deployed(l *release.Ledger) *release.Ledger {
 func TestReconcileReportsAMissingContainer(t *testing.T) {
 	state := &RemoteState{Ledger: deployed(nil)}
 	got := reconcileService(state, "app", release.Service{Image: "app"})
-	if len(got) != 1 || !strings.Contains(got[0], "removed outside shunt") {
+	if len(got) != 1 || !strings.Contains(got[0], "no container on the host") {
 		t.Fatalf("reconcileService = %v, want a missing-container reason", got)
 	}
 }

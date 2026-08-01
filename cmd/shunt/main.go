@@ -53,6 +53,9 @@ const usage = `usage:
   shunt rollback [release]   restore the previous (or a named) release
   shunt boot <accessory>     (re)create a stateful accessory — destructive
   shunt retire <service>     stop a service you removed from shunt.toml
+  shunt down                 stop this project's services on the host
+                             --all also removes accessories; --purge removes
+                             the network, images, history and secrets too
   shunt bundle               build a release into a portable file
   shunt bundle inspect <f>   show what a bundle contains, without applying it
   shunt bundle verify <f>    rehash a bundle's blobs; needs no host
@@ -98,6 +101,7 @@ var commands = map[string]func(context.Context, []string) error{
 	"rollback": cmdRollback,
 	"boot":     cmdBoot,
 	"retire":   cmdRetire,
+	"down":     cmdDown,
 	"bundle":   cmdBundle,
 	"apply":    cmdApply,
 	"fetch":    cmdFetch,

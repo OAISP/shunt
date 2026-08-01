@@ -24,7 +24,7 @@ const Version = "0.1.0"
 
 func main() {
 	if len(os.Args) < 2 {
-		fatal(errors.New("usage: shunt-helper <apply|rollback|boot|retire|status|logs|prune|version>"))
+		fatal(errors.New("usage: shunt-helper <apply|rollback|boot|retire|down|status|logs|prune|version>"))
 	}
 	var err error
 	switch os.Args[1] {
@@ -45,6 +45,8 @@ func main() {
 		err = cmdBoot(os.Stdin, os.Args[2:])
 	case "retire":
 		err = cmdRetire(os.Args[2:])
+	case "down":
+		err = cmdDown(os.Args[2:])
 	default:
 		err = fmt.Errorf("unknown subcommand %q", os.Args[1])
 	}

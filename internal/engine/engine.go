@@ -474,6 +474,30 @@ func (e *Engine) Retire(ctx context.Context, service string, r EventRenderer) er
 	return e.stream(ctx, nil, r, e.helperPath, "retire", e.M.Project, service)
 }
 
+// DownOptions says how much of a project to take away.
+type DownOptions struct {
+	// Accessories removes the stateful containers too. Opt-in for the same
+	// reason `shunt boot` is its own verb: that is the database.
+	Accessories bool
+
+	// Purge additionally removes the network, the release-tagged images, the
+	// ledger and the on-host secrets. Never volumes.
+	Purge bool
+}
+
+// Down stops and removes a project's containers, and with Purge everything else
+// shunt put on the host.
+func (e *Engine) Down(ctx context.Context, o DownOptions, r EventRenderer) error {
+	args := []string{e.helperPath, "down", e.M.Project, e.M.Network}
+	if o.Accessories || o.Purge {
+		args = append(args, "--accessories")
+	}
+	if o.Purge {
+		args = append(args, "--purge")
+	}
+	return e.stream(ctx, nil, r, args...)
+}
+
 func (e *Engine) Rollback(ctx context.Context, id string, r EventRenderer) error {
 	args := []string{e.helperPath, "rollback", e.M.Project}
 	if id != "" {

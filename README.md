@@ -103,6 +103,7 @@ zero-downtime proxying, portable bundles — is optional and documented at
 | `shunt plan` · `up` | diff, then apply |
 | `shunt status` · `logs` · `exec` · `run` | see and reach what's running |
 | `shunt rollback` · `boot` · `retire` · `prune` | lifecycle |
+| `shunt down` | take it back off the host — `--purge` removes the secrets too |
 | `shunt fetch` | pull artifacts and captures back down |
 | `shunt bundle` · `apply` | deploy where the builder can't reach |
 

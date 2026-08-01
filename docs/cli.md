@@ -19,6 +19,7 @@ nav_order: 5
 | `shunt rollback [id]` | Restore the previous, or a named, release. |
 | `shunt boot <accessory>` | Recreate a stateful accessory. Destructive. |
 | `shunt retire <service>` | Stop a service you removed from the manifest. |
+| `shunt down` | Take this project off the host. `--all` and `--purge` go deeper. |
 | `shunt fetch [name\|path]` | Pull an artifact or capture back down. |
 | `shunt prune` | Drop superseded images on the host. |
 | `shunt bundle` | Build a release into a portable file. |
@@ -102,6 +103,40 @@ not the whole set.
 shunt exec app -- sh
 shunt run app -- bin/rails console
 ```
+
+### `shunt down`
+
+The inverse of `shunt up`, in three depths — because "stop the app for a minute"
+and "I am finished with this server" are different requests, and conflating them
+is how a rollback target or a database disappears by accident.
+
+```sh
+shunt down            # the services. Reversible: `shunt up` brings them back.
+shunt down --all      # the accessories too
+shunt down --purge    # everything shunt put on this host
+```
+
+`--purge` additionally removes the deploy network, every release-tagged image,
+the release history and **this project's secrets on the host**. That last one is
+the reason it exists rather than being left to `rm -rf`: the `0600` env-files and
+`/run/secrets` directories under `~/.shunt/<project>/` are the only plaintext
+copies of your credentials, and nothing else removes them — `shunt prune` only
+expires what is already past `retain`.
+
+It also removes every rollback target, which it says out loud before asking.
+
+Two things it will never do:
+
+- **Remove a volume.** Not at any depth. `docker compose down` needs `-v` for
+  that and shunt has no equivalent on purpose — a flag that deletes a database
+  is one tab-completion away from being pressed by mistake.
+- **Purge without explicit consent.** Every other prompt in shunt proceeds when
+  stdin is not a terminal, so CI never blocks on a question nobody can answer.
+  `--purge` refuses instead, and asks for `-y`.
+
+It works from the labels on the host rather than from the manifest, so it still
+removes a container for a service you have already deleted from `shunt.toml` —
+which `shunt retire` deliberately will not do.
 
 ### `shunt logs`
 

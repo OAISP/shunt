@@ -342,6 +342,35 @@ else
   ok "retire removed the orphan"
 fi
 
+# ------------------------------------------------------------------- down ----
+# Last, because it takes the project away. The trap-based cleanup still runs
+# afterwards on purpose: this section asserts that `down` works, and the trap
+# guarantees the host is clean even when it does not.
+step "down"
+running() { ssh -o BatchMode=yes "$HOST" "docker ps -aq --filter label=shunt.project=$PROJECT" | tr -d '[:space:]'; }
+onhost()  { ssh -o BatchMode=yes "$HOST" "$@" >/dev/null 2>&1; }
+
+"$SHUNT" down -y </dev/null >/dev/null
+eq "down removed every container" "$(running)" ""
+
+# Reversible: the release history and the secrets are what make that true, so
+# they have to have survived.
+succeeds "down kept the release history" onhost "test -f ~/.shunt/$PROJECT/releases.json"
+succeeds "down kept the deploy network" onhost "docker network inspect $PROJECT-net"
+
+"$SHUNT" up -y </dev/null >/dev/null
+# Against the working tree rather than a literal: earlier sections move the
+# content on, and the claim being made is "up rebuilds what is here now".
+eq "up brings the project back after down" "$(served)" "$(cat index.html)"
+
+# --purge is the decommission button: nothing shunt put on this host survives it.
+"$SHUNT" down --purge -y </dev/null >/dev/null
+eq "purge removed every container" "$(running)" ""
+fails "purge removed the deploy network" onhost "docker network inspect $PROJECT-net"
+fails "purge removed the release history and secrets" onhost "test -d ~/.shunt/$PROJECT"
+fails "purge removed the release-tagged images" \
+  ssh -o BatchMode=yes "$HOST" "docker images -q --filter reference='shunt/$PROJECT-*' | grep -q ."
+
 # ----------------------------------------------------------------- summary ---
 printf '\n\033[1m%d passed, %d failed\033[0m\n\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

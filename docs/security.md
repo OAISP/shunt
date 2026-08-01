@@ -39,6 +39,24 @@ appear in `docker inspect` and therefore in anything that captures it;
   release's retained `0600` copy, which is what makes retention bound how far
   back you can go.
 
+## Secrets outlive the deploy
+
+A release's resolved values stay on the host in `0600` files under
+`~/.shunt/<project>/` — an env-file, or one file per key for `mode = "file"`.
+They have to: a rollback replays an old release and needs the environment that
+release was deployed with, and the ledger holds only hashes.
+
+`shunt prune` expires the ones past `retain`, but never the active release's.
+So a project you stop deploying keeps live credentials on that host until you
+say otherwise:
+
+```sh
+shunt down --purge     # removes the containers, network, images and secrets
+```
+
+Worth doing when you decommission a host or move a project elsewhere. It never
+touches volumes.
+
 ## Integrity
 
 Every blob is rehashed on the host and checked against its own filename before

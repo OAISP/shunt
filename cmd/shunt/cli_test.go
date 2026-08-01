@@ -146,3 +146,23 @@ func TestParseArgsPreservesPositionalOrder(t *testing.T) {
 		t.Error("-v was dropped")
 	}
 }
+
+// Every other prompt proceeds when stdin is not a terminal, so CI never blocks.
+// Purging is the one operation where inferring consent from a missing tty is
+// wrong: it destroys the ledger, the images and the only copy of the project's
+// secrets, and a pipeline that reaches it by accident has nobody to stop it.
+func TestPurgeRefusesToInferConsentFromAMissingTerminal(t *testing.T) {
+	for _, tc := range []struct {
+		name                          string
+		purge, yes, interactive, want bool
+	}{
+		{"piped purge with no -y is refused", true, false, false, true},
+		{"piped purge with -y proceeds", true, true, false, false},
+		{"interactive purge asks rather than refusing", true, false, true, false},
+		{"a plain down is reversible and never refused", false, false, false, false},
+	} {
+		if got := purgeNeedsConsent(tc.purge, tc.yes, tc.interactive); got != tc.want {
+			t.Errorf("%s: purgeNeedsConsent = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

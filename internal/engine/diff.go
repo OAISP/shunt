@@ -63,7 +63,10 @@ func reconcileService(state *RemoteState, name string, svc release.Service) []st
 		if state.Ledger == nil || state.Ledger.Current == "" {
 			return nil
 		}
-		return []string{"no container on the host — it was removed outside shunt"}
+		// Not "removed outside shunt": `shunt down` is now a supported way to
+		// reach this state, and blaming the operator for a command shunt offers
+		// them reads as a fault rather than a fact.
+		return []string{"no container on the host — `shunt up` will start it"}
 	}
 
 	want := release.HashService(svc)
