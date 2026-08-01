@@ -239,6 +239,12 @@ fails "the deploy failed" "$SHUNT" up -y --rollback-on-failure
 eq "the previous release is serving again" "$(current)" "$BEFORE"
 eq "it serves the previous content" "$(served)" "v3"
 
+# The restored release has no `broken` service, so nothing in its swap ever
+# visits that container. Left running, it would keep serving the code the
+# rollback exists to remove — and `shunt status` would call the host untouched.
+fails "the failed release's own container was not left behind" \
+  ssh -o BatchMode=yes "$HOST" "docker ps -aq --filter name=$PROJECT-broken | grep -q ."
+
 mv shunt.toml.bak shunt.toml
 echo "v3" > index.html
 "$SHUNT" up -y </dev/null >/dev/null 2>&1 || true

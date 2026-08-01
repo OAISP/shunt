@@ -101,6 +101,54 @@ func retireOldContainers(spec *release.Spec, name string, svc release.Service) {
 	}
 }
 
+// retireUndeclaredServices removes service containers for services the restored
+// release does not have.
+//
+// Only rollback calls this, never a deploy. The two look alike and are not: a
+// service dropped from the manifest is an orphan, which shunt reports and
+// refuses to act on, because a human deleted it and only a human should stop it.
+// A service that exists solely because the release being undone introduced it is
+// shunt's own leftover — nobody asked for it, the release that created it is
+// being taken back, and leaving it means the host keeps serving the code the
+// rollback exists to remove.
+//
+// That also makes the ledger honest. A restored release that leaves one
+// container of the failed one behind is still a mix, and `shunt status` would
+// call it `failed` — production untouched — while a container from the bad
+// release was in rotation.
+//
+// Accessories are exempt, as everywhere else: they are stateful, and no rollback
+// should destroy a database because the release that booted it went away.
+func retireUndeclaredServices(spec, outgoing *release.Spec) {
+	out, err := docker.Run("docker", "ps", "-a",
+		"--filter", "label=shunt.project="+spec.Project,
+		"--filter", "label=shunt.kind=service",
+		"--format", "{{.Names}}\t{{.Label \"shunt.service\"}}")
+	if err != nil {
+		return
+	}
+	for _, ln := range splitLines(out) {
+		f := strings.SplitN(ln, "\t", 2)
+		// An unlabelled container predates this and cannot be attributed to a
+		// service, so it is left alone rather than guessed at.
+		if len(f) < 2 || f[1] == "" {
+			continue
+		}
+		if _, declared := spec.Services[f[1]]; declared {
+			continue // its own swap has already dealt with it
+		}
+		drain := 10
+		if outgoing != nil {
+			if svc, ok := outgoing.Services[f[1]]; ok {
+				drain = drainSeconds(svc)
+			}
+		}
+		info(fmt.Sprintf("%s is not part of %s — removing it", f[0], spec.ID))
+		stopAndRemove(f[0], drain)
+		ok("rollback", f[0]+" removed; it belonged to the release being undone")
+	}
+}
+
 // containerExists reports whether a container of that name is present in any
 // state, running or stopped.
 func containerExists(name string) bool {

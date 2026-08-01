@@ -450,3 +450,74 @@ func TestPromoteSwapsADirectoryAndKeepsTheOld(t *testing.T) {
 		t.Fatalf("backup = %q, want the old tree", got)
 	}
 }
+
+// A release that fails after adding a service leaves that service's container
+// running: nothing in the restored release's swap ever visits it, because the
+// restored release has no such service. The rollback then reported the previous
+// release as restored while code from the failed one was still serving — and
+// apply() dropped `mutated` on the strength of that, so the ledger called it
+// `failed`, meaning production untouched.
+func TestRollbackRemovesAServiceTheUndoneReleaseIntroduced(t *testing.T) {
+	f := newFake().
+		on("--filter label=shunt.kind=service", "demo-app\tapp\ndemo-broken\tbroken\n", nil).
+		on("ps -aq --filter name=", "cid\n", nil)
+	withFake(t, f)
+
+	restored := svcSpec(map[string]release.Service{"app": {Image: "app"}}, "app")
+	failed := svcSpec(map[string]release.Service{
+		"app":    {Image: "app"},
+		"broken": {Image: "app", Drain: "3s"},
+	}, "app", "broken")
+
+	retireUndeclaredServices(restored, failed)
+
+	if !f.did("docker stop", "demo-broken") {
+		t.Fatalf("the failed release's container was left running; calls:\n%s", strings.Join(f.calls, "\n"))
+	}
+	// Its own drain, not a default: it is still serving something until it stops.
+	if !f.did("docker stop --timeout 3 demo-broken") {
+		t.Error("the outgoing service's drain was not honoured")
+	}
+	if f.did("docker stop", "demo-app") {
+		t.Error("a service the restored release does declare was removed")
+	}
+}
+
+// Accessories are exempt everywhere else and must be here too. A rollback that
+// destroyed the database because the release which booted it went away would be
+// the worst possible reading of "restore the previous release".
+func TestRollbackLeavesAccessoriesAlone(t *testing.T) {
+	// The kind filter is what excludes them, so the fake answers as docker would:
+	// a query for services never mentions the accessory at all.
+	f := newFake().
+		on("--filter label=shunt.kind=service", "demo-app\tapp\n", nil).
+		on("ps -aq --filter name=", "cid\n", nil)
+	withFake(t, f)
+
+	restored := svcSpec(map[string]release.Service{"app": {Image: "app"}}, "app")
+	retireUndeclaredServices(restored, nil)
+
+	for _, c := range f.calls {
+		if strings.Contains(c, "ps -a") && !strings.Contains(c, "label=shunt.kind=service") {
+			t.Fatalf("containers were enumerated without excluding accessories: %q", c)
+		}
+	}
+	if f.did("docker stop", "demo-db") {
+		t.Fatal("a rollback removed an accessory")
+	}
+}
+
+// A container from before shunt labelled them cannot be attributed to a service,
+// so it is left alone rather than guessed at.
+func TestRollbackIgnoresUnlabelledContainers(t *testing.T) {
+	f := newFake().
+		on("--filter label=shunt.kind=service", "demo-mystery\t\n", nil).
+		on("ps -aq --filter name=", "cid\n", nil)
+	withFake(t, f)
+
+	retireUndeclaredServices(svcSpec(map[string]release.Service{"app": {Image: "app"}}, "app"), nil)
+
+	if f.did("docker stop", "demo-mystery") {
+		t.Fatal("an unattributable container was removed")
+	}
+}

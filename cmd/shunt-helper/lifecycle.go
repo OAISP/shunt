@@ -62,12 +62,16 @@ func cmdRollback(args []string) error {
 				envFile = p
 			}
 		}
-		if _, _, err := swapServices(spec, previousSpec(ledger), envFile); err != nil {
+		outgoing := previousSpec(ledger)
+		if _, _, err := swapServices(spec, outgoing, envFile); err != nil {
 			return err
 		}
 		if err := healthCheck(spec); err != nil {
 			return err
 		}
+		// Only once the restore is proven good. Removing the newer release's
+		// containers first would leave the host with neither if this failed.
+		retireUndeclaredServices(spec, outgoing)
 		for i := range ledger.Releases {
 			if ledger.Releases[i].Status == release.StatusActive {
 				ledger.Releases[i].Status = release.StatusSuperseded
@@ -284,6 +288,10 @@ func autoRollback(spec *release.Spec, ledger *release.Ledger) error {
 	if err := healthCheck(prev); err != nil {
 		return err
 	}
+	// A service this deploy introduced has no counterpart in the release being
+	// restored, so nothing above has visited it and it is still running the code
+	// that just failed. Clearing it is what lets apply() drop `mutated`.
+	retireUndeclaredServices(prev, spec)
 	for i := range ledger.Releases {
 		if ledger.Releases[i].ID == target.ID {
 			ledger.Releases[i].Status = release.StatusActive

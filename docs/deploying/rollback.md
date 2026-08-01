@@ -73,6 +73,24 @@ Opt-in on purpose. Automatic rollback is right for a stateless app and wrong for
 a release whose stages already migrated a database: the code would go back and
 the schema would not.
 
+## Services the restored release did not have
+
+Rolling back means running what that release ran. A service the newer release
+introduced has no counterpart in the one being restored, so its container is
+stopped and removed as part of the rollback — otherwise the host keeps serving
+code from the release you just undid, which is the mixed state a rollback exists
+to end. `shunt up` brings it back.
+
+This is the one place shunt stops a container without being asked, and it is
+narrow on purpose. It applies only to rollback, never to a deploy: a service you
+delete from `shunt.toml` is an *orphan*, which `shunt plan` reports and only
+`shunt retire` acts on, because a person removed it and a person should stop it.
+Here nobody asked for the container — shunt created it moments ago as part of an
+attempt that is being taken back.
+
+Accessories are exempt, as everywhere else. No rollback destroys a database
+because the release that booted it went away.
+
 ## What rollback does not do
 
 `shunt rollback` restores containers and images. It does not revert data.
