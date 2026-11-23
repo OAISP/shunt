@@ -65,6 +65,9 @@ func printCurrent(l *release.Ledger, s ui.Style) {
 	if prov := cur.Provenance.Describe(); prov != "" {
 		fmt.Printf("  %s %s\n", s.Dim("from    "), prov)
 	}
+	if run := cur.Provenance.Run; run != "" {
+		fmt.Printf("  %s %s\n", s.Dim("run     "), run)
+	}
 	if cur.Error != "" {
 		fmt.Printf("  %s\n", s.Red(ui.FirstLine(cur.Error)))
 	}

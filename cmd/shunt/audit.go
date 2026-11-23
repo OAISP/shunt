@@ -11,6 +11,7 @@ import (
 	"github.com/OAISP/shunt/internal/build"
 	"github.com/OAISP/shunt/internal/engine"
 	"github.com/OAISP/shunt/internal/manifest"
+	"github.com/OAISP/shunt/internal/release"
 	"github.com/OAISP/shunt/internal/ui"
 )
 
@@ -31,9 +32,9 @@ const (
 // cmdAudit checks everything a deploy depends on, before a deploy depends on it.
 //
 // Every one of these is checked somewhere in the deploy path anyway, but spread
-// across it, so the answer arrives at the worst moment — a missing `curl`
-// surfaces after the container swap. Collected here they are answerable before
-// the first deploy rather than during it.
+// across it, so the answer arrives late — an image built for the wrong
+// architecture loads fine and only fails once it is running. Collected here
+// they are answerable before the first deploy rather than during it.
 func cmdAudit(ctx context.Context, args []string) error {
 	var c commonFlags
 	fs := newFlagSet("audit", &c)
@@ -60,7 +61,15 @@ func cmdAudit(ctx context.Context, args []string) error {
 	}
 
 	if c.asJSON {
-		return json.NewEncoder(os.Stdout).Encode(map[string]any{"checks": checks})
+		if err := json.NewEncoder(os.Stdout).Encode(map[string]any{"checks": checks}); err != nil {
+			return err
+		}
+		for _, ch := range checks {
+			if ch.Status == statusFail {
+				return errReported // exit 1, so CI can gate on audit --json too
+			}
+		}
+		return nil
 	}
 	return renderAudit(checks, c.out())
 }
@@ -82,11 +91,9 @@ func localChecks() []check {
 
 	// A builder without OCI export cannot produce the layout the whole design
 	// rests on, and the failure otherwise appears only after a full build.
-	//
-	// Checking that buildx merely exists is not enough, and used to be all this
-	// did: the default `docker` driver is present on every machine and still
-	// refuses to export a layout unless the daemon runs the containerd image
-	// store. So audit passed, and the very next command died on the first build.
+	// buildx being present is not enough: the default `docker` driver is on
+	// every machine and refuses to export a layout unless the daemon runs the
+	// containerd image store.
 	if outb, err := exec.Command("docker", "buildx", "version").Output(); err != nil {
 		out = append(out, check{"local buildx", statusFail, "not available",
 			"install docker buildx; shunt exports an OCI layout with it"})
@@ -129,11 +136,9 @@ func hostChecks(ctx context.Context, m *manifest.Manifest) []check {
 		{"host ssh", statusOK, "connected to " + m.Host, ""},
 		{"host docker", statusOK, f.DockerVersion + " on " + f.Arch, ""},
 		{"host rsync", statusOK, versionOr(f.RsyncVersion), ""},
-		{"host curl", statusOK, "present", ""},
 	}
-	// Connect fails outright when rsync or curl is missing, so reaching here
-	// means they are present; report them anyway so the list is a complete
-	// account rather than a list of things that happened to be checked.
+	// Connect fails outright when rsync is missing, so reaching here means it is
+	// present; it is reported anyway so the list is a complete account.
 
 	// tar is not required — the helper writes the load archive itself — so its
 	// absence is worth noting and never a failure.
@@ -151,27 +156,39 @@ func hostChecks(ctx context.Context, m *manifest.Manifest) []check {
 			"apt-get install rsync from a release with 3.2+ (Ubuntu 20.04 ships 3.1.3)"})
 	}
 
-	if f.FreeBytes > 0 {
-		st := statusOK
-		fix := ""
-		if f.FreeBytes < 2<<30 {
-			st, fix = statusWarn, "free some space, or run `shunt prune`"
-		}
-		out = append(out, check{"host disk", st, ui.Bytes(f.FreeBytes) + " free", fix})
-	}
-
 	// The image platform is the single most common first-deploy failure: an
 	// arm64 laptop building for an amd64 server produces an image that loads
 	// fine and then exits immediately.
 	out = append(out, platformCheck(m, f.GoArch()))
 
-	if err := e.PreflightArtifacts(ctx); err != nil {
+	state, err := e.PlanState(ctx, e.ArtifactDests())
+	switch {
+	case err != nil:
 		out = append(out, check{"host artifact paths", statusFail, ui.FirstLine(err.Error()),
 			"create the destination directories, or point dest= somewhere writable"})
-	} else if len(m.Artifacts) > 0 {
+	case len(m.Artifacts) > 0:
 		out = append(out, check{"host artifact paths", statusOK, "writable", ""})
 	}
+	if state != nil && state.Disk != nil {
+		out = append(out, diskCheck(*state.Disk))
+	}
 	return out
+}
+
+// diskCheck warns below 2 GB wherever a deploy writes. The real check is sized
+// from each deploy's own delta; this is the early warning.
+func diskCheck(d release.Disk) check {
+	free, where := d.StoreFree, "for the store"
+	if !d.Shared && d.DockerFree > 0 && d.DockerFree < free {
+		free, where = d.DockerFree, "in docker's data root"
+	}
+	if free <= 0 {
+		return check{"host disk", statusOK, "free space could not be read", ""}
+	}
+	if free < 2<<30 {
+		return check{"host disk", statusWarn, ui.Bytes(free) + " free " + where, "free some space, or run `shunt prune`"}
+	}
+	return check{"host disk", statusOK, ui.Bytes(free) + " free " + where, ""}
 }
 
 // platformCheck compares what each image will be built for against the host.

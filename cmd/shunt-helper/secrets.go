@@ -107,17 +107,11 @@ func writeSecretFiles(spec *release.Spec, scope []string) (string, error) {
 	}
 
 	// Updated in place rather than recreated. Every service sharing a scope
-	// shares this directory — and two services that both narrow to the same keys
-	// share it, as do any two that narrow to nothing at all, which is the
-	// default. Removing and recreating it unlinked the very inode an
-	// already-running container had bind-mounted, so the first service to start
-	// was left with an empty /run/secrets for the life of the release while the
-	// last one to start saw the files. Nothing failed: the container came up,
-	// passed its health check, and could not read its own credentials.
-	//
-	// Stale keys still have to go, which is what this loop is for: the property
-	// worth keeping is "a key removed from the manifest does not linger", not the
-	// unlink that used to deliver it.
+	// shares this directory — including any two that narrow to nothing, the
+	// default — and recreating it would unlink the inode an already-running
+	// container has bind-mounted, leaving it an empty /run/secrets that still
+	// passes its health check. Stale keys are removed one by one instead, so a
+	// key dropped from the manifest does not linger.
 	ents, err := os.ReadDir(dir)
 	if err != nil {
 		return "", err

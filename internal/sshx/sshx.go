@@ -15,7 +15,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -189,29 +188,31 @@ func (c *Client) Upload(ctx context.Context, local, remote string, mode os.FileM
 // trip, as key=value lines so a missing field cannot shift the meaning of the
 // others the way positional output can.
 //
-// It covers the tools shunt shells out to on the host. `curl` runs url health
-// checks, and when it was missing the deploy got all the way past the container
-// swap before failing — the worst possible moment to discover a missing
-// package. `tar` is still reported because a host that has it is worth knowing
-// about, but no longer required: the helper builds the load archive itself.
+// rsync is the only tool shunt needs on the host besides docker; the helper
+// does its own health probes and builds its own load archive. tar is reported
+// only because its absence usually means a very minimal image.
 const probeScript = `
 echo "root=${SHUNT_ROOT:-$HOME/.shunt}"
 echo "arch=$(uname -m)"
 echo "docker=$(docker version --format '{{.Server.Version}}' 2>&1 | head -1)"
 echo "rsync=$(rsync --version 2>/dev/null | head -1 | awk '{print $3}')"
 echo "rsync_zstd=$(rsync --version 2>/dev/null | grep -ci zstd)"
-command -v curl >/dev/null && echo "curl=yes" || echo "curl=no"
 command -v tar  >/dev/null && echo "tar=yes"  || echo "tar=no"
-echo "free_kb=$(df -Pk "${SHUNT_ROOT:-$HOME}" 2>/dev/null | awk 'NR==2{print $4}')"
 `
 
 // Probe verifies the host is reachable and reports what shunt needs from it.
-func (c *Client) Probe(ctx context.Context) (Facts, error) {
+// helpers names files to look for in the helper directory, so checking that an
+// up-to-date helper is in place costs no round trip of its own.
+func (c *Client) Probe(ctx context.Context, helpers ...string) (Facts, error) {
 	var f Facts
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	out, err := c.Run(ctx, "sh", "-c", probeScript)
+	script := probeScript
+	for _, h := range helpers {
+		script += fmt.Sprintf("if [ -x \"${SHUNT_ROOT:-$HOME/.shunt}/bin/\"%s ]; then echo %s; fi\n", Quote(h), Quote("has:"+h+"=1"))
+	}
+	out, err := c.Run(ctx, "sh", "-c", script)
 	if err != nil {
 		return f, err
 	}
@@ -230,10 +231,14 @@ func (c *Client) Probe(ctx context.Context) (Facts, error) {
 	f.RsyncVersion = kv["rsync"]
 	f.HasRsync = f.RsyncVersion != ""
 	f.RsyncZstd = kv["rsync_zstd"] != "" && kv["rsync_zstd"] != "0"
-	f.HasCurl = kv["curl"] == "yes"
 	f.HasTar = kv["tar"] == "yes"
-	if n, err := strconv.ParseInt(kv["free_kb"], 10, 64); err == nil {
-		f.FreeBytes = n * 1024
+	for _, h := range helpers {
+		if kv["has:"+h] == "1" {
+			if f.Helpers == nil {
+				f.Helpers = map[string]bool{}
+			}
+			f.Helpers[h] = true
+		}
 	}
 
 	if strings.Contains(strings.ToLower(f.DockerVersion), "cannot connect") ||
@@ -253,9 +258,6 @@ func (f Facts) Missing() []string {
 	var missing []string
 	if !f.HasRsync {
 		missing = append(missing, "rsync")
-	}
-	if !f.HasCurl {
-		missing = append(missing, "curl")
 	}
 	return missing
 }
@@ -278,16 +280,14 @@ type Facts struct {
 	// older still — so the flag cannot simply be assumed.
 	RsyncZstd bool
 
-	HasCurl bool // url health checks shell out to it on the host
-
 	// HasTar is informational. The helper writes the load archive itself, so a
 	// host without tar deploys fine; it is reported only because its absence
 	// usually means a very minimal image worth knowing about.
 	HasTar bool
 
-	// FreeBytes is free space where the store and ledger live. Running out
-	// mid-transfer leaves a partial layout and a confusing error.
-	FreeBytes int64
+	// Helpers are the helper binaries the probe was asked about that the host
+	// already has.
+	Helpers map[string]bool
 }
 
 // GoArch maps uname -m to the GOARCH used to pick a helper binary.

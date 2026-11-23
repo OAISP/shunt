@@ -3,13 +3,13 @@
 #
 # Everything here is a path unit tests cannot reach: containers actually swap,
 # health checks actually probe, a failed stage actually has to leave production
-# alone. These are the failures that cost someone their site, and until now the
-# only thing standing behind them was the honour system in CONTRIBUTING.
+# alone. These are the failures that cost someone their site.
 #
 # Usage:  test/e2e.sh <ssh-host>     (defaults to localhost)
 #
-# The host needs docker, rsync, tar and curl, and an ssh account that can reach
-# the docker socket. CI points it at the runner itself.
+# The host needs docker and rsync, and an ssh account that can reach the docker
+# socket. CI points it at the runner itself. Assertions read served content with
+# curl on the host, so the test itself needs that there too.
 set -euo pipefail
 
 HOST="${1:-localhost}"
@@ -59,13 +59,8 @@ neq() { # neq <description> <got> <unwanted>
 
 # says <description> <pattern> <command...>
 #
-# Asserts on a command's stdout, and on nothing else. Deliberately not
-# `cmd | grep -q`: this script runs under `set -o pipefail`, which gives the
-# pipeline the command's exit status, and `shunt plan` exits 2 by design when it
-# finds changes. Piping therefore turned "the output says this" into "...and the
-# host had nothing else to apply" — a second, unrelated claim that silently
-# breaks as soon as an earlier test leaves the host and the manifest legitimately
-# out of step.
+# Asserts on a command's stdout, and on nothing else — not its exit status, so a
+# claim about the output stays independent of whether the host has other work.
 says() {
   local desc="$1" pattern="$2"; shift 2
   local out
@@ -105,6 +100,7 @@ context = "."
 [services.app]
 image   = "app"
 publish = ["127.0.0.1:$PORT:8080"]
+init    = true
 
 [services.app.health]
 url     = "/index.html"
@@ -113,6 +109,7 @@ retries = 20
 [services.worker]
 image   = "app"
 command = ["sh", "-c", "while true; do echo tick; sleep 5; done"]
+init    = true
 EOF
 
 served() { ssh -o BatchMode=yes "$HOST" "curl -sS --max-time 5 http://127.0.0.1:$PORT/index.html"; }
@@ -132,8 +129,8 @@ neq "a release was recorded" "$R1" ""
 
 # ------------------------------------------------------------------- no-op ---
 step "no-op"
-# plan exits 2 when there are changes, 0 when there are none.
-exits "plan exits 0 when the host already matches" 0 "$SHUNT" plan
+# --detailed-exitcode: 2 when there are changes, 0 when there are none.
+exits "plan exits 0 when the host already matches" 0 "$SHUNT" plan --detailed-exitcode
 
 # --json must not redeploy when nothing changed.
 "$SHUNT" up -y --json </dev/null >/dev/null 2>&1 || true
@@ -142,12 +139,19 @@ eq "up --json does not redeploy a no-op" "$(current)" "$R1"
 # ------------------------------------------------------------ code change ----
 step "code change"
 echo "v2" > index.html
-"$SHUNT" up -y </dev/null >/dev/null
+"$SHUNT" up -y </dev/null >"$WORK/v2.log" 2>&1
 eq "the app serves v2" "$(served)" "v2"
+# Neither process installs a SIGTERM handler; as PID 1 they would each sit out
+# the whole drain. Under init = true they exit on stop.
+if grep -q "ignored SIGTERM" "$WORK/v2.log"; then
+  bad "init = true lets a process with no SIGTERM handler exit on stop"
+else
+  ok "init = true lets a process with no SIGTERM handler exit on stop"
+fi
 R2="$(current)"
 neq "a new release was recorded" "$R2" "$R1"
 
-exits "plan is clean again after deploying" 0 "$SHUNT" plan
+exits "plan is clean again after deploying" 0 "$SHUNT" plan --detailed-exitcode
 
 # ------------------------------------------------------------ failed stage ---
 # The safety invariant of the whole tool: a stage that fails must leave the
@@ -190,7 +194,7 @@ eq "the ledger points at the restored release" "$(current)" "$R2"
 # A plan built from the ledger alone would call this "unchanged".
 step "drift detection"
 ssh -o BatchMode=yes "$HOST" "docker rm -f $PROJECT-worker" >/dev/null 2>&1 || true
-exits "a hand-deleted container is reported as work" 2 "$SHUNT" plan
+exits "a hand-deleted container is reported as work" 2 "$SHUNT" plan --detailed-exitcode
 "$SHUNT" up -y </dev/null >/dev/null
 if ssh -o BatchMode=yes "$HOST" "docker ps --filter name=$PROJECT-worker --format '{{.Names}}'" | grep -q worker; then
   ok "the missing container was restored"
@@ -249,6 +253,51 @@ mv shunt.toml.bak shunt.toml
 echo "v3" > index.html
 "$SHUNT" up -y </dev/null >/dev/null 2>&1 || true
 
+# ------------------------------------------------------ cancelled deploy ----
+# CI cancels jobs all the time: a newer push, a timeout. Once the release has
+# been handed to the host, the helper must finish it under the lock rather than
+# die at its next status write — possibly between stopping a container and
+# starting its replacement.
+step "a deploy cancelled mid-apply still lands"
+cp shunt.toml shunt.toml.bak
+cat >> shunt.toml <<'TOML'
+
+[[stages]]
+name    = "slow"
+image   = "app"
+command = ["sh", "-c", "sleep 6"]
+TOML
+BEFORE="$(current)"
+echo "v-cancelled" > index.html
+"$SHUNT" up -y </dev/null >"$WORK/cancel.log" 2>&1 &
+pid=$!
+for _ in $(seq 1 240); do grep -q "applying" "$WORK/cancel.log" && break; sleep 0.25; done
+sleep 1
+kill -INT "$pid"
+wait "$pid" || true
+# The ledger is written last, once every service is swapped and healthy.
+for _ in $(seq 1 90); do [ "$(current)" != "$BEFORE" ] && break; sleep 1; done
+neq "the helper finished and recorded the release" "$(current)" "$BEFORE"
+eq "the abandoned release is serving" "$(served)" "v-cancelled"
+
+# --------------------------------------------------- deploy behind a deploy --
+# The second deploy plans against the release serving when it started, then
+# waits for the lock. By the time it gets it, that premise is gone — applying
+# anyway would silently revert the first.
+step "a deploy that waited behind another is refused"
+echo "v-first" > index.html
+"$SHUNT" up -y </dev/null >"$WORK/first.log" 2>&1 &
+first=$!
+for _ in $(seq 1 240); do grep -q "applying" "$WORK/first.log" && break; sleep 0.25; done
+echo "v-second" > index.html
+fails "the queued deploy was refused" "$SHUNT" up -y
+wait "$first" || true
+eq "the first deploy's release is serving" "$(served)" "v-first"
+
+mv shunt.toml.bak shunt.toml
+echo "v3" > index.html
+"$SHUNT" up -y </dev/null >/dev/null 2>&1 || true
+
 # ----------------------------------------------------------------- bundle ----
 # A bundle has to apply from a directory with no manifest, no Dockerfile and no
 # source — that is the entire point of it.
@@ -266,7 +315,7 @@ succeeds "verify rehashes its blobs" \
 # --plan must answer without touching anything.
 BEFORE_PLAN="$(current)"
 exits "apply --plan reports changes with exit 2" 2 \
-  "$SHUNT" apply --plan "$BUNDLE_DIR/rel.shuntpkg"
+  "$SHUNT" apply --plan --detailed-exitcode "$BUNDLE_DIR/rel.shuntpkg"
 eq "apply --plan changed nothing" "$(current)" "$BEFORE_PLAN"
 
 ( cd "$BUNDLE_DIR" && "$SHUNT" apply rel.shuntpkg -y ) >/dev/null 2>&1 || true
@@ -274,7 +323,7 @@ eq "the bundle deployed" "$(served)" "v5"
 
 # Re-planning an applied bundle must be a clean no-op, which only holds if
 # mtimes survived the archive.
-exits "apply --plan is clean once applied" 0 "$SHUNT" apply --plan "$BUNDLE_DIR/rel.shuntpkg"
+exits "apply --plan is clean once applied" 0 "$SHUNT" apply --plan --detailed-exitcode "$BUNDLE_DIR/rel.shuntpkg"
 
 # Immutable release ids mean the host has already recorded this one.
 if ( cd "$BUNDLE_DIR" && "$SHUNT" apply rel.shuntpkg -y ) >/dev/null 2>&1; then

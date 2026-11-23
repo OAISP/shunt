@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -240,5 +241,52 @@ func TestOCIExportOKIsTheCombination(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("driver=%q containerd=%v: OK = %v, want %v", tc.driver, tc.containerd, got, tc.want)
 		}
+	}
+}
+
+func TestCacheForGitHubActions(t *testing.T) {
+	c := CacheFor("gha", "acme-app")
+	if c.From != "type=gha,scope=shunt-acme-app" {
+		t.Errorf("From = %q", c.From)
+	}
+	// A cache outage must cost a slower build, never a failed deploy.
+	if !strings.Contains(c.To, "mode=max") || !strings.Contains(c.To, "ignore-error=true") ||
+		!strings.Contains(c.To, "scope=shunt-acme-app") {
+		t.Errorf("To = %q", c.To)
+	}
+	if CacheFor("", "acme-app") != nil {
+		t.Error("an unset cache produced cache flags")
+	}
+}
+
+// buildx never collects garbage in a local cache it exports into, so each build
+// writes beside the old cache and is swapped over it afterwards.
+func TestCacheForADirectoryRotates(t *testing.T) {
+	root := t.TempDir()
+	c := CacheFor(root, "acme-app")
+	if c.From != "" {
+		t.Errorf("first build imported from a cache that does not exist yet: %q", c.From)
+	}
+	next := filepath.Join(root, "acme-app.next")
+	if c.To != "type=local,mode=max,dest="+next {
+		t.Errorf("To = %q", c.To)
+	}
+
+	if err := os.MkdirAll(next, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(next, "index.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.rotate(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(next); !os.IsNotExist(err) {
+		t.Error("the exported cache was left beside the live one")
+	}
+
+	again := CacheFor(root, "acme-app")
+	if again.From != "type=local,src="+filepath.Join(root, "acme-app") {
+		t.Errorf("second build did not import the rotated cache: %q", again.From)
 	}
 }

@@ -5,23 +5,16 @@ import (
 	"fmt"
 	"maps"
 	"os"
-	"path/filepath"
 	"reflect"
 	"slices"
-	"strings"
 
 	"github.com/OAISP/shunt/internal/build"
 	"github.com/OAISP/shunt/internal/oci"
 	"github.com/OAISP/shunt/internal/release"
-	"github.com/OAISP/shunt/internal/sshx"
-	"github.com/OAISP/shunt/internal/transport"
 )
 
-// PlanSchema versions the machine-readable plan.
-//
-// `--json` previously emitted whatever Go field names happened to be, which is
-// not a contract: renaming a field would have silently broken every consumer.
-// The version is what lets a consumer notice a change instead of misreading one.
+// PlanSchema versions the machine-readable plan, so a consumer notices a change
+// in its shape instead of misreading one.
 const PlanSchema = 1
 
 // Plan is the diff between what the host is running and what the manifest says
@@ -174,9 +167,8 @@ func (p *Plan) Changed() bool {
 			return true
 		}
 	}
-	// Adding a migration to the manifest is a deploy. Without this the stage was
-	// invisible to change detection, `shunt up` said "nothing to do", and the
-	// migration silently never ran.
+	// Adding a migration to the manifest is a deploy even when nothing else
+	// changed; otherwise the migration would never run.
 	for _, st := range p.Stages {
 		if st.Action != "run" {
 			return true
@@ -185,8 +177,6 @@ func (p *Plan) Changed() bool {
 	// Settings that belong to the release rather than to any one service —
 	// switching secrets from environment to files, renaming the network —
 	// change how every container is created but appear in no service diff.
-	// Without this they were silently ignored until something else forced a
-	// deploy, which is the same shape of bug stages had.
 	return len(p.Release) > 0
 }
 
@@ -252,8 +242,8 @@ func (e *Engine) BuildPlan(ctx context.Context, spec *release.Spec, built map[st
 			}
 		}
 		// The ledger says what shunt last deployed; only the containers say what
-		// the host is running now. Without this a service deleted, stopped or
-		// replaced by hand read as "unchanged" and `shunt up` refused to fix it.
+		// the host is running now, so a service deleted, stopped or replaced by
+		// hand is reported as work.
 		if drift := reconcileService(state, name, svc); len(drift) > 0 {
 			if sc.Action == "unchanged" {
 				sc.Action = "update"
@@ -272,16 +262,14 @@ func (e *Engine) BuildPlan(ctx context.Context, spec *release.Spec, built map[st
 
 	p.Accessories = e.planAccessories(p, spec, state, oldSpec)
 
-	// Every artifact stat in one round trip rather than one apiece; see
-	// RemoteFileStat for why size and mtime are the right test rather than
-	// hashing.
-	dests := make([]string, 0, len(spec.Artifacts))
+	// Size and mtime are exactly the heuristic rsync itself uses to decide
+	// whether a file needs transferring. Hashing would be exact but means
+	// reading the whole file on both sides — most of the cost of shipping it.
 	for _, a := range spec.Artifacts {
-		dests = append(dests, a.Dest)
-	}
-	hostStats := transport.RemoteFileStats(ctx, e.Client, dests)
-	for _, a := range spec.Artifacts {
-		host := hostStats[a.Dest]
+		host, ok := state.pathState(a.Dest)
+		if !ok {
+			host = release.PathState{Size: -1}
+		}
 		p.Artifacts = append(p.Artifacts, ArtifactChange{
 			Name:       a.Name,
 			Dest:       a.Dest,
@@ -304,7 +292,7 @@ func (e *Engine) BuildPlan(ctx context.Context, spec *release.Spec, built map[st
 
 	defer func() { p.HasChanges = p.Changed() }()
 
-	est, err := e.estimate(ctx, built)
+	est, err := EstimateTransfer(built, state)
 	if err != nil {
 		// A failed estimate must not block a deploy; it is informational.
 		fmt.Fprintf(os.Stderr, "warning: could not estimate transfer size: %v\n", err)
@@ -360,40 +348,25 @@ func (e *Engine) planAccessories(p *Plan, spec *release.Spec, state *RemoteState
 	return out
 }
 
-// estimate asks the host which blobs it already holds and sums the rest. This is
-// the number that makes the registry-free approach legible: it is the actual
-// wire cost of the deploy, before it happens.
-//
-// One round trip for every image, not one per image: each listing is fenced by
-// a marker line so the replies can be told apart. A manifest with several images
-// otherwise paid a full ssh round trip each, before any work had started.
-func (e *Engine) estimate(ctx context.Context, built map[string]*build.Result) (*TransferEstimate, error) {
+// EstimateTransfer sums the blobs the host's store does not hold yet. This is
+// the number that makes the registry-free approach legible: the actual wire
+// cost of the deploy, before it happens.
+func EstimateTransfer(built map[string]*build.Result, state *RemoteState) (*TransferEstimate, error) {
 	est := &TransferEstimate{}
-	if len(built) == 0 {
-		return est, nil
-	}
-	names := slices.Sorted(maps.Keys(built))
-
-	var script strings.Builder
-	for _, name := range names {
-		dir := filepath.Join(e.StorePath(), name, "blobs", "sha256")
-		fmt.Fprintf(&script, "echo %s\nls -1 %s 2>/dev/null || true\n",
-			sshx.Quote(blobFence+name), sshx.Quote(dir))
-	}
-	out, err := e.Client.Run(ctx, "sh", "-c", script.String())
-	if err != nil {
-		return nil, err
-	}
-	have := parseBlobListing(out)
-
-	for _, name := range names {
+	for _, name := range slices.Sorted(maps.Keys(built)) {
+		have := map[string]bool{}
+		if state != nil {
+			for _, d := range state.Store[name] {
+				have[d] = true
+			}
+		}
 		local, err := oci.Blobs(built[name].Dir)
 		if err != nil {
 			return nil, err
 		}
 		for digest, sz := range local {
 			est.Total += sz
-			if !have[name][digest] {
+			if !have[digest] {
 				est.Missing += sz
 				est.Blobs++
 			}
@@ -402,23 +375,10 @@ func (e *Engine) estimate(ctx context.Context, built map[string]*build.Result) (
 	return est, nil
 }
 
-// blobFence separates one image's blob listing from the next in a batched reply.
-// A digest is hex, so this cannot collide with one.
-const blobFence = "--shunt-image:"
-
-func parseBlobListing(out string) map[string]map[string]bool {
-	have := map[string]map[string]bool{}
-	var current string
-	for _, ln := range strings.Split(out, "\n") {
-		ln = strings.TrimSpace(ln)
-		switch {
-		case ln == "":
-		case strings.HasPrefix(ln, blobFence):
-			current = strings.TrimPrefix(ln, blobFence)
-			have[current] = map[string]bool{}
-		case current != "":
-			have[current][ln] = true
-		}
+func (s *RemoteState) pathState(dest string) (release.PathState, bool) {
+	if s == nil {
+		return release.PathState{}, false
 	}
-	return have
+	st, ok := s.Paths[dest]
+	return st, ok
 }

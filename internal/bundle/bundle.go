@@ -60,6 +60,11 @@ type Meta struct {
 	// Spec is the release, with secret values stripped. Its Images point at
 	// layouts inside the archive.
 	Spec *release.Spec `json:"spec"`
+
+	// Targets are the manifest's other destinations. A target changes where a
+	// release goes and never what it contains, so the same bytes can be applied
+	// to any of them: build once, then promote from staging to production.
+	Targets map[string]manifest.Destination `json:"targets,omitempty"`
 }
 
 // Contents names what a bundle should hold, resolved on the building machine.

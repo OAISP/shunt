@@ -39,9 +39,10 @@ func drainSeconds(svc release.Service) int {
 // stopAndRemove stops a container with SIGTERM and a grace period, then removes
 // it. `docker rm -f` SIGKILLs immediately, which drops every in-flight request;
 // this gives the process a chance to finish what it was doing.
-func stopAndRemove(container string, drain int) {
+// It reports whether there was a container to remove.
+func stopAndRemove(container string, drain int) bool {
 	if !containerExists(container) {
-		return
+		return false
 	}
 	start := time.Now()
 	docker.Ok("docker", "stop", "--timeout", fmt.Sprint(drain), container)
@@ -54,9 +55,10 @@ func stopAndRemove(container string, drain int) {
 	// It is also the app-side contract the zero-downtime section describes, so
 	// point at the fix rather than just reporting a number.
 	if drain > 0 && took >= time.Duration(drain)*time.Second {
-		info(fmt.Sprintf("%s ignored SIGTERM and was killed after %ds — handling it would cut that to near zero",
-			container, drain))
+		info(fmt.Sprintf("%s ignored SIGTERM and was killed after %ds — handling it, or `init = true` "+
+			"if it runs as PID 1, would cut that to near zero", container, drain))
 	}
+	return true
 }
 
 // containerIP resolves a container's address on the deploy network. It lets
@@ -156,19 +158,26 @@ func containerExists(name string) bool {
 	return err == nil && strings.TrimSpace(out) != ""
 }
 
-// startContainer removes any container of the same name and runs a fresh one.
-func startContainer(spec *release.Spec, name string, svc release.Service, envFile, kind string) error {
+// startContainer replaces any container of the same name with a fresh one, and
+// reports whether there was one to replace.
+//
+// The replacement is created before the old container is stopped. Creating it
+// is where docker checks the image, mounts and arguments, so a definition it
+// rejects leaves the old container serving, and the gap an in-place swap cannot
+// avoid shrinks to the stop and the start.
+func startContainer(spec *release.Spec, name string, svc release.Service, envFile, kind string) (replaced bool, err error) {
 	ref, err := imageRef(spec, svc.Image)
 	if err != nil {
-		return err
+		return false, err
 	}
 	container := serviceContainer(spec, name, svc)
+	staged := container + ".next"
+	docker.Ok("docker", "rm", "-f", staged) // left by an interrupted deploy
 
-	// A same-named container may linger from an interrupted deploy. Stop it
-	// gracefully rather than SIGKILLing whatever is still in flight.
-	stopAndRemove(container, drainSeconds(svc))
-
-	args := []string{"run", "-d", "--name", container, "--restart", svc.Restart}
+	args := []string{"create", "--name", staged, "--restart", svc.Restart}
+	if svc.Init {
+		args = append(args, "--init")
+	}
 	if spec.Network != "" {
 		args = append(args, "--network", spec.Network, "--network-alias", name)
 	}
@@ -178,7 +187,7 @@ func startContainer(spec *release.Spec, name string, svc release.Service, envFil
 		if len(spec.Secrets) > 0 {
 			dir, err := writeSecretFiles(spec, svc.Secrets)
 			if err != nil {
-				return fmt.Errorf("service %s: %w", name, err)
+				return false, fmt.Errorf("service %s: %w", name, err)
 			}
 			args = append(args, "-v", dir+":"+release.SecretMountPath+":ro")
 		}
@@ -187,7 +196,7 @@ func startContainer(spec *release.Spec, name string, svc release.Service, envFil
 		if len(svc.Secrets) > 0 {
 			scoped, err := writeEnvFileScoped(spec, svc.Secrets)
 			if err != nil {
-				return fmt.Errorf("service %s: %w", name, err)
+				return false, fmt.Errorf("service %s: %w", name, err)
 			}
 			envFile = scoped
 		}
@@ -225,9 +234,17 @@ func startContainer(spec *release.Spec, name string, svc release.Service, envFil
 	args = append(args, svc.Command...)
 
 	if out, err := docker.Run("docker", args...); err != nil {
-		return fmt.Errorf("start %s: %s", container, strings.TrimSpace(out))
+		return false, fmt.Errorf("create %s: %s", container, strings.TrimSpace(out))
 	}
-	return nil
+	// Gracefully, not with rm -f: SIGKILL drops whatever is still in flight.
+	replaced = stopAndRemove(container, drainSeconds(svc))
+	if out, err := docker.Run("docker", "rename", staged, container); err != nil {
+		return replaced, fmt.Errorf("rename %s: %s", staged, strings.TrimSpace(out))
+	}
+	if out, err := docker.Run("docker", "start", container); err != nil {
+		return replaced, fmt.Errorf("start %s: %s", container, strings.TrimSpace(out))
+	}
+	return replaced, nil
 }
 
 // ensureAccessories brings up stateful dependencies that are not already
@@ -250,7 +267,7 @@ func ensureAccessories(spec *release.Spec, ledger *release.Ledger, envFile strin
 			continue
 		}
 		step("accessory:"+name, "booting "+container)
-		if err := startContainer(spec, name, acc, envFile, "accessory"); err != nil {
+		if _, err := startContainer(spec, name, acc, envFile, "accessory"); err != nil {
 			return err
 		}
 		// Recorded here rather than from the release spec: a deploy records the
@@ -301,14 +318,15 @@ func swapServices(spec, prev *release.Spec, envFile string) (started []string, m
 		container := serviceContainer(spec, name, svc)
 
 		if !svc.Proxied() {
-			// Replacing in place stops the old container first, so the moment
-			// this begins the host is no longer as it was — whether or not the
-			// new container comes up.
-			mutated = true
 			step("swap:"+name, "replacing "+container)
-			if err := startContainer(spec, name, svc, envFile, "service"); err != nil {
-				return started, mutated, err
+			replaced, err := startContainer(spec, name, svc, envFile, "service")
+			// A replacement docker refused to create never touched the old
+			// container; once that was stopped, the host has changed whether or
+			// not the new one comes up.
+			if err != nil {
+				return started, mutated || replaced, err
 			}
+			mutated = true
 			// A service that used to be proxied left per-release containers
 			// behind, and those still carry their proxy labels — so without this
 			// they would keep serving the old code indefinitely.
@@ -336,7 +354,7 @@ func swapServices(spec, prev *release.Spec, envFile string) (started []string, m
 		}
 
 		step("swap:"+name, "starting "+container+" alongside the running release")
-		if err := startContainer(spec, name, svc, envFile, "service"); err != nil {
+		if _, err := startContainer(spec, name, svc, envFile, "service"); err != nil {
 			return started, mutated, err
 		}
 		// The old container is still serving, so a broken new release must be

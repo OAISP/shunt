@@ -44,3 +44,12 @@ func TestParseStatIgnoresUnrelatedLines(t *testing.T) {
 		t.Errorf("unrelated lines mutated stats: %+v", st)
 	}
 }
+
+// Unchanged blobs are skipped by rsync's quick check, so they show up in the
+// total and nowhere else — which is the common case, and must read as cached.
+func TestDedupPercentCountsSkippedFilesAsCached(t *testing.T) {
+	st := Stats{Total: 17_800_000, Literal: 2_300}
+	if got := st.DedupPercent(); got < 99.9 {
+		t.Errorf("DedupPercent = %.2f with nothing matched and almost nothing sent, want ~100", got)
+	}
+}

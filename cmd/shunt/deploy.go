@@ -4,21 +4,22 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"maps"
 	"os"
-	"slices"
 	"time"
 
+	"github.com/OAISP/shunt/internal/build"
 	"github.com/OAISP/shunt/internal/engine"
+	"github.com/OAISP/shunt/internal/release"
 	"github.com/OAISP/shunt/internal/ui"
 )
 
 // cmdPlan builds and diffs, but changes nothing on the host.
 func cmdPlan(ctx context.Context, args []string) error {
 	var c commonFlags
-	var noCache bool
+	var noCache, detailed bool
 	fs := newFlagSet("plan", &c)
 	fs.BoolVar(&noCache, "no-cache", false, "build without the layer cache")
+	fs.BoolVar(&detailed, "detailed-exitcode", false, "exit 2 when there are changes to apply")
 	if err := parseArgs(fs, args); err != nil {
 		return err
 	}
@@ -45,10 +46,9 @@ func cmdPlan(ctx context.Context, args []string) error {
 			fmt.Println("  nothing to do — the host already matches this manifest")
 		}
 	}
-	// Distinct exit codes so CI can branch on "is there anything to deploy"
-	// without parsing prose: 0 means the host already matches, 2 means it does
-	// not. Errors keep 1, so a broken plan is never mistaken for a clean one.
-	if p.Changed() {
+	// Opt-in, as with terraform: a plan step in a pull request should not fail
+	// the job merely because there is something to deploy.
+	if detailed && p.Changed() {
 		return errExitChanges
 	}
 	return nil
@@ -99,42 +99,10 @@ func cmdUp(ctx context.Context, args []string) error {
 		}
 	}
 
-	// Taken before the transfer, not just around the container swap. Two deploys
-	// otherwise rsync into the same store with --delete and stage artifacts over
-	// each other long before either helper reaches its own lock.
-	lock, err := b.engine.AcquireLock(ctx, func(msg string) {
-		fmt.Fprintf(os.Stderr, "  %s\n", c.err().Dim(msg))
-	})
-	if err != nil {
-		return err
-	}
-	defer lock.Release()
-
-	// Another deploy may have landed while we waited for the lock, so the plan's
-	// premise is re-stated for the helper to check under its own lock.
-	b.spec.ExpectedCurrent = b.state.ExpectedCurrent()
-
-	// And checked here as well, because the helper only sees the spec after the
-	// transfer. Waiting behind another deploy and then uploading a whole image
-	// to be told the plan expired is minutes of wire time spent on a release
-	// that was never going to be applied; one round trip answers it first.
-	if err := confirmPremise(ctx, b); err != nil {
-		return err
-	}
 	b.engine.WithProvenance(b.spec, version)
 	b.spec.RollbackOnFailure = rollbackOnFail
-
-	if err := ship(ctx, b, &c); err != nil {
-		return err
-	}
-
-	s := c.err()
-	fmt.Fprintf(os.Stderr, "\n%s\n", s.Bold("applying"))
-	applyStart := time.Now()
-	r := c.renderer()
-	if err := run(func(r engine.EventRenderer) error {
-		return b.engine.Apply(ctx, b.spec, r)
-	}, r, "deploy"); err != nil {
+	t, err := deploy(ctx, b.engine, b.spec, b.built, b.state, &c)
+	if err != nil {
 		return err
 	}
 	if !c.asJSON {
@@ -142,33 +110,52 @@ func cmdUp(ctx context.Context, args []string) error {
 		// advertises, but the host still has to load the image and swap
 		// containers, and an operator wondering where twelve seconds went should
 		// not have to guess which phase owns them.
-		fmt.Fprintf(os.Stderr, "  %s\n", s.Dim(fmt.Sprintf(
+		fmt.Fprintf(os.Stderr, "  %s\n", c.err().Dim(fmt.Sprintf(
 			"done in %s  ·  build %s · ship %s · apply %s",
-			round(time.Since(start)), round(b.buildTook), round(b.shipTook), round(time.Since(applyStart)))))
+			round(time.Since(start)), round(b.buildTook), round(t.ship), round(t.apply))))
 	}
 	return nil
 }
 
-// confirmPremise rechecks, under the lock, that the release this plan was built
-// against is still the one serving.
+// phases is where a deploy's wall clock went after the build.
+type phases struct{ ship, apply time.Duration }
+
+// deploy takes the project lock on the host, ships the release and hands it to
+// the helper, which holds the lock until the release is applied.
 //
-// The helper makes the same check and is the authority — it holds the lock that
-// actually matters. This one exists only to make the failure cheap, and says
-// nothing when the host has not moved.
-func confirmPremise(ctx context.Context, b *buildOut) error {
-	now, err := b.engine.State(ctx)
+// The plan was built before the lock was taken — a build can take minutes — so
+// the release it was built against must still be serving once the lock is
+// ours. Checked before anything is shipped: that is what stops a deploy that
+// waited behind another from silently reverting it, and finding out after an
+// upload would waste the upload.
+func deploy(ctx context.Context, e *engine.Engine, spec *release.Spec, built map[string]*build.Result,
+	state *engine.RemoteState, c *commonFlags) (phases, error) {
+	var t phases
+	expected := state.ExpectedCurrent()
+	s := c.err()
+	d, err := e.BeginDeploy(ctx, func(msg string) { fmt.Fprintf(os.Stderr, "  %s\n", s.Dim(msg)) })
 	if err != nil {
-		// Not a reason to refuse: the helper still checks, so the worst case is
-		// the slow failure this exists to avoid.
-		return nil
+		return t, err
 	}
-	if got := now.ExpectedCurrent(); got != b.spec.ExpectedCurrent {
-		return fmt.Errorf("this plan was built when %s was serving, but %s is serving now — "+
+	defer d.Close()
+	if d.Serving != expected {
+		return t, fmt.Errorf("this plan was built when %s was serving, but %s is serving now — "+
 			"another deploy or rollback landed while this one waited for the lock\n"+
-			"  rerun `shunt up` to plan against the current state",
-			orNone(b.spec.ExpectedCurrent), orNone(got))
+			"  rerun it to plan against the current state", orNone(expected), orNone(d.Serving))
 	}
-	return nil
+	spec.ExpectedCurrent = expected
+
+	start := time.Now()
+	if err := ship(ctx, e, spec, built, state, c); err != nil {
+		return t, err
+	}
+	t.ship = time.Since(start)
+
+	fmt.Fprintf(os.Stderr, "\n%s\n", s.Bold("applying"))
+	start = time.Now()
+	err = run(func(r engine.EventRenderer) error { return d.Apply(ctx, spec, r) }, c.renderer(), "deploy")
+	t.apply = time.Since(start)
+	return t, err
 }
 
 func orNone(id string) string {
@@ -186,58 +173,33 @@ func round(d time.Duration) time.Duration {
 	return d.Round(100 * time.Millisecond)
 }
 
-// ship mirrors the built layouts to the host and reports what actually crossed
-// the wire — the number that justifies the whole design.
-func ship(ctx context.Context, b *buildOut, c *commonFlags) error {
+// ship mirrors the built layouts and any artifacts to the host, and reports
+// what actually crossed the wire — the number that justifies the whole design.
+func ship(ctx context.Context, e *engine.Engine, spec *release.Spec, built map[string]*build.Result,
+	state *engine.RemoteState, c *commonFlags) error {
 	s := c.err()
 	fmt.Fprintf(os.Stderr, "\n%s\n", s.Bold("shipping"))
-	shipStart := time.Now()
-	defer func() { b.shipTook = time.Since(shipStart) }()
 
-	stats, err := b.engine.Push(ctx, b.built, c.verbose)
+	st, err := e.Push(ctx, built, c.verbose)
 	if err != nil {
 		return err
 	}
-	var sent, total int64
-	// Sorted so repeated deploys produce identical output, which makes a diff of
-	// two deploy logs meaningful.
-	for _, name := range slices.Sorted(maps.Keys(stats)) {
-		st := stats[name]
-		sent += st.Sent
-		total += st.Total
-		if c.verbose {
-			fmt.Fprintf(os.Stderr, "  %s %s: %s sent of %s %s\n", s.Tick(), name,
-				ui.Bytes(st.Sent), ui.Bytes(st.Total),
-				s.Dim(fmt.Sprintf("(%.1f%% already on host)", st.DedupPercent())))
-		}
-	}
-	if !c.verbose {
-		fmt.Fprintf(os.Stderr, "  %s %s on the wire (image total %s)\n",
-			s.Tick(), ui.Bytes(sent), ui.Bytes(total))
-	}
+	fmt.Fprintf(os.Stderr, "  %s %s on the wire (image total %s) %s\n", s.Tick(), ui.Bytes(st.Sent),
+		ui.Bytes(st.Total), s.Dim(fmt.Sprintf("· %.1f%% already on host", st.DedupPercent())))
 
-	return shipArtifacts(ctx, b, c)
-}
-
-// shipArtifacts transfers data files to their staged paths on the host. They are
-// only swapped into place later, by the helper, once stages have passed.
-func shipArtifacts(ctx context.Context, b *buildOut, c *commonFlags) error {
-	if len(b.spec.Artifacts) == 0 {
+	if len(spec.Artifacts) == 0 {
 		return nil
 	}
-	s := c.err()
-	stats, err := b.engine.PushArtifacts(ctx, b.spec, c.verbose)
+	astats, err := e.PushArtifacts(ctx, spec, state.Paths, c.verbose)
 	if err != nil {
 		return err
 	}
-	for _, a := range b.spec.Artifacts {
-		st := stats[a.Name]
-		if st == nil {
-			continue
+	for _, a := range spec.Artifacts {
+		if st := astats[a.Name]; st != nil {
+			fmt.Fprintf(os.Stderr, "  %s %s: %s sent of %s %s\n", s.Tick(), a.Name,
+				ui.Bytes(st.Sent), ui.Bytes(a.Bytes),
+				s.Dim(fmt.Sprintf("(%.1f%% unchanged)", st.DedupPercent())))
 		}
-		fmt.Fprintf(os.Stderr, "  %s %s: %s sent of %s %s\n", s.Tick(), a.Name,
-			ui.Bytes(st.Sent), ui.Bytes(a.Bytes),
-			s.Dim(fmt.Sprintf("(%.1f%% unchanged)", st.DedupPercent())))
 	}
 	return nil
 }

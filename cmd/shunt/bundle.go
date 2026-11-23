@@ -15,6 +15,7 @@ import (
 	"github.com/OAISP/shunt/internal/bundle"
 	"github.com/OAISP/shunt/internal/engine"
 	"github.com/OAISP/shunt/internal/manifest"
+	"github.com/OAISP/shunt/internal/release"
 	"github.com/OAISP/shunt/internal/secrets"
 	"github.com/OAISP/shunt/internal/ui"
 )
@@ -26,9 +27,8 @@ import (
 // to a machine the builder cannot reach.
 func cmdBundle(ctx context.Context, args []string) error {
 	// `bundle` builds; `bundle inspect|verify` act on a file that already
-	// exists. Without this, `shunt bundle rel.shuntpkg` ignored the argument,
-	// rebuilt, and quietly wrote a second file — the obvious typo for someone
-	// reaching for inspect.
+	// exists. Any other argument is refused below rather than ignored, since
+	// `shunt bundle rel.shuntpkg` is the obvious typo for inspect.
 	if len(args) > 0 {
 		switch args[0] {
 		case "inspect":
@@ -74,16 +74,23 @@ func cmdBundle(ctx context.Context, args []string) error {
 			ui.ShortDigest(built[name].Digest), ui.Bytes(built[name].Bytes))
 	}
 
-	spec, err := e.Spec(ctx, id, built)
+	spec, err := e.SpecWith(id, built, nil)
 	if err != nil {
 		return err
 	}
 	e.WithProvenance(spec, version)
 
 	// The key *names* travel, so an approver can see which credentials a bundle
-	// will want; the values are resolved by whoever applies it.
-	secretKeys := secrets.Keys(spec.Secrets)
-	spec.Secrets = nil
+	// will want; the values are resolved by whoever applies it. A CI build job
+	// should not need production credentials, so unreachable secrets fall back
+	// to the names the manifest declares.
+	var secretKeys []string
+	if sec, err := secrets.Resolve(m); err == nil {
+		secretKeys = secrets.Keys(sec)
+	} else {
+		secretKeys = m.DeclaredSecretKeys()
+		fmt.Fprintf(os.Stderr, "  %s\n", s.Dim("secrets are not reachable here, so the bundle records only the keys shunt.toml names"))
+	}
 
 	contents := bundle.Contents{
 		Meta: bundle.Meta{
@@ -92,6 +99,7 @@ func cmdBundle(ctx context.Context, args []string) error {
 			Secrets:    m.Secrets,
 			SecretKeys: secretKeys,
 			Spec:       spec,
+			Targets:    m.Destinations(),
 		},
 		ImageDirs:     map[string]string{},
 		ArtifactPaths: map[string]string{},
@@ -138,8 +146,9 @@ func cmdBundle(ctx context.Context, args []string) error {
 func cmdApply(ctx context.Context, args []string) error {
 	var c commonFlags
 	var host string
-	var yes, rollbackOnFail, planOnly bool
+	var yes, rollbackOnFail, planOnly, detailed bool
 	fs := newFlagSet("apply", &c)
+	fs.BoolVar(&detailed, "detailed-exitcode", false, "with --plan, exit 2 when there are changes to apply")
 	fs.StringVar(&host, "host", "", "deploy to this host instead of the one recorded in the bundle")
 	fs.BoolVar(&planOnly, "plan", false, "show what applying would change, and change nothing")
 	fs.BoolVar(&yes, "y", false, "skip the confirmation prompt")
@@ -151,7 +160,7 @@ func cmdApply(ctx context.Context, args []string) error {
 	}
 	path := fs.Arg(0)
 	if path == "" {
-		return fmt.Errorf("usage: shunt apply <bundle>")
+		return usagef("usage: shunt apply <bundle>")
 	}
 
 	f, err := os.Open(path)
@@ -171,8 +180,20 @@ func cmdApply(ctx context.Context, args []string) error {
 		return err
 	}
 	spec := b.Meta.Spec
+	dest := manifest.Destination{Host: b.Meta.Host, Secrets: b.Meta.Secrets}
+	if c.target != "" {
+		d, ok := b.Meta.Targets[c.target]
+		if !ok {
+			return fmt.Errorf("this bundle records no target %q (records: %s)",
+				c.target, orNone(strings.Join(slices.Sorted(maps.Keys(b.Meta.Targets)), ", ")))
+		}
+		if err := retarget(spec, b.ImageDirs, d); err != nil {
+			return err
+		}
+		dest = d
+	}
 	if host == "" {
-		host = b.Meta.Host
+		host = dest.Host
 	}
 	if host == "" {
 		return fmt.Errorf("this bundle records no host; pass --host")
@@ -190,8 +211,8 @@ func cmdApply(ctx context.Context, args []string) error {
 	// here, from this machine's own provider. That means whoever applies a bundle
 	// needs access to the secrets — which is the correct requirement.
 	secretsKnown := true
-	if b.Meta.Secrets != nil {
-		resolved, err := secrets.Resolve(&manifest.Manifest{Secrets: b.Meta.Secrets})
+	if dest.Secrets != nil {
+		resolved, err := secrets.Resolve(&manifest.Manifest{Secrets: dest.Secrets})
 		switch {
 		case err != nil && planOnly:
 			// Planning is a read-only question and should still answer it. What it
@@ -241,7 +262,8 @@ func cmdApply(ctx context.Context, args []string) error {
 	for _, a := range spec.Artifacts {
 		dests = append(dests, a.Dest)
 	}
-	if err := e.PreflightArtifactDests(ctx, dests); err != nil {
+	state, err := e.PlanState(ctx, dests)
+	if err != nil {
 		return err
 	}
 
@@ -249,10 +271,6 @@ func cmdApply(ctx context.Context, args []string) error {
 	// never have seen this host; re-resolve it here.
 	spec.StorePath = e.StorePath()
 
-	state, err := e.State(ctx)
-	if err != nil {
-		return err
-	}
 	if planOnly {
 		p, err := e.BuildPlan(ctx, spec, built, state)
 		if err != nil {
@@ -271,7 +289,7 @@ func cmdApply(ctx context.Context, args []string) error {
 				fmt.Println("  nothing to do — the host already matches this bundle")
 			}
 		}
-		if p.Changed() {
+		if detailed && p.Changed() {
 			return errExitChanges
 		}
 		return nil
@@ -286,37 +304,37 @@ func cmdApply(ctx context.Context, args []string) error {
 		return err
 	}
 
-	lock, err := e.AcquireLock(ctx, func(msg string) {
-		fmt.Fprintf(os.Stderr, "  %s\n", s.Dim(msg))
-	})
-	if err != nil {
-		return err
-	}
-	defer lock.Release()
-	spec.ExpectedCurrent = state.ExpectedCurrent()
-
-	fmt.Fprintf(os.Stderr, "\n%s\n", s.Bold("shipping"))
-	stats, err := e.Push(ctx, built, c.verbose)
-	if err != nil {
-		return err
-	}
-	var sent, total int64
-	for _, st := range stats {
-		sent += st.Sent
-		total += st.Total
-	}
-	fmt.Fprintf(os.Stderr, "  %s %s on the wire (image total %s)\n", s.Tick(), ui.Bytes(sent), ui.Bytes(total))
-
-	if len(spec.Artifacts) > 0 {
-		if _, err := e.PushArtifacts(ctx, spec, c.verbose); err != nil {
+	if est, err := engine.EstimateTransfer(built, state); err == nil {
+		if err := e.PreflightSpace(est, state.Disk); err != nil {
 			return err
 		}
 	}
+	_, err = deploy(ctx, e, spec, built, state, &c)
+	return err
+}
 
-	fmt.Fprintf(os.Stderr, "\n%s\n", s.Bold("applying"))
-	return run(func(r engine.EventRenderer) error {
-		return e.Apply(ctx, spec, r)
-	}, c.renderer(), "apply")
+// retarget points a bundled release at another of the manifest's targets. Only
+// the destination moves: the project its containers, network and ledger are
+// named after, how secrets are delivered, and the tag each image loads under —
+// which lives in the layout's own index, so that is rewritten too.
+func retarget(spec *release.Spec, layouts map[string]string, d manifest.Destination) error {
+	spec.Project, spec.Network = d.Project, d.Network
+	spec.SecretMode = engine.SecretMode(d.Secrets)
+	for name, img := range spec.Images {
+		dir, ok := layouts[name]
+		if img.External || !ok {
+			continue
+		}
+		img.Ref = engine.ImageTag(d.Project, name, spec.ID)
+		if err := build.Retag(dir, img.Ref); err != nil {
+			return fmt.Errorf("image %s: %w", name, err)
+		}
+		if err := build.WriteDockerArchiveManifest(dir, img.Ref); err != nil {
+			return fmt.Errorf("image %s: %w", name, err)
+		}
+		spec.Images[name] = img
+	}
+	return nil
 }
 
 // missingKeys names secrets the release needs that the local provider lacks.

@@ -54,8 +54,7 @@ jobs:
         run: make build
 
       # Exercises the binary end to end without a host. Exit codes are asserted
-      # explicitly: `shunt init` once wrote a correct manifest and *then* exited
-      # 2, which no unit test noticed.
+      # explicitly, since a command can do its work and still exit wrong.
       - name: smoke
         run: |
           set -euo pipefail

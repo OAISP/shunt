@@ -39,6 +39,49 @@ type Options struct {
 	NoCache    bool
 	Progress   string    // buildx --progress value
 	Stdout     io.Writer // build log sink; discard it when not verbose
+	Cache      *Cache    // nil builds with only the builder's own cache
+}
+
+// Cache is where buildx keeps layer cache between builds.
+//
+// A CI runner starts with an empty builder, so without one every layer after
+// the base image is rebuilt, gets a new digest and is shipped again in full,
+// and every pipeline reads as a change. With it, unchanged layers keep their
+// digests and the transfer and the no-op check both work as they do locally.
+type Cache struct {
+	From, To string // --cache-from / --cache-to values
+
+	// rotate moves a freshly exported local cache over the old one. buildx
+	// never garbage-collects a local cache it exports into, so writing beside
+	// it and swapping is what keeps it from growing on every build.
+	rotate func() error
+}
+
+// CacheFor resolves a SHUNT_BUILD_CACHE value for one image. "gha" uses GitHub
+// Actions' cache service; anything else is a directory the CI system persists
+// between jobs. key separates images, so it must be stable across builds.
+func CacheFor(spec, key string) *Cache {
+	if spec == "" {
+		return nil
+	}
+	if spec == "gha" {
+		scope := "shunt-" + key
+		// ignore-error: a cache service outage should cost a slower build, not
+		// a failed deploy.
+		return &Cache{From: "type=gha,scope=" + scope, To: "type=gha,mode=max,ignore-error=true,scope=" + scope}
+	}
+	dir := filepath.Join(spec, key)
+	c := &Cache{To: "type=local,mode=max,dest=" + dir + ".next"}
+	if _, err := os.Stat(filepath.Join(dir, "index.json")); err == nil {
+		c.From = "type=local,src=" + dir
+	}
+	c.rotate = func() error {
+		if err := os.RemoveAll(dir); err != nil {
+			return err
+		}
+		return os.Rename(dir+".next", dir)
+	}
+	return c
 }
 
 // Build exports one image to an OCI layout directory and returns its digest.
@@ -71,6 +114,12 @@ func Build(ctx context.Context, o Options) (*Result, error) {
 	if o.Progress != "" {
 		args = append(args, "--progress", o.Progress)
 	}
+	if c := o.Cache; c != nil {
+		if c.From != "" {
+			args = append(args, "--cache-from", c.From)
+		}
+		args = append(args, "--cache-to", c.To)
+	}
 	for _, k := range slices.Sorted(maps.Keys(o.Args)) {
 		args = append(args, "--build-arg", k+"="+o.Args[k])
 	}
@@ -81,6 +130,12 @@ func Build(ctx context.Context, o Options) (*Result, error) {
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("build image %q: %w%s", o.Name, err, buildxHint())
+	}
+
+	if o.Cache != nil && o.Cache.rotate != nil {
+		if err := o.Cache.rotate(); err != nil {
+			return nil, fmt.Errorf("build image %q: rotate build cache: %w", o.Name, err)
+		}
 	}
 
 	dg, err := readIndexDigest(o.OutDir)
@@ -195,11 +250,10 @@ func Retag(dir, ref string) error {
 // OCIExport describes whether the local builder can write the OCI layout every
 // part of shunt's transport depends on.
 //
-// The rule is not "which driver" — that is what the previous version of this
-// check got wrong, in both directions. The classic `docker` driver exports a
-// layout perfectly well once the daemon uses the containerd image store, and
-// refuses outright when it does not. So both have to be read, and only the one
-// combination is a real problem.
+// The rule is not "which driver": the classic `docker` driver exports a layout
+// perfectly well once the daemon uses the containerd image store, and refuses
+// outright when it does not. So both are read, and only that one combination
+// is a problem.
 type OCIExport struct {
 	Driver     string // buildx driver: docker, docker-container, remote, kubernetes
 	Containerd bool   // whether the daemon uses the containerd image store
@@ -241,11 +295,9 @@ func (c OCIExport) supported() bool { return c.Driver != "docker" || c.Container
 
 // parseBuildxDriver picks the driver out of `docker buildx inspect`.
 //
-// Split out so it can be tested against the real output, which is what the
-// previous version of this check needed and did not have: it looked for
-// "Driver: docker" with a single space, and buildx pads its labels into a
-// column. The check that existed to explain the most common first-build failure
-// therefore never fired.
+// buildx pads its labels into a column, so this matches the label rather than a
+// fixed "Driver: docker" string; it is split out to be tested against the real
+// output.
 func parseBuildxDriver(out string) string {
 	for _, ln := range strings.Split(out, "\n") {
 		if rest, found := strings.CutPrefix(strings.TrimSpace(ln), "Driver:"); found {

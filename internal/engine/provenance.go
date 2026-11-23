@@ -41,7 +41,37 @@ func collectProvenance(m interface{ Dir() string }, cliVersion string) release.P
 		// commit it claims looks innocent.
 		p.Dirty = gitOutput(dir, "status", "--porcelain") != ""
 	}
+	fromCI(&p, os.Getenv)
 	return p
+}
+
+// fromCI fills in what git and the OS cannot answer on a CI runner. GitLab
+// checks out a detached HEAD, so there is no branch; the OS user is the
+// runner's service account rather than whoever pushed; and the run itself is
+// the most useful link a release can carry.
+func fromCI(p *release.Provenance, env func(string) string) {
+	var actor, system, branch, sha string
+	switch {
+	case env("GITHUB_ACTIONS") == "true":
+		system, actor, branch, sha = "github-actions", env("GITHUB_ACTOR"), env("GITHUB_REF_NAME"), env("GITHUB_SHA")
+		if id := env("GITHUB_RUN_ID"); id != "" {
+			p.Run = env("GITHUB_SERVER_URL") + "/" + env("GITHUB_REPOSITORY") + "/actions/runs/" + id
+		}
+	case env("GITLAB_CI") == "true":
+		system, actor, branch, sha = "gitlab-ci", env("GITLAB_USER_LOGIN"), env("CI_COMMIT_REF_NAME"), env("CI_COMMIT_SHA")
+		p.Run = env("CI_JOB_URL")
+	default:
+		return
+	}
+	if actor != "" {
+		p.Deployer = actor + "@" + system
+	}
+	if p.Branch == "" {
+		p.Branch = branch
+	}
+	if p.Commit == "" && sha != "" {
+		p.Commit, p.Short = sha, shortSHA(sha)
+	}
 }
 
 func gitOutput(dir string, args ...string) string {

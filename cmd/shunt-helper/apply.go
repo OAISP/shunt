@@ -10,19 +10,45 @@ import (
 	"github.com/OAISP/shunt/internal/release"
 )
 
-func cmdApply(in io.Reader) error {
-	var spec release.Spec
-	if err := json.NewDecoder(in).Decode(&spec); err != nil {
-		return fmt.Errorf("decode release spec: %w", err)
+// cmdApply is one deploy session, and holds the project lock for all of it —
+// the CLI opens it before shipping anything, so two deploys can never rsync
+// into the same store at once.
+//
+// Once held, the lock is announced along with the release then serving, which
+// lets the CLI check its plan still holds before spending minutes on the wire.
+// The spec follows on stdin when the transfer is done. EOF in its place means
+// the CLI gave up, and the session ends having changed nothing.
+func cmdApply(args []string, in io.Reader) error {
+	if len(args) < 1 {
+		return errors.New("usage: shunt-helper apply <project> < spec.json")
 	}
-	if spec.Protocol != release.Protocol {
-		return fmt.Errorf("protocol mismatch: helper speaks v%d, CLI sent v%d — upgrade both ends",
-			release.Protocol, spec.Protocol)
-	}
-	if spec.Project == "" || spec.ID == "" {
-		return errors.New("release spec is missing project or id")
-	}
-	return withLock(spec.Project, func() error { return apply(&spec) })
+	project := args[0]
+	return withLock(project, func() error {
+		ledger, err := loadLedger(project)
+		if err != nil {
+			return err
+		}
+		emit(release.Event{Kind: release.KindHeld, Release: ledger.Current})
+
+		var spec release.Spec
+		if err := json.NewDecoder(in).Decode(&spec); err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return fmt.Errorf("decode release spec: %w", err)
+		}
+		if spec.Protocol != release.Protocol {
+			return fmt.Errorf("protocol mismatch: helper speaks v%d, CLI sent v%d — upgrade both ends",
+				release.Protocol, spec.Protocol)
+		}
+		if spec.Project != project {
+			return fmt.Errorf("release spec is for project %q, but this session locked %q", spec.Project, project)
+		}
+		if spec.ID == "" {
+			return errors.New("release spec has no id")
+		}
+		return apply(&spec)
+	})
 }
 
 func apply(spec *release.Spec) error {
@@ -139,7 +165,7 @@ func apply(spec *release.Spec) error {
 	// set explicitly — otherwise the deploy prunes what it just loaded.
 	keepIDs := ledger.KeepIDs(retainFor(ledger, spec))
 	keepIDs[spec.ID] = true
-	if err := pruneImages(spec.Project, keepImageRefs(ledger, keepIDs, spec)); err != nil {
+	if err := pruneImages(spec.Project, ledger, spec, keepImageRefs(ledger, keepIDs, spec)); err != nil {
 		info("image prune: " + err.Error())
 	}
 	pruneEnvFiles(spec.Project, keepIDs)

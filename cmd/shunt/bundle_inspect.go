@@ -30,7 +30,7 @@ func cmdBundleInspect(_ context.Context, args []string) error {
 	}
 	path := fs.Arg(0)
 	if path == "" {
-		return fmt.Errorf("usage: shunt bundle inspect <bundle>")
+		return usagef("usage: shunt bundle inspect <bundle>")
 	}
 
 	f, err := os.Open(path)
@@ -163,7 +163,7 @@ func cmdBundleVerify(_ context.Context, args []string) error {
 	}
 	path := fs.Arg(0)
 	if path == "" {
-		return fmt.Errorf("usage: shunt bundle verify <bundle>")
+		return usagef("usage: shunt bundle verify <bundle>")
 	}
 
 	f, err := os.Open(path)

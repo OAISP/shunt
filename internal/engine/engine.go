@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/OAISP/shunt/internal/build"
@@ -49,7 +50,7 @@ func (e *Engine) Connect(ctx context.Context) error {
 	if err := e.Client.Connect(ctx); err != nil {
 		return err
 	}
-	facts, err := e.Client.Probe(ctx)
+	facts, err := e.Client.Probe(ctx, embeddedHelperNames()...)
 	if err != nil {
 		return err
 	}
@@ -80,6 +81,10 @@ func (e *Engine) ensureHelper(ctx context.Context) error {
 	remote := filepath.Join(e.root, "bin", h.remoteName())
 	e.helperPath = remote
 
+	if e.facts.Helpers[h.remoteName()] {
+		return nil
+	}
+	// A helper compiled on demand was not known before the probe.
 	if _, err := e.Client.Run(ctx, "test", "-x", remote); err == nil {
 		return nil
 	}
@@ -107,15 +112,19 @@ type BuildOptions struct {
 	Verbose bool
 }
 
-// Build compiles every image in the manifest into a local OCI layout.
+// Build compiles every image in the manifest into a local OCI layout, all at
+// once: BuildKit schedules concurrent builds itself and shares the work they
+// have in common, such as a base image.
 func (e *Engine) Build(ctx context.Context, id string, o BuildOptions) (map[string]*build.Result, error) {
-	res := map[string]*build.Result{}
 	// buildx writes the image id to stdout even under --progress quiet; only a
 	// verbose run wants to see it.
 	var logSink io.Writer = io.Discard
 	progress := "quiet"
 	if o.Verbose {
 		logSink, progress = os.Stderr, "auto"
+		if len(e.M.Images) > 1 {
+			progress = "plain" // interactive progress displays cannot share a terminal
+		}
 	}
 	cacheDir, err := e.cacheDir(id)
 	if err != nil {
@@ -124,65 +133,111 @@ func (e *Engine) Build(ctx context.Context, id string, o BuildOptions) (map[stri
 	// Old export directories are dropped here rather than at the end, so a run
 	// that fails partway still tidies up after its predecessors.
 	e.pruneCacheDirs(3)
+	// Keyed on the manifest's own project rather than the target's: staging and
+	// production build the same images, so they should share one cache.
+	cacheKey := e.M.Project
+	if own, _ := e.M.Destination(""); own.Project != "" {
+		cacheKey = own.Project
+	}
+	cacheSpec := os.Getenv("SHUNT_BUILD_CACHE")
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var (
+		mu       sync.Mutex
+		wg       sync.WaitGroup
+		res      = map[string]*build.Result{}
+		firstErr error
+	)
 	for _, name := range slices.Sorted(maps.Keys(e.M.Images)) {
-		img := e.M.Images[name]
-		args, err := secrets.InterpolateMap(img.Args)
-		if err != nil {
-			return nil, fmt.Errorf("image %s build args: %w", name, err)
-		}
-		r, err := build.Build(ctx, build.Options{
-			Name:       name,
-			Context:    e.M.Abs(img.Context),
-			Dockerfile: e.M.Abs(img.Dockerfile),
-			Platform:   img.Platform,
-			Target:     img.Target,
-			Args:       args,
-			OutDir:     filepath.Join(cacheDir, name),
-			NoCache:    o.NoCache,
-			Progress:   progress,
-			Stdout:     logSink,
-		})
-		if err != nil {
-			return nil, err
-		}
-		ref := e.ImageRef(name, id)
-		if err := build.Retag(r.Dir, ref); err != nil {
-			return nil, fmt.Errorf("image %s: %w", name, err)
-		}
-		// Makes the layout loadable by hosts without the containerd image store,
-		// which is most of them.
-		if err := build.WriteDockerArchiveManifest(r.Dir, ref); err != nil {
-			return nil, fmt.Errorf("image %s: %w", name, err)
-		}
-		res[name] = r
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r, err := e.buildOne(ctx, name, id, build.Options{
+				OutDir:   filepath.Join(cacheDir, name),
+				NoCache:  o.NoCache,
+				Progress: progress,
+				Stdout:   logSink,
+				Cache:    build.CacheFor(cacheSpec, cacheKey+"-"+name),
+			})
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil && firstErr == nil {
+				firstErr = err
+				cancel() // one failed image fails the release; stop the rest
+			}
+			res[name] = r
+		}()
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
 	}
 	return res, nil
 }
 
-// Push mirrors each built layout to the host's store.
-func (e *Engine) Push(ctx context.Context, built map[string]*build.Result, verbose bool) (map[string]*transport.Stats, error) {
-	stats := map[string]*transport.Stats{}
-	for _, name := range slices.Sorted(maps.Keys(built)) {
-		st, err := transport.Push(ctx, transport.Options{
-			Client:     e.Client,
-			LocalDir:   built[name].Dir,
-			RemoteDir:  filepath.Join(e.StorePath(), name),
-			Verbose:    verbose,
-			RemoteZstd: e.facts.RsyncZstd,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("push image %s: %w", name, err)
-		}
-		stats[name] = st
+// buildOne builds one image and tags its layout for this release.
+func (e *Engine) buildOne(ctx context.Context, name, id string, o build.Options) (*build.Result, error) {
+	img := e.M.Images[name]
+	args, err := secrets.InterpolateMap(img.Args)
+	if err != nil {
+		return nil, fmt.Errorf("image %s build args: %w", name, err)
 	}
-	return stats, nil
+	o.Name, o.Args, o.Platform, o.Target = name, args, img.Platform, img.Target
+	o.Context, o.Dockerfile = e.M.Abs(img.Context), e.M.Abs(img.Dockerfile)
+	r, err := build.Build(ctx, o)
+	if err != nil {
+		return nil, err
+	}
+	ref := e.ImageRef(name, id)
+	if err := build.Retag(r.Dir, ref); err != nil {
+		return nil, fmt.Errorf("image %s: %w", name, err)
+	}
+	// Makes the layout loadable by hosts without the containerd image store.
+	if err := build.WriteDockerArchiveManifest(r.Dir, ref); err != nil {
+		return nil, fmt.Errorf("image %s: %w", name, err)
+	}
+	return r, nil
+}
+
+// Push mirrors the built layouts into the host's store in one transfer. They
+// are exported side by side, one directory per image, which is exactly the
+// store's own shape — so mirroring their parent also drops the layout of an
+// image the manifest no longer builds.
+func (e *Engine) Push(ctx context.Context, built map[string]*build.Result, verbose bool) (*transport.Stats, error) {
+	if len(built) == 0 {
+		return &transport.Stats{}, nil
+	}
+	parent := ""
+	for name, r := range built {
+		dir := filepath.Dir(r.Dir)
+		if filepath.Base(r.Dir) != name || (parent != "" && dir != parent) {
+			return nil, fmt.Errorf("image layouts must sit side by side, named after their images: %s", r.Dir)
+		}
+		parent = dir
+	}
+	st, err := transport.Push(ctx, transport.Options{
+		Client:    e.Client,
+		LocalDir:  parent,
+		RemoteDir: e.StorePath(),
+		Verbose:   verbose,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("push images: %w", err)
+	}
+	return st, nil
 }
 
 // ImageRef is the immutable, release-addressable tag a built image gets on the
 // host. Rollback works by re-running a previous release's refs, so these must
 // never be reused.
 func (e *Engine) ImageRef(image, releaseID string) string {
-	return fmt.Sprintf("shunt/%s-%s:%s", e.M.Project, image, releaseID)
+	return ImageTag(e.M.Project, image, releaseID)
+}
+
+// ImageTag is the tag a project's built image carries on the host.
+func ImageTag(project, image, releaseID string) string {
+	return fmt.Sprintf("shunt/%s-%s:%s", project, image, releaseID)
 }
 
 // Spec assembles the complete release description sent to the helper.
@@ -191,7 +246,12 @@ func (e *Engine) Spec(ctx context.Context, id string, built map[string]*build.Re
 	if err != nil {
 		return nil, err
 	}
+	return e.SpecWith(id, built, sec)
+}
 
+// SpecWith assembles a spec around secrets the caller already resolved — or
+// none, for a bundle, which never carries values.
+func (e *Engine) SpecWith(id string, built map[string]*build.Result, sec map[string]string) (*release.Spec, error) {
 	images := map[string]release.ImageRef{}
 	for name, r := range built {
 		images[name] = release.ImageRef{Ref: e.ImageRef(name, id), Digest: r.Digest}
@@ -263,8 +323,11 @@ func (e *Engine) Spec(ctx context.Context, id string, built map[string]*build.Re
 }
 
 // secretMode reports how this manifest wants secrets delivered.
-func secretMode(m *manifest.Manifest) string {
-	if m.Secrets != nil && m.Secrets.Mode == "file" {
+func secretMode(m *manifest.Manifest) string { return SecretMode(m.Secrets) }
+
+// SecretMode is the spec's delivery mode for a secrets block.
+func SecretMode(s *manifest.Secrets) string {
+	if s != nil && s.Mode == "file" {
 		return "file"
 	}
 	return ""
@@ -274,27 +337,30 @@ func secretMode(m *manifest.Manifest) string {
 //
 // rsync running out of space partway leaves a truncated blob and an error about
 // a write failure, which tells the operator nothing about the actual problem.
-// Checking first costs nothing — the free-space figure already came back with
-// the probe. The headroom multiplier covers `docker load` unpacking the layout
-// alongside the copy rsync just wrote.
-func (e *Engine) PreflightSpace(built map[string]*build.Result) error {
-	if e.facts.FreeBytes <= 0 {
-		return nil // df was unavailable; not a reason to refuse to deploy
-	}
-	var need int64
-	for _, r := range built {
-		need += r.Bytes
-	}
-	if need == 0 {
+// Sized from what is actually missing, not the whole image: a 5 KB deploy of a
+// 2 GB image needs 5 KB of store. The daemon side gets headroom for the archive
+// it copies in plus the layers it unpacks, which are typically two or three
+// times their compressed size.
+func (e *Engine) PreflightSpace(est *TransferEstimate, d *release.Disk) error {
+	if est == nil || d == nil || est.Missing == 0 {
 		return nil
 	}
-	const headroom = 3
-	if want := need * headroom; e.facts.FreeBytes < want {
-		return fmt.Errorf("%s has %s free, and this deploy needs roughly %s (%s of images, plus room to unpack them)\n"+
+	storeNeed, dockerNeed := est.Missing, 3*est.Missing
+	check := func(free, need int64, where string) error {
+		if free <= 0 || free >= need {
+			return nil
+		}
+		return fmt.Errorf("%s has %s free %s, and this deploy needs roughly %s there (%s of new image data)\n"+
 			"  free some space, or run `shunt prune` to drop superseded images",
-			e.M.Host, ui.Bytes(e.facts.FreeBytes), ui.Bytes(want), ui.Bytes(need))
+			e.M.Host, ui.Bytes(free), where, ui.Bytes(need), ui.Bytes(est.Missing))
 	}
-	return nil
+	if d.Shared {
+		return check(d.StoreFree, storeNeed+dockerNeed, "for the store and the docker daemon")
+	}
+	if err := check(d.StoreFree, storeNeed, "for the store"); err != nil {
+		return err
+	}
+	return check(d.DockerFree, dockerNeed, "in docker's data root")
 }
 
 // BootSpec assembles a spec for `shunt boot`, which recreates an accessory
@@ -356,6 +422,7 @@ func convertServices(in map[string]manifest.Service) (map[string]release.Service
 			Requires: s.Requires,
 			Expose:   s.Expose,
 			Drain:    s.Drain.String(),
+			Init:     s.Init,
 		}
 		if s.Proxy != nil {
 			rs.Proxy = &release.Proxy{
@@ -424,6 +491,12 @@ func (c Container) Running() bool { return c.State == "running" }
 type RemoteState struct {
 	Ledger     *release.Ledger `json:"ledger"`
 	Containers []Container     `json:"containers"`
+
+	// Store and Paths come back only from PlanState: the blobs each image's
+	// store holds, and the state of every artifact destination.
+	Store map[string][]string          `json:"store,omitempty"`
+	Paths map[string]release.PathState `json:"paths,omitempty"`
+	Disk  *release.Disk                `json:"disk,omitempty"`
 }
 
 // ServiceContainers returns the containers belonging to one service.
@@ -438,7 +511,25 @@ func (s *RemoteState) ServiceContainers(name string) []Container {
 }
 
 func (e *Engine) State(ctx context.Context) (*RemoteState, error) {
-	out, err := e.Client.Run(ctx, e.helperPath, "status", e.M.Project)
+	return e.remoteState(ctx, "status")
+}
+
+// PlanState is State plus everything a plan needs from the host, in one round
+// trip: what each image's store already holds, and the state of every artifact
+// destination. It fails if a destination cannot receive its artifact, which is
+// why it runs before the build: building and shipping a 400 MB image only to
+// fail on mkdir wastes minutes and tells the operator nothing useful.
+func (e *Engine) PlanState(ctx context.Context, dests []string) (*RemoteState, error) {
+	st, err := e.remoteState(ctx, append([]string{"plan"}, dests...)...)
+	if err != nil {
+		return nil, err
+	}
+	return st, e.unusableDests(st.Paths)
+}
+
+func (e *Engine) remoteState(ctx context.Context, args ...string) (*RemoteState, error) {
+	argv := append([]string{e.helperPath, args[0], e.M.Project}, args[1:]...)
+	out, err := e.Client.Run(ctx, argv...)
 	if err != nil {
 		return nil, err
 	}
@@ -447,15 +538,6 @@ func (e *Engine) State(ctx context.Context) (*RemoteState, error) {
 		return nil, fmt.Errorf("parse remote status: %w (%s)", err, truncate(out, 200))
 	}
 	return &st, nil
-}
-
-// Apply streams the spec to the helper and renders the event stream.
-func (e *Engine) Apply(ctx context.Context, spec *release.Spec, r EventRenderer) error {
-	b, err := json.Marshal(spec)
-	if err != nil {
-		return err
-	}
-	return e.stream(ctx, strings.NewReader(string(b)), r, e.helperPath, "apply")
 }
 
 // Boot force-recreates a single accessory. The spec is streamed the same way a

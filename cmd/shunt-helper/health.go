@@ -2,8 +2,10 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"net"
-	"os/exec"
+	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -88,7 +90,7 @@ func waitHealthy(spec *release.Spec, order []string, set map[string]release.Serv
 // An absolute url is fetched as-is, which matches a service with a published
 // host port. A bare path is resolved against the container's own address on the
 // deploy network — that is how a proxied service, which publishes nothing, is
-// checked without needing curl inside the image or a second container.
+// checked without needing anything inside the image or on the host.
 // A command check runs inside the container.
 func probe(spec *release.Spec, container string, svc release.Service, h *release.Health) (string, error) {
 	if h.URL != "" {
@@ -100,29 +102,7 @@ func probe(spec *release.Spec, container string, svc release.Service, h *release
 			}
 			target = base + h.URL
 		}
-		args := []string{"-sS", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "10"}
-		if h.Follow {
-			args = append(args, "-L")
-		}
-		out, err := exec.Command("curl", append(args, target)...).Output()
-		if err != nil {
-			return "", fmt.Errorf("curl %s: %v", target, err)
-		}
-		code := strings.TrimSpace(string(out))
-		if strings.HasPrefix(code, "2") {
-			return code, nil
-		}
-		// A bare redirect only proves the server is listening. Accepting it is
-		// the historical default and stays for compatibility, but a service that
-		// sets follow has asked for the stronger gate: chase the redirect and
-		// require the page at the end of it.
-		if !h.Follow && strings.HasPrefix(code, "3") {
-			return code, nil
-		}
-		if h.Follow && strings.HasPrefix(code, "3") {
-			return "", fmt.Errorf("HTTP %s from %s after following redirects (a redirect loop, or a chain that never reaches 2xx)", code, target)
-		}
-		return "", fmt.Errorf("HTTP %s from %s", code, target)
+		return probeURL(target, h.Follow)
 	}
 	args := append([]string{"exec", container}, h.Command...)
 	out, err := docker.Run("docker", args...)
@@ -185,6 +165,33 @@ func publishedHostPort(svc release.Service) (host, port string, ok bool) {
 		// nothing stable to probe.
 	}
 	return "", "", false
+}
+
+// probeURL fetches a health url and judges the status code.
+//
+// A bare redirect only proves the server is listening. Accepting it is the
+// historical default and stays for compatibility, but follow asks for the
+// stronger gate: chase the redirect and require the page at the end of it.
+func probeURL(target string, follow bool) (string, error) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	if !follow {
+		client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	}
+	resp, err := client.Get(target)
+	if err != nil {
+		return "", fmt.Errorf("GET %s: %v", target, err)
+	}
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	resp.Body.Close()
+
+	code := strconv.Itoa(resp.StatusCode)
+	switch c := resp.StatusCode; {
+	case c >= 200 && c < 300, c >= 300 && c < 400 && !follow:
+		return code, nil
+	case c >= 300 && c < 400:
+		return "", fmt.Errorf("HTTP %s from %s after following redirects (a chain that never reaches 2xx)", code, target)
+	}
+	return "", fmt.Errorf("HTTP %s from %s", code, target)
 }
 
 func tailLogs(container string, n int) string {

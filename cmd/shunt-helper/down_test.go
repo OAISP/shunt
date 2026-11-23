@@ -17,6 +17,7 @@ func downLedger(t *testing.T) {
 		Project: "demo", Current: testRelease,
 		Releases: []release.Entry{{
 			ID: testRelease, Status: release.StatusActive,
+			Images: map[string]release.ImageRef{"app": {Ref: "shunt/demo-app:" + testRelease}},
 			Spec: &release.Spec{
 				Project: "demo", ID: testRelease, Network: "demo-net",
 				Order: []string{"db", "web"}, // web requires db
@@ -135,6 +136,26 @@ func TestPurgeRemovesSecretsAndHistory(t *testing.T) {
 	}
 	if !f.did("docker rmi", "shunt/demo-app:") {
 		t.Error("purge left the release-tagged images behind")
+	}
+}
+
+// A staging target sharing the host is `demo-staging` by default, so its images
+// match the `shunt/demo-*` glob. Purging demo must not take them.
+func TestPurgeLeavesAnotherProjectsImages(t *testing.T) {
+	t.Setenv("SHUNT_ROOT", t.TempDir())
+	downLedger(t)
+	f := newFake().
+		on("docker images", "shunt/demo-app:"+testRelease+"\nshunt/demo-staging-app:"+testRelease+"\n", nil)
+	withFake(t, f)
+
+	if err := down("demo", "demo-net", true, true); err != nil {
+		t.Fatal(err)
+	}
+	if !f.did("docker rmi", "shunt/demo-app:") {
+		t.Error("purge left this project's own images behind")
+	}
+	if f.did("docker rmi", "shunt/demo-staging-app:") {
+		t.Error("purge removed the images of another project on the same host")
 	}
 }
 

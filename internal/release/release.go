@@ -21,7 +21,7 @@ import (
 // Protocol is bumped when Spec or Event change shape incompatibly. The helper
 // refuses a Spec whose protocol it does not understand, which turns a silent
 // version-skew misdeploy into a clean error.
-const Protocol = 1
+const Protocol = 2
 
 // Spec is a complete, self-contained description of one release. Everything the
 // helper needs is here; it never reads the manifest and never phones home.
@@ -93,6 +93,9 @@ type Provenance struct {
 	Dirty    bool   `json:"dirty,omitempty"`
 	CLI      string `json:"cli,omitempty"`
 	Deployer string `json:"deployer,omitempty"`
+
+	// Run links the CI job that built the release, when one did.
+	Run string `json:"run,omitempty"`
 }
 
 // Describe renders provenance for a human, or "" when nothing is known.
@@ -137,6 +140,7 @@ type Service struct {
 
 	Expose int    `json:"expose,omitempty"`
 	Drain  string `json:"drain,omitempty"`
+	Init   bool   `json:"init,omitempty"`
 	Proxy  *Proxy `json:"proxy,omitempty"`
 
 	// Secrets narrows which of the release's secrets this service receives.
@@ -160,9 +164,8 @@ type Proxy struct {
 //
 // A bare path is used directly. An absolute url is reduced to its path, because
 // the proxy reaches the container on the deploy network and the host and port
-// written for shunt's own probe do not apply there — previously such a service
-// got no readiness gate at all purely because of how its health url happened to
-// be spelled.
+// written for shunt's own probe do not apply there, and whether a service gets a
+// readiness gate should not depend on how its health url is spelled.
 //
 // A command health check yields nothing: there is no way to express "run this
 // inside the container" to Traefik or caddy. Those services fall back to the
@@ -461,6 +464,27 @@ func (l *Ledger) Previous() *Entry {
 	return nil
 }
 
+// PathState is what a plan knows about an artifact destination on the host,
+// without moving any of it. Size is -1 when nothing is there yet; a directory
+// is summarised by TreeSummary, the same function the CLI uses on its own copy.
+type PathState struct {
+	Size  int64 `json:"size"`
+	MTime int64 `json:"mtime"`
+
+	// Problem says why the destination's directory cannot receive a new copy,
+	// and is empty when it can.
+	Problem string `json:"problem,omitempty"`
+}
+
+// Disk is free space where a deploy writes: the store rsync fills, and the
+// daemon's data root, where loaded layers are unpacked.
+type Disk struct {
+	StoreFree  int64 `json:"store_free"`
+	DockerFree int64 `json:"docker_free"`
+	// Shared means both live on one filesystem, so their needs add up.
+	Shared bool `json:"shared"`
+}
+
 // Event kinds. Constants rather than bare strings so the two binaries cannot
 // drift on a typo that would silently stop rendering a whole class of event.
 const (
@@ -468,6 +492,7 @@ const (
 	KindOK     = "ok"     // work completed
 	KindInfo   = "info"   // noteworthy but not a step outcome
 	KindLog    = "log"    // passthrough output from a container
+	KindHeld   = "held"   // the project lock is held; Release is what is serving
 	KindFail   = "fail"   // the operation failed; message explains why
 	KindResult = "result" // terminal summary of a successful operation
 )

@@ -12,12 +12,6 @@ import (
 	"strings"
 )
 
-// HelperVersion is cosmetic — it appears in `shunt version`. It is deliberately
-// NOT what identifies the helper on the host: a hand-maintained constant is one
-// forgotten bump away from silently running stale remote code, which is exactly
-// the bug that motivated content-addressing below.
-const HelperVersion = "0.1.0"
-
 // helperPkg is the package built when no prebuilt helper is embedded.
 const helperPkg = "./cmd/shunt-helper"
 
@@ -60,6 +54,23 @@ func (h helper) write() (string, func(), error) {
 	return f.Name(), func() { os.Remove(f.Name()) }, nil
 }
 
+// embeddedHelperNames are the remote names of every helper this build embeds,
+// known before the host's architecture is.
+func embeddedHelperNames() []string {
+	var names []string
+	for _, arch := range []string{"amd64", "arm64"} {
+		if data, err := helperFS.ReadFile("bin/shunt-helper-linux-" + arch); err == nil {
+			names = append(names, newHelper(data).remoteName())
+		}
+	}
+	return names
+}
+
+func newHelper(data []byte) *helper {
+	sum := sha256.Sum256(data)
+	return &helper{data: data, hash: hex.EncodeToString(sum[:])[:12]}
+}
+
 // helperBinary loads the helper for the host's architecture, preferring the
 // embedded copy and compiling one if this build did not include it.
 func helperBinary(goarch string) (*helper, error) {
@@ -69,8 +80,7 @@ func helperBinary(goarch string) (*helper, error) {
 			return nil, err
 		}
 	}
-	sum := sha256.Sum256(data)
-	return &helper{data: data, hash: hex.EncodeToString(sum[:])[:12]}, nil
+	return newHelper(data), nil
 }
 
 // buildHelper compiles the helper from this module's own source.

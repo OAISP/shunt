@@ -26,24 +26,48 @@ func svcSpec(services map[string]release.Service, order ...string) *release.Spec
 	}
 }
 
-// The distinction the ledger depends on: replacing a non-proxied service stops
-// the old container first, so the host has changed the moment it begins —
-// whether or not the new container comes up.
-func TestSwapServicesReportsMutationForAnInPlaceReplacement(t *testing.T) {
-	f := newFake().on("docker run", "", errors.New("exit status 125"))
+// The distinction the ledger depends on. Once an in-place replacement has
+// stopped the old container, the host has changed whether or not the new one
+// comes up.
+func TestSwapServicesReportsMutationOnceTheOldContainerIsStopped(t *testing.T) {
+	f := newFake().
+		on("ps -aq --filter name=^/demo-app$", "cid\n", nil).
+		on("docker start", "", errors.New("exit status 1"))
 	withFake(t, f)
 
 	spec := svcSpec(map[string]release.Service{"app": {Image: "app", Restart: "always"}}, "app")
 	started, mutated, err := swapServices(spec, nil, "")
 
 	if err == nil {
-		t.Fatal("swapServices succeeded despite docker run failing")
+		t.Fatal("swapServices succeeded despite docker start failing")
 	}
 	if !mutated {
-		t.Fatal("an in-place replacement that failed must still report the host as changed")
+		t.Fatal("a replacement that failed after stopping the old container must report the host as changed")
 	}
 	if len(started) != 0 {
 		t.Fatalf("started = %v, want none", started)
+	}
+}
+
+// The replacement is created first, so a definition docker rejects never
+// reaches the old container: production is untouched, and the ledger says so.
+func TestSwapServicesLeavesTheOldContainerWhenTheReplacementCannotBeCreated(t *testing.T) {
+	f := newFake().
+		on("ps -aq --filter name=^/demo-app$", "cid\n", nil).
+		on("docker create", "invalid mount config", errors.New("exit status 125"))
+	withFake(t, f)
+
+	spec := svcSpec(map[string]release.Service{"app": {Image: "app", Restart: "always"}}, "app")
+	_, mutated, err := swapServices(spec, nil, "")
+
+	if err == nil || !strings.Contains(err.Error(), "invalid mount config") {
+		t.Fatalf("err = %v, want docker's own reason", err)
+	}
+	if mutated {
+		t.Error("a replacement that was never created reported the host as changed")
+	}
+	if f.did("docker stop", "demo-app") {
+		t.Error("the old container was stopped although its replacement could not be created")
 	}
 }
 
@@ -151,7 +175,7 @@ func TestEnsureAccessoriesLeavesAnExistingOneAlone(t *testing.T) {
 	if err := ensureAccessories(spec, ledger, ""); err != nil {
 		t.Fatal(err)
 	}
-	if f.did("docker run", "--name demo-db") {
+	if f.did("docker create", "--name demo-db") {
 		t.Fatalf("an existing accessory was recreated; calls:\n%s", strings.Join(f.calls, "\n"))
 	}
 	if !f.did("docker start demo-db") {

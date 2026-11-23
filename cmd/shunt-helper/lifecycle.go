@@ -186,7 +186,7 @@ func cmdBoot(in io.Reader, args []string) error {
 			}
 		}
 		step("boot:"+name, "recreating "+containerName(spec.Project, name))
-		if err := startContainer(&spec, name, acc, envFile, "accessory"); err != nil {
+		if _, err := startContainer(&spec, name, acc, envFile, "accessory"); err != nil {
 			return err
 		}
 		ok("boot:"+name, containerName(spec.Project, name)+" recreated")

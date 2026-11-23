@@ -157,6 +157,9 @@ func diffService(old, nw release.Service) []string {
 	if old.Drain != nw.Drain {
 		r = append(r, fmt.Sprintf("drain %s → %s", old.Drain, nw.Drain))
 	}
+	if old.Init != nw.Init {
+		r = append(r, fmt.Sprintf("init %v → %v", old.Init, nw.Init))
+	}
 	if !reflect.DeepEqual(old.Proxy, nw.Proxy) {
 		switch {
 		case old.Proxy == nil:

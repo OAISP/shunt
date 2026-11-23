@@ -64,16 +64,10 @@ func loadImages(spec *release.Spec) error {
 			return fmt.Errorf("image %s: %w", name, err)
 		}
 
-		// A partial load is an optimisation, never a requirement, and a daemon
-		// declines one in either of two ways: it errors on a manifest naming a
-		// blob the archive does not carry, or it accepts the archive and produces
-		// no image. Both mean the same thing and both have the same answer, so
-		// both fall through to sending the whole layout.
-		//
-		// Treating only the second as recoverable is what made this fallback
-		// unreachable on the store that actually needs it: the classic overlay2
-		// importer resolves every layer path out of the archive rather than out
-		// of the layers it already holds, so it fails loudly rather than quietly.
+		// A partial load is an optimisation, never a requirement. It fails when
+		// the daemon lacks a layer the archive leaves out — after a `docker
+		// system prune`, say — in one of two shapes, an error or a load that
+		// produces no image, and both fall through to sending the whole layout.
 		if fresh != nil {
 			if err := loadLayout(dir, fresh); err != nil {
 				info("this daemon will not load a partial layout (" + firstLine(err.Error()) + "); sending the whole layout")
@@ -203,15 +197,8 @@ func firstLine(s string) string {
 // becoming 40 KB. A nil map sends everything, which is what a first deploy and
 // the fallback do.
 //
-// Whether a daemon accepts this is not something to assert: the containerd
-// snapshotter resolves the missing layers out of its own content store, while
-// the classic overlay2 importer resolves every path out of the archive and
-// fails on the first one that is not there. The caller therefore treats a
-// partial load as an attempt rather than a step, and both of its failure shapes
-// as the same answer.
-//
 // Built here rather than shelled out to `tar`, which is how the filtering is
-// expressed and why the host no longer needs tar.
+// expressed and why the host does not need tar.
 func dockerLoadDir(dir string, onlyBlobs map[string]bool) error {
 	loadCmd := exec.Command("docker", "load")
 	stdin, err := loadCmd.StdinPipe()
@@ -233,10 +220,17 @@ func dockerLoadDir(dir string, onlyBlobs map[string]bool) error {
 	return writeErr
 }
 
-// writeLayoutTar tars a layout, optionally keeping only the named blobs.
+// writeLayoutTar tars a layout, leaving out the layers not named in onlyBlobs.
+//
+// Only layers: config and manifest blobs always travel. Both image stores load
+// a layer they already hold without its file, but the classic one has to read
+// the image config from the archive — and when the image is unchanged, as in a
+// deploy that only changed env or secrets, rsync rewrote no blob at all, so a
+// config left out made that load fail and fall back to sending everything.
 func writeLayoutTar(w io.Writer, dir string, onlyBlobs map[string]bool) error {
 	tw := tar.NewWriter(w)
 	blobPrefix := filepath.Join("blobs", "sha256") + string(filepath.Separator)
+	layers := layoutLayers(dir)
 
 	err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
@@ -250,10 +244,8 @@ func writeLayoutTar(w io.Writer, dir string, onlyBlobs map[string]bool) error {
 		if strings.HasPrefix(filepath.Base(rel), ".shunt-verified.json") {
 			return nil
 		}
-		if onlyBlobs != nil && strings.HasPrefix(rel, blobPrefix) {
-			if !onlyBlobs[filepath.Base(rel)] {
-				return nil
-			}
+		if b := filepath.Base(rel); onlyBlobs != nil && strings.HasPrefix(rel, blobPrefix) && layers[b] && !onlyBlobs[b] {
+			return nil
 		}
 		fi, err := d.Info()
 		if err != nil {
@@ -278,6 +270,26 @@ func writeLayoutTar(w io.Writer, dir string, onlyBlobs map[string]bool) error {
 		return fmt.Errorf("tar layout: %w", err)
 	}
 	return tw.Close()
+}
+
+// layoutLayers names the layer blobs in a layout's docker-archive manifest. An
+// unreadable manifest names none, so nothing is left out of the archive.
+func layoutLayers(dir string) map[string]bool {
+	out := map[string]bool{}
+	b, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
+	if err != nil {
+		return out
+	}
+	var entries []struct{ Layers []string }
+	if json.Unmarshal(b, &entries) != nil {
+		return out
+	}
+	for _, e := range entries {
+		for _, l := range e.Layers {
+			out[filepath.Base(l)] = true
+		}
+	}
+	return out
 }
 
 func imageRef(spec *release.Spec, name string) (string, error) {
