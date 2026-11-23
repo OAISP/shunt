@@ -667,3 +667,59 @@ host = "qa@example.com"
 		t.Errorf("Destinations() has %d entries, want 2", got)
 	}
 }
+
+const prebuiltImage = `
+project = "demo"
+host = "h"
+[images.app]
+layout = "image"
+[services.app]
+image = "app"
+`
+
+// writeLayout lays down a manifest next to a directory holding an index.json.
+func writeLayout(t *testing.T, toml string) string {
+	t.Helper()
+	p := write(t, toml)
+	dir := filepath.Join(filepath.Dir(p), "image")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "index.json"), []byte(`{"manifests":[]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestLayoutImageGetsNoBuildDefaults(t *testing.T) {
+	m, err := Load(writeLayout(t, prebuiltImage))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if img := m.Images["app"]; img.Context != "" || img.Dockerfile != "" {
+		t.Errorf("layout image got build defaults: %+v", img)
+	}
+}
+
+// A build key next to a layout would be silently ignored, which is the failure
+// mode unknown-key rejection exists to prevent.
+func TestLayoutWithBuildKeysIsRejected(t *testing.T) {
+	_, err := Load(writeLayout(t, strings.Replace(prebuiltImage, `layout = "image"`, "layout = \"image\"\ncontext = \".\"", 1)))
+	if err == nil || !strings.Contains(err.Error(), "do not apply") {
+		t.Fatalf("err = %v, want a conflict error", err)
+	}
+}
+
+// platform picks one image out of a multi-platform layout, so it is allowed.
+func TestLayoutAcceptsAPlatform(t *testing.T) {
+	if _, err := Load(writeLayout(t, strings.Replace(prebuiltImage, `layout = "image"`, "layout = \"image\"\nplatform = \"linux/arm64\"", 1))); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+}
+
+// validate runs on merge requests, before any CI step has exported the layout.
+func TestLayoutNeedNotExistToValidate(t *testing.T) {
+	if _, err := Load(write(t, prebuiltImage)); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+}

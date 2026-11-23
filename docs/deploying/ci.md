@@ -99,7 +99,7 @@ jobs:
       - name: install shunt
         run: |
           curl -sSL https://raw.githubusercontent.com/OAISP/shunt/main/install.sh \
-            | SHUNT_VERSION=v0.2.0 PREFIX="$HOME/.local/bin" sh
+            | SHUNT_VERSION=v0.3.0 PREFIX="$HOME/.local/bin" sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       # The runner's default builder cannot export an OCI layout.
@@ -142,7 +142,7 @@ deploy:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
   before_script:
     - apk add --no-cache rsync openssh-client curl
-    - curl -sSL https://raw.githubusercontent.com/OAISP/shunt/main/install.sh | SHUNT_VERSION=v0.2.0 sh
+    - curl -sSL https://raw.githubusercontent.com/OAISP/shunt/main/install.sh | SHUNT_VERSION=v0.3.0 sh
     - docker buildx create --use --driver docker-container
     - install -m 700 -d ~/.ssh
     - printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
@@ -194,6 +194,25 @@ jobs:
 
 Secrets are resolved by the job that applies the bundle, so give each deploy
 job the variables its target's provider reads.
+
+## Deploy an image your pipeline already built
+
+If the pipeline already builds, scans and signs the image, rebuilding it in the
+deploy job would ship a different image from the one that was checked. Export
+the checked image by digest into an OCI layout and let shunt ship that instead;
+see [prebuilt images]({% link manifest/images.md %}#prebuilt-images). The deploy
+job then needs no Docker and no build cache, only shunt, ssh, rsync and a
+registry client. Start from the [GitLab CI](#gitlab-ci) job above, drop
+docker, dind and the build cache, install `regctl`, and replace the script:
+
+```yaml
+  script:
+    - regctl image copy "$IMAGE@$IMAGE_DIGEST" ocidir://.ci/oci/app:release
+    - shunt up --rollback-on-failure
+```
+
+with `layout = ".ci/oci/app"` under `[images.app]` in `shunt.toml`. The server
+never talks to the registry, so it works for a registry the server cannot reach.
 
 ## Checks on pull requests
 

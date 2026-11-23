@@ -53,7 +53,7 @@ func cmdAudit(ctx context.Context, args []string) error {
 			m.Project, len(m.Services), len(m.Images)), ""})
 	}
 
-	checks = append(checks, localChecks()...)
+	checks = append(checks, localChecks(manifestErr != nil || buildsAny(m))...)
 
 	// Host checks need a manifest to know which host to talk to.
 	if manifestErr == nil {
@@ -74,14 +74,28 @@ func cmdAudit(ctx context.Context, args []string) error {
 	return renderAudit(checks, c.out())
 }
 
+// buildsAny reports whether a deploy builds anything here; one that only ships
+// prebuilt layouts needs no docker on this machine.
+func buildsAny(m *manifest.Manifest) bool {
+	for _, img := range m.Images {
+		if img.Layout == "" {
+			return true
+		}
+	}
+	return false
+}
+
 // localChecks cover the machine running shunt.
-func localChecks() []check {
+func localChecks(builds bool) []check {
 	var out []check
 	for _, tool := range []struct{ name, fix string }{
 		{"docker", "install Docker, and make sure the daemon is running"},
 		{"rsync", "install rsync (brew install rsync / apt-get install rsync)"},
 		{"ssh", "install an ssh client"},
 	} {
+		if tool.name == "docker" && !builds {
+			continue
+		}
 		if _, err := exec.LookPath(tool.name); err != nil {
 			out = append(out, check{"local " + tool.name, statusFail, "not on PATH", tool.fix})
 			continue
@@ -94,6 +108,9 @@ func localChecks() []check {
 	// buildx being present is not enough: the default `docker` driver is on
 	// every machine and refuses to export a layout unless the daemon runs the
 	// containerd image store.
+	if !builds {
+		return append(out, rsyncZstdCheck()...)
+	}
 	if outb, err := exec.Command("docker", "buildx", "version").Output(); err != nil {
 		out = append(out, check{"local buildx", statusFail, "not available",
 			"install docker buildx; shunt exports an OCI layout with it"})
@@ -107,18 +124,22 @@ func localChecks() []check {
 		}
 	}
 
-	// zstd on this side is half of the transfer-compression story; the host is
-	// the other half and is reported separately.
-	if outb, err := exec.Command("rsync", "--version").Output(); err == nil {
-		if strings.Contains(strings.ToLower(string(outb)), "zstd") {
-			out = append(out, check{"local rsync zstd", statusOK, "supported", ""})
-		} else {
-			out = append(out, check{"local rsync zstd", statusWarn,
-				"this rsync has no zstd; transfers fall back to plain -z",
-				"install rsync 3.2+ for cheaper compression (macOS ships 2.6.9)"})
-		}
+	return append(out, rsyncZstdCheck()...)
+}
+
+// rsyncZstdCheck covers this side of transfer compression; the host is the
+// other half and is reported separately.
+func rsyncZstdCheck() []check {
+	outb, err := exec.Command("rsync", "--version").Output()
+	if err != nil {
+		return nil
 	}
-	return out
+	if strings.Contains(strings.ToLower(string(outb)), "zstd") {
+		return []check{{"local rsync zstd", statusOK, "supported", ""}}
+	}
+	return []check{{"local rsync zstd", statusWarn,
+		"this rsync has no zstd; transfers fall back to plain -z",
+		"install rsync 3.2+ for cheaper compression (macOS ships 2.6.9)"}}
 }
 
 // hostChecks cover the deploy target. They reuse the probe the deploy itself
@@ -193,15 +214,27 @@ func diskCheck(d release.Disk) check {
 
 // platformCheck compares what each image will be built for against the host.
 func platformCheck(m *manifest.Manifest, hostArch string) check {
-	var mismatched []string
+	var mismatched, unreadable []string
 	for name, img := range m.Images {
 		want := img.Platform
+		if img.Layout != "" {
+			p, err := build.LayoutPlatform(m.Abs(img.Layout), img.Platform)
+			if err != nil {
+				unreadable = append(unreadable, fmt.Sprintf("%s: %v", name, err))
+				continue
+			}
+			want = p
+		}
 		if want == "" {
 			continue // buildx defaults to this machine; reported below
 		}
-		if !strings.HasSuffix(want, "/"+hostArch) {
+		if arch := strings.Split(want+"/", "/")[1]; arch != hostArch {
 			mismatched = append(mismatched, fmt.Sprintf("%s builds %s but the host is %s", name, want, hostArch))
 		}
+	}
+	if len(unreadable) > 0 {
+		// Each layout error already names its own fix.
+		return check{"image platform", statusFail, strings.Join(append(unreadable, mismatched...), "; "), ""}
 	}
 	if len(mismatched) > 0 {
 		return check{"image platform", statusFail, strings.Join(mismatched, "; "),
@@ -209,7 +242,7 @@ func platformCheck(m *manifest.Manifest, hostArch string) check {
 	}
 	var unset []string
 	for name, img := range m.Images {
-		if img.Platform == "" {
+		if img.Platform == "" && img.Layout == "" {
 			unset = append(unset, name)
 		}
 	}

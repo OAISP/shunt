@@ -15,7 +15,7 @@ curl -sSL https://raw.githubusercontent.com/OAISP/shunt/main/install.sh | sh
 ```
 
 It never runs sudo. It installs to `/usr/local/bin` when that is writable and to
-`~/.local/bin` otherwise. `SHUNT_VERSION=v0.2.0` pins a release and
+`~/.local/bin` otherwise. `SHUNT_VERSION=v0.3.0` pins a release and
 `PREFIX=<dir>` chooses the directory. Read the script first if you would rather
 not pipe one into a shell — a reasonable instinct for a tool that will hold ssh
 access to your servers.
@@ -48,7 +48,8 @@ make install    # builds ./shunt with the helpers embedded, installs to ~/.local
 ## Requirements
 
 **Your machine:** docker with a buildx builder that can export an OCI layout,
-rsync and ssh.
+rsync and ssh. Docker is only needed for images shunt builds; a
+[prebuilt image]({% link manifest/images.md %}#prebuilt-images) needs none.
 
 **The server:** docker, rsync, and an ssh user that can reach the docker socket.
 Nothing else — shunt uploads its own helper, which does the health probes and

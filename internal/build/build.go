@@ -158,6 +158,195 @@ func Build(ctx context.Context, o Options) (*Result, error) {
 // arbitrary; only its stability matters.
 var blobEpoch = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
 
+// Import writes a single-image layout holding just the image a prebuilt layout
+// names, so it ships, deduplicates and loads like a fresh export. Attestation
+// manifests are skipped, and from a multi-platform index only the requested
+// platform is taken, so blobs the server would never run are never shipped.
+// Blobs are copied, not linked: pinning their times must not touch the source.
+func Import(src, outDir, name, platform string) (*Result, error) {
+	d, man, err := selectImage(src, platform)
+	if err != nil {
+		return nil, fmt.Errorf("import image %q: %w", name, err)
+	}
+	if err := os.RemoveAll(outDir); err != nil {
+		return nil, err
+	}
+	blobs := append([]string{d.Digest, man.Config.Digest}, layerDigests(man)...)
+	for _, dg := range blobs {
+		if err := copyFile(filepath.Join(src, blobPath(dg)), filepath.Join(outDir, blobPath(dg))); err != nil {
+			return nil, fmt.Errorf("import image %q: %w", name, err)
+		}
+	}
+	idx, err := json.Marshal(map[string]any{
+		"schemaVersion": 2,
+		"mediaType":     "application/vnd.oci.image.index.v1+json",
+		"manifests":     []descriptor{{MediaType: d.MediaType, Digest: d.Digest, Size: d.Size}},
+	})
+	if err != nil {
+		return nil, err
+	}
+	for file, body := range map[string][]byte{"index.json": idx, "oci-layout": []byte(`{"imageLayoutVersion":"1.0.0"}`)} {
+		if err := os.WriteFile(filepath.Join(outDir, file), body, 0o644); err != nil {
+			return nil, err
+		}
+	}
+	if err := normalizeBlobTimes(outDir); err != nil {
+		return nil, fmt.Errorf("import image %q: %w", name, err)
+	}
+	return &Result{Name: name, Dir: outDir, Digest: d.Digest, Bytes: DirSize(outDir)}, nil
+}
+
+// LayoutPlatform reads the os/arch of the image Import would take from a layout.
+func LayoutPlatform(dir, platform string) (string, error) {
+	_, man, err := selectImage(dir, platform)
+	if err != nil {
+		return "", err
+	}
+	b, err := os.ReadFile(filepath.Join(dir, blobPath(man.Config.Digest)))
+	if err != nil {
+		return "", fmt.Errorf("read image config: %w", err)
+	}
+	var cfg ociPlatform
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		return "", fmt.Errorf("parse image config: %w", err)
+	}
+	return cfg.String(), nil
+}
+
+type descriptor struct {
+	MediaType   string            `json:"mediaType,omitempty"`
+	Digest      string            `json:"digest"`
+	Size        int64             `json:"size,omitempty"`
+	Platform    *ociPlatform      `json:"platform,omitempty"`
+	Annotations map[string]string `json:"annotations,omitempty"`
+}
+
+type ociPlatform struct {
+	OS           string `json:"os"`
+	Architecture string `json:"architecture"`
+	Variant      string `json:"variant,omitempty"`
+}
+
+func (p ociPlatform) String() string {
+	s := p.OS + "/" + p.Architecture
+	if p.Variant != "" {
+		s += "/" + p.Variant
+	}
+	return s
+}
+
+// isAttestation recognises the provenance and SBOM manifests buildx adds to an
+// index: annotated as such, and given the platform unknown/unknown.
+func isAttestation(d descriptor) bool {
+	return d.Annotations["vnd.docker.reference.type"] == "attestation-manifest" ||
+		(d.Platform != nil && d.Platform.OS == "unknown")
+}
+
+// selectImage finds the image manifest a layout means: its one index.json entry,
+// descending through nested indexes, minus attestations, narrowed to platform.
+func selectImage(dir, platform string) (descriptor, *ociManifest, error) {
+	b, err := os.ReadFile(filepath.Join(dir, "index.json"))
+	if err != nil {
+		return descriptor{}, nil, fmt.Errorf("%s is not an OCI image layout (no index.json)", dir)
+	}
+	var top struct {
+		Manifests []descriptor `json:"manifests"`
+	}
+	if err := json.Unmarshal(b, &top); err != nil {
+		return descriptor{}, nil, fmt.Errorf("parse index.json: %w", err)
+	}
+	if len(top.Manifests) != 1 {
+		return descriptor{}, nil, fmt.Errorf("%s lists %d images in index.json; export exactly one image into an empty directory", dir, len(top.Manifests))
+	}
+	d := top.Manifests[0]
+	for depth := 0; depth <= 4; depth++ {
+		mb, err := os.ReadFile(filepath.Join(dir, blobPath(d.Digest)))
+		if err != nil {
+			return descriptor{}, nil, fmt.Errorf("read blob %s: %w", d.Digest, err)
+		}
+		var m struct {
+			ociManifest
+			Manifests []descriptor `json:"manifests"`
+		}
+		if err := json.Unmarshal(mb, &m); err != nil {
+			return descriptor{}, nil, fmt.Errorf("parse blob %s: %w", d.Digest, err)
+		}
+		if m.Config.Digest != "" {
+			if d.MediaType == "" {
+				d.MediaType = m.MediaType
+			}
+			if d.Size == 0 {
+				d.Size = int64(len(mb))
+			}
+			return d, &m.ociManifest, nil
+		}
+		var images []descriptor
+		for _, c := range m.Manifests {
+			if !isAttestation(c) && (platform == "" || c.Platform == nil || matchesPlatform(*c.Platform, platform)) {
+				images = append(images, c)
+			}
+		}
+		switch {
+		case len(images) == 1:
+			d = images[0]
+		case len(images) == 0 && platform != "":
+			return descriptor{}, nil, fmt.Errorf("layout has no image for %s (it has %s)", platform, platformList(m.Manifests))
+		case len(images) == 0:
+			return descriptor{}, nil, fmt.Errorf("index %s holds no image manifest", d.Digest)
+		default:
+			return descriptor{}, nil, fmt.Errorf("layout holds %d platforms (%s); set platform in [images.*] to pick one", len(images), platformList(images))
+		}
+	}
+	return descriptor{}, nil, fmt.Errorf("image index nests more than 4 levels deep")
+}
+
+// matchesPlatform compares os/arch, and the variant only when one is asked for.
+func matchesPlatform(p ociPlatform, want string) bool {
+	parts := strings.Split(want, "/")
+	if len(parts) < 2 || p.OS != parts[0] || p.Architecture != parts[1] {
+		return false
+	}
+	return len(parts) < 3 || p.Variant == parts[2]
+}
+
+func platformList(ds []descriptor) string {
+	var out []string
+	for _, d := range ds {
+		if d.Platform != nil && !isAttestation(d) {
+			out = append(out, d.Platform.String())
+		}
+	}
+	return strings.Join(out, ", ")
+}
+
+func layerDigests(m *ociManifest) []string {
+	out := make([]string, 0, len(m.Layers))
+	for _, l := range m.Layers {
+		out = append(out, l.Digest)
+	}
+	return out
+}
+
+func copyFile(src, dst string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
+}
+
 // normalizeBlobTimes gives every blob the same modification time.
 //
 // A blob's filename is its content hash, so its mtime carries no information
@@ -351,15 +540,6 @@ type ociManifest struct {
 	Layers []struct {
 		Digest string `json:"digest"`
 	} `json:"layers"`
-	// Present when this blob is an index rather than a manifest.
-	Manifests []struct {
-		Digest    string `json:"digest"`
-		MediaType string `json:"mediaType"`
-		Platform  struct {
-			OS           string `json:"os"`
-			Architecture string `json:"architecture"`
-		} `json:"platform"`
-	} `json:"manifests"`
 }
 
 // WriteDockerArchiveManifest adds the manifest.json that a Docker daemon without
@@ -377,11 +557,7 @@ type ociManifest struct {
 // transfer, so layer deduplication is untouched and both loaders are satisfied
 // without shunt having to probe the host or care which one it is talking to.
 func WriteDockerArchiveManifest(dir, ref string) error {
-	idxDigest, err := readIndexDigest(dir)
-	if err != nil {
-		return err
-	}
-	man, err := resolveManifest(dir, idxDigest, 0)
+	_, man, err := selectImage(dir, "")
 	if err != nil {
 		return err
 	}
@@ -400,34 +576,6 @@ func WriteDockerArchiveManifest(dir, ref string) error {
 		return err
 	}
 	return os.WriteFile(filepath.Join(dir, "manifest.json"), out, 0o644)
-}
-
-// resolveManifest walks from a descriptor to the image manifest, descending
-// through an index when the export nested one.
-func resolveManifest(dir, digest string, depth int) (*ociManifest, error) {
-	if depth > 4 {
-		return nil, fmt.Errorf("image index nests more than 4 levels deep")
-	}
-	b, err := os.ReadFile(filepath.Join(dir, blobPath(digest)))
-	if err != nil {
-		return nil, fmt.Errorf("read blob %s: %w", digest, err)
-	}
-	var m ociManifest
-	if err := json.Unmarshal(b, &m); err != nil {
-		return nil, fmt.Errorf("parse blob %s: %w", digest, err)
-	}
-	if m.Config.Digest != "" {
-		return &m, nil
-	}
-	if len(m.Manifests) == 0 {
-		return nil, fmt.Errorf("blob %s is neither an image manifest nor an index", digest)
-	}
-	// A single-platform build exports one entry; anything else is ambiguous, and
-	// guessing which platform the host wants would be worse than saying so.
-	if len(m.Manifests) > 1 {
-		return nil, fmt.Errorf("layout holds %d platforms; set `platform` in [images.*] to build one", len(m.Manifests))
-	}
-	return resolveManifest(dir, m.Manifests[0].Digest, depth+1)
 }
 
 func blobPath(digest string) string {

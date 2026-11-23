@@ -4,7 +4,7 @@
 #   curl -sSL https://raw.githubusercontent.com/OAISP/shunt/main/install.sh | sh
 #
 # Environment:
-#   SHUNT_VERSION   pin a release, e.g. v0.2.0 (default: latest)
+#   SHUNT_VERSION   pin a release, e.g. v0.3.0 (default: latest)
 #   PREFIX          install directory (default: /usr/local/bin, else ~/.local/bin)
 #
 # This script never invokes sudo. If it cannot write to /usr/local/bin it
