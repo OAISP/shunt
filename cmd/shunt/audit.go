@@ -233,8 +233,8 @@ func platformCheck(m *manifest.Manifest, hostArch string) check {
 		}
 	}
 	if len(unreadable) > 0 {
-		return check{"image platform", statusFail, strings.Join(append(unreadable, mismatched...), "; "),
-			"re-export the layout as one image into an empty directory"}
+		// Each layout error already names its own fix.
+		return check{"image platform", statusFail, strings.Join(append(unreadable, mismatched...), "; "), ""}
 	}
 	if len(mismatched) > 0 {
 		return check{"image platform", statusFail, strings.Join(mismatched, "; "),

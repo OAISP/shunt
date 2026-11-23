@@ -540,15 +540,6 @@ type ociManifest struct {
 	Layers []struct {
 		Digest string `json:"digest"`
 	} `json:"layers"`
-	// Present when this blob is an index rather than a manifest.
-	Manifests []struct {
-		Digest    string `json:"digest"`
-		MediaType string `json:"mediaType"`
-		Platform  struct {
-			OS           string `json:"os"`
-			Architecture string `json:"architecture"`
-		} `json:"platform"`
-	} `json:"manifests"`
 }
 
 // WriteDockerArchiveManifest adds the manifest.json that a Docker daemon without
@@ -566,11 +557,7 @@ type ociManifest struct {
 // transfer, so layer deduplication is untouched and both loaders are satisfied
 // without shunt having to probe the host or care which one it is talking to.
 func WriteDockerArchiveManifest(dir, ref string) error {
-	idxDigest, err := readIndexDigest(dir)
-	if err != nil {
-		return err
-	}
-	man, err := resolveManifest(dir, idxDigest, 0)
+	_, man, err := selectImage(dir, "")
 	if err != nil {
 		return err
 	}
@@ -589,34 +576,6 @@ func WriteDockerArchiveManifest(dir, ref string) error {
 		return err
 	}
 	return os.WriteFile(filepath.Join(dir, "manifest.json"), out, 0o644)
-}
-
-// resolveManifest walks from a descriptor to the image manifest, descending
-// through an index when the export nested one.
-func resolveManifest(dir, digest string, depth int) (*ociManifest, error) {
-	if depth > 4 {
-		return nil, fmt.Errorf("image index nests more than 4 levels deep")
-	}
-	b, err := os.ReadFile(filepath.Join(dir, blobPath(digest)))
-	if err != nil {
-		return nil, fmt.Errorf("read blob %s: %w", digest, err)
-	}
-	var m ociManifest
-	if err := json.Unmarshal(b, &m); err != nil {
-		return nil, fmt.Errorf("parse blob %s: %w", digest, err)
-	}
-	if m.Config.Digest != "" {
-		return &m, nil
-	}
-	if len(m.Manifests) == 0 {
-		return nil, fmt.Errorf("blob %s is neither an image manifest nor an index", digest)
-	}
-	// A single-platform build exports one entry; anything else is ambiguous, and
-	// guessing which platform the host wants would be worse than saying so.
-	if len(m.Manifests) > 1 {
-		return nil, fmt.Errorf("layout holds %d platforms; set `platform` in [images.*] to build one", len(m.Manifests))
-	}
-	return resolveManifest(dir, m.Manifests[0].Digest, depth+1)
 }
 
 func blobPath(digest string) string {
