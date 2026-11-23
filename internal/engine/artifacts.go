@@ -8,12 +8,10 @@ import (
 	"fmt"
 	"maps"
 	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 
 	"github.com/OAISP/shunt/internal/release"
-	"github.com/OAISP/shunt/internal/sshx"
 	"github.com/OAISP/shunt/internal/transport"
 )
 
@@ -71,7 +69,7 @@ func (e *Engine) artifacts(releaseID string) ([]release.Artifact, error) {
 
 // linkDestFor names the live tree to reuse unchanged files from, or "" when the
 // host has nothing there yet.
-func linkDestFor(a release.Artifact, present map[string]transport.FileStat) string {
+func linkDestFor(a release.Artifact, present map[string]release.PathState) string {
 	if !a.Dir {
 		return "" // single files use --fuzzy instead
 	}
@@ -94,20 +92,10 @@ func (e *Engine) LocalArtifactPath(name string) string {
 	return ""
 }
 
-// PushArtifacts transfers each artifact to its staged path on the host.
-func (e *Engine) PushArtifacts(ctx context.Context, spec *release.Spec, verbose bool) (map[string]*transport.Stats, error) {
+// PushArtifacts transfers each artifact to its staged path on the host. present
+// is what PlanState found at each destination.
+func (e *Engine) PushArtifacts(ctx context.Context, spec *release.Spec, present map[string]release.PathState, verbose bool) (map[string]*transport.Stats, error) {
 	stats := map[string]*transport.Stats{}
-
-	// Which destinations already exist, in one round trip. A directory transfer
-	// reuses the live tree via --link-dest, and pointing that at a path the host
-	// does not have yet makes rsync print a warning on a first deploy — accurate
-	// but alarming, and avoidable now that stats come back batched.
-	dests := make([]string, 0, len(spec.Artifacts))
-	for _, a := range spec.Artifacts {
-		dests = append(dests, a.Dest)
-	}
-	present := transport.RemoteFileStats(ctx, e.Client, dests)
-
 	for _, a := range spec.Artifacts {
 		st, err := transport.PushFile(ctx, transport.FileOptions{
 			Client:     e.Client,
@@ -117,7 +105,8 @@ func (e *Engine) PushArtifacts(ctx context.Context, spec *release.Spec, verbose 
 			RemoteZstd: e.facts.RsyncZstd,
 			// The live tree is what an unchanged file should be linked from
 			// rather than re-sent; ignored for single-file artifacts, and
-			// omitted entirely until the host actually has a tree to link from.
+			// omitted entirely until the host actually has a tree to link from,
+			// since rsync warns about a --link-dest that does not exist.
 			LinkDest: linkDestFor(a, present),
 		})
 		if err != nil {
@@ -128,61 +117,27 @@ func (e *Engine) PushArtifacts(ctx context.Context, spec *release.Spec, verbose 
 	return stats, nil
 }
 
-// PreflightArtifacts checks the host can actually receive every artifact, before
-// anything expensive happens.
-//
-// Building and shipping a 400 MB image only to fail on mkdir wastes minutes and
-// tells the operator nothing useful, so every destination directory is probed in
-// a single round trip and each failure names its own fix.
-func (e *Engine) PreflightArtifacts(ctx context.Context) error {
+// ArtifactDests lists where a manifest's artifacts land on the host.
+func (e *Engine) ArtifactDests() []string {
 	dests := make([]string, 0, len(e.M.Artifacts))
 	for _, a := range e.M.Artifacts {
 		dests = append(dests, a.Dest)
 	}
-	return e.PreflightArtifactDests(ctx, dests)
+	return dests
 }
 
-// PreflightArtifactDests is the same check driven by explicit destinations,
-// which is what a bundle has: it carries a release, not a manifest, so the
-// paths come from the spec. Skipping this was why applying a bundle with an
-// artifact failed at rsync with a bare "No such file or directory".
-func (e *Engine) PreflightArtifactDests(ctx context.Context, dests []string) error {
-	if len(dests) == 0 {
-		return nil
-	}
-	dirs := map[string]bool{}
-	for _, d := range dests {
-		if d != "" {
-			dirs[filepath.Dir(d)] = true
-		}
-	}
-	var script strings.Builder
-	for _, d := range slices.Sorted(maps.Keys(dirs)) {
-		fmt.Fprintf(&script, "if ! mkdir -p %s 2>/dev/null; then echo \"NODIR %s\"; elif [ ! -w %s ]; then echo \"NOWRITE %s\"; fi\n",
-			sshx.Quote(d), d, sshx.Quote(d), d)
-	}
-	out, err := e.Client.Run(ctx, "sh", "-c", script.String())
-	if err != nil {
-		return err
-	}
-
+// unusableDests turns destinations whose directory cannot take a new copy into
+// one error naming each, and the fix.
+func (e *Engine) unusableDests(paths map[string]release.PathState) error {
 	var problems []string
-	for _, ln := range strings.Split(strings.TrimSpace(out), "\n") {
-		if ln == "" {
-			continue
-		}
-		kind, dir, _ := strings.Cut(ln, " ")
-		switch kind {
-		case "NODIR":
-			problems = append(problems, fmt.Sprintf("  %s could not be created", dir))
-		case "NOWRITE":
-			problems = append(problems, fmt.Sprintf("  %s is not writable", dir))
+	for _, dest := range slices.Sorted(maps.Keys(paths)) {
+		if p := paths[dest].Problem; p != "" {
+			problems = append(problems, "  "+p)
 		}
 	}
 	if len(problems) == 0 {
 		return nil
 	}
-
 	user := e.M.Host
 	if u, _, ok := strings.Cut(e.M.Host, "@"); ok {
 		user = u
@@ -191,5 +146,5 @@ func (e *Engine) PreflightArtifactDests(ctx context.Context, dests []string) err
 		"  This is a one-time setup step — /opt is root-owned by default. On the host run:\n"+
 		"    sudo mkdir -p <dir> && sudo chown -R %s <dir>\n"+
 		"  Or point dest= somewhere you already own, e.g. $HOME.",
-		e.M.Host, strings.Join(problems, "\n"), user)
+		e.M.Host, strings.Join(slices.Compact(problems), "\n"), user)
 }

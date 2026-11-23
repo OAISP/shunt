@@ -108,11 +108,9 @@ func runStage(spec *release.Spec, st release.Stage, envFile string) error {
 
 // pruneCaptures keeps the newest `retain` generations of one stage's capture.
 //
-// It takes the *template*, not the rendered path. Deriving the prefix from the
-// rendered name — by cutting at its last dash — produced a prefix containing the
-// release id, which matches exactly one file: the one just written. Retention
-// silently never deleted anything, and a nightly pre-migration dump grew without
-// bound until the disk filled.
+// It takes the *template*, not the rendered path: the rendered name contains the
+// release id, so a prefix cut from it would match only the file just written
+// and nothing would ever be pruned.
 func pruneCaptures(template string, retain int) {
 	if retain <= 0 {
 		return

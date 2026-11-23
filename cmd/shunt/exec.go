@@ -22,7 +22,7 @@ func cmdExec(ctx context.Context, args []string) error {
 	}
 	rest := fs.Args()
 	if len(rest) == 0 {
-		return fmt.Errorf("usage: shunt exec <service> [--] <command>...")
+		return usagef("usage: shunt exec <service> [--] <command>...")
 	}
 	service, command := rest[0], rest[1:]
 	if len(command) == 0 {
@@ -59,7 +59,7 @@ func cmdRun(ctx context.Context, args []string) error {
 	}
 	rest := fs.Args()
 	if len(rest) == 0 {
-		return fmt.Errorf("usage: shunt run <service> [--] <command>...")
+		return usagef("usage: shunt run <service> [--] <command>...")
 	}
 	service, command := rest[0], rest[1:]
 	if len(command) == 0 {

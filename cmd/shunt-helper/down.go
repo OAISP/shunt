@@ -102,7 +102,7 @@ func down(project, network string, accessories, purge bool) error {
 		}
 	}
 
-	if n := removeProjectImages(project); n > 0 {
+	if n := removeProjectImages(project, ledger); n > 0 {
 		ok("down", fmt.Sprintf("%d image(s) removed", n))
 	}
 
@@ -191,18 +191,15 @@ func networkFor(ledger *release.Ledger, fallback string) string {
 // removeProjectImages drops every release-tagged image of this project. Unlike
 // pruneImages there is no keep set: purging means the rollback targets go too,
 // which the CLI says out loud before asking.
-func removeProjectImages(project string) int {
-	out, err := docker.Run("docker", "images",
-		"--filter", "reference=shunt/"+project+"-*", "--format", "{{.Repository}}:{{.Tag}}")
+func removeProjectImages(project string, ledger *release.Ledger) int {
+	refs, err := projectImages(project, ledger, nil)
 	if err != nil {
+		info("could not list images: " + err.Error())
 		return 0
 	}
 	var removed int
-	for _, ref := range splitLines(out) {
-		if ref == "" || strings.HasSuffix(ref, ":<none>") {
-			continue
-		}
-		if _, err := docker.Run("docker", "rmi", "-f", ref); err == nil {
+	for _, ref := range refs {
+		if docker.Ok("docker", "rmi", "-f", ref) {
 			removed++
 		}
 	}

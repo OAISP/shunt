@@ -6,97 +6,84 @@ nav_order: 1
 
 # Zero-downtime
 
-A service with a published host port must be stopped before its replacement can
-bind the same port. Measured on a live deploy, that gap was 0.29 s for an app
-booting in 200 ms — the gap is essentially your app's cold-boot time, so a
-Next.js or Rails app will be seconds.
+A service with a published host port is replaced in place: the old container
+has to stop before the new one can bind the port. The gap is the stop plus your
+app's start-up time — measured at 0.29 s for an app that boots in 200 ms, and
+seconds for a typical Next.js or Rails app.
 
-Give a service a `proxy` block and it goes blue/green instead: the new release
-starts alongside the old one, is health-checked, and the old one drains only
-once the new one is serving.
+Give the service a `proxy` block and it goes blue/green instead. The new
+release starts alongside the old one, is health-checked, and only then is the
+old one drained.
 
 ```toml
 [services.app]
 image  = "app"
-expose = 3000     # no host port — that is what allows two releases at once
-drain  = "10s"    # SIGTERM, then this long to finish in-flight work
+expose = 3000     # a container port, no host port: two releases can run at once
+drain  = "10s"    # how long the old release gets to finish in-flight requests
 
 [services.app.proxy]
-kind        = "traefik"          # traefik | caddy
+kind        = "traefik"          # traefik (default) | caddy
 host        = "app.example.com"
 entrypoints = ["web"]
-# path      = "/api"             # optional PathPrefix
-# port      = 3000               # defaults to `expose`
-# retry     = 2                  # default; reissues requests never answered
+# path      = "/api"             # a path prefix; default "/"
+# port      = 3000               # default: expose
+# retry     = 2                  # default; reissues requests that got no answer
 
 [services.app.health]
 url = "/health"
 ```
 
-shunt does not run a proxy. It emits the labels Traefik and caddy-docker-proxy
-already watch for, so the switchover is the proxy's job and shunt gains no
-long-lived component and no certificate management.
+A proxied service needs `expose` (or `proxy.port`) instead of `publish`, and a
+health check — without one a broken release would go straight into rotation.
 
-Measured through Traefik, hammering the app throughout a deploy:
+shunt does not run a proxy. It sets the container labels that Traefik and
+caddy-docker-proxy already watch, so the proxy does the switchover and shunt
+adds no long-running component and no certificates to manage.
+
+Measured through Traefik, with the app under load for the whole deploy:
 
 | | Requests | Failures |
 |:--|--:|--:|
-| Published port (stop-then-start) | 5648 | 23 — 0.29 s outage |
+| Published port, replaced in place | 5648 | 23 — a 0.29 s outage |
 | Blue/green, app ignores SIGTERM | 4031 | 3 |
-| Blue/green, graceful SIGTERM | 4018 | 2 |
-| Blue/green, graceful + retry | 4130 | **0** |
+| Blue/green, app handles SIGTERM | 4018 | 2 |
+| Blue/green, handles SIGTERM, `retry` on | 4130 | **0** |
 
 ## What your app has to do
 
-Zero-downtime is a contract, not a flag. The last two rows above are entirely
-app-side, and no deploy tool can supply them for you.
+The last rows of that table are up to the app; no deploy tool can supply them.
 
-1. **Handle SIGTERM.** On signal, start failing your health check so the proxy
-   takes you out of rotation, keep serving in-flight requests, then exit. A
-   process that dies instantly on SIGTERM drops whatever was in flight.
-2. **If you run schema migrations, make them expand/contract.** Stages run
-   before the swap, so during the overlap both releases talk to the migrated
-   schema. Dropping a column the old release still reads turns a clean outage
-   into a stream of 500s. Projects without migrations can ignore this.
+1. **Handle SIGTERM.** On the signal, start failing the health check so the
+   proxy takes you out of rotation, finish the requests in flight, then exit.
+   A process running as PID 1 with no handler ignores SIGTERM entirely and is
+   killed at the end of `drain`; [`init = true`]({% link manifest/services.md %}#stopping-cleanly)
+   fixes that without touching the app.
+2. **Make migrations expand-then-contract.** Stages run before the swap, so
+   during the overlap the old release runs against the new schema. Dropping a
+   column the old release still reads turns a clean switchover into a burst of
+   errors.
 
-A container that burns its whole drain window did not exit on SIGTERM and was
-killed. shunt says so, because it is usually the largest single cost in a deploy
-and is otherwise invisible:
+## When the proxy cannot check readiness
 
-```
-shuntbig-app ignored SIGTERM and was killed after 10s — handling it would cut
-that to near zero
-```
+The proxy, not shunt, decides when the new container receives traffic, so it
+needs something to poll. shunt gives Traefik and caddy an active health check
+whenever the service's health check is a `url` — the path of a full URL is used.
 
-## When the proxy cannot gate readiness
-
-A proxied service is put into rotation by the proxy, not by shunt, so the proxy
-needs something it can poll to know the new container is ready. shunt emits an
-active health check — for Traefik and for caddy — whenever the health block
-gives it a path to poll, taking the path from an absolute url if that is how it
-is written.
-
-A **command** health check cannot be expressed to either proxy. Such a service
-still overlaps, and `retry` still covers a backend that is not listening yet,
-but nothing covers one that is listening and still warming up. `shunt plan` says
-so rather than leaving it implicit:
+A `command` health check cannot be expressed to either proxy. Such a service
+still overlaps, and `retry` covers a backend that is not listening yet, but
+nothing holds back one that is listening and still warming up. `shunt plan`
+says so:
 
 ```
 ~ app            blue/green  (starts alongside; proxy cannot poll this health check)
 ```
 
-Give the service a `url` health check to close that gap.
+Use a `url` health check to close that gap.
 
-## Changing the proxy config
+## Changing the proxy block
 
-A label-discovered router is defined by *every* container carrying its labels,
-and Traefik refuses to serve a router that two containers define differently. It
-drops the route entirely, which is a total outage rather than a blip.
-
-So whenever the `proxy` block changes, shunt detects it and degrades that one
-deploy to stop-then-start. `shunt plan` says so, and you take a short gap
-instead of a dropped route. Steady-state deploys, where the block is unchanged,
-overlap normally.
-
-Services without a `proxy` block — workers, anything with no HTTP port — are
-stopped gracefully and restarted. They need none of this.
+A router discovered from labels is defined by every container that carries
+them, and Traefik drops a router that two containers define differently — a
+full outage, not a blip. So a deploy that changes the `proxy` block stops the
+old container before starting the new one, once. `shunt plan` says so, and the
+next deploy overlaps normally again.

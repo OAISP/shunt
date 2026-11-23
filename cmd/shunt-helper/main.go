@@ -12,31 +12,32 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"syscall"
 
 	"github.com/OAISP/shunt/internal/release"
 )
 
-// Version is informational only. What identifies this binary on the host is its
-// content hash, not this string; see internal/engine/helperbin.go.
-const Version = "0.1.0"
-
 func main() {
 	if len(os.Args) < 2 {
-		fatal(errors.New("usage: shunt-helper <apply|rollback|boot|retire|down|status|logs|prune|version>"))
+		fatal(errors.New("usage: shunt-helper <apply|plan|rollback|boot|retire|down|status|logs|prune|version>"))
 	}
 	var err error
 	switch os.Args[1] {
 	case "version":
-		fmt.Println(Version)
+		// What identifies this binary is its content hash, which is its filename
+		// on the host; the protocol is what it can talk.
+		fmt.Printf("protocol %d\n", release.Protocol)
 		return
 	case "apply":
-		err = cmdApply(os.Stdin)
+		err = cmdApply(os.Args[2:], os.Stdin)
 	case "rollback":
 		err = cmdRollback(os.Args[2:])
 	case "status":
 		err = cmdStatus(os.Args[2:])
+	case "plan":
+		err = cmdPlan(os.Args[2:])
 	case "logs":
 		err = cmdLogs(os.Args[2:])
 	case "prune":
@@ -115,5 +116,12 @@ func withLock(project string, fn func() error) error {
 		}
 	}
 	defer syscall.Flock(int(lf.Fd()), syscall.LOCK_UN)
+
+	// Whatever runs under the lock mutates the host, and must finish once begun.
+	// A dropped session — a cancelled CI job, a lost network — closes stdout, and
+	// by default the next status write would kill this process with SIGPIPE,
+	// possibly between stopping a container and starting its replacement.
+	// Ignored, the write just fails and the outcome still reaches the ledger.
+	signal.Ignore(syscall.SIGPIPE, syscall.SIGHUP)
 	return fn()
 }

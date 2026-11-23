@@ -67,16 +67,6 @@ func cmdDown(ctx context.Context, args []string) error {
 		return err
 	}
 
-	// The same lock a deploy takes. Without it a `down` racing an `up`
-	// interleaves removal with creation, and the host ends up with half of each.
-	lock, err := e.AcquireLock(ctx, func(msg string) {
-		fmt.Fprintf(os.Stderr, "  %s\n", c.err().Dim(msg))
-	})
-	if err != nil {
-		return err
-	}
-	defer lock.Release()
-
 	fmt.Fprintln(os.Stderr)
 	return run(func(r engine.EventRenderer) error {
 		return e.Down(ctx, engine.DownOptions{Accessories: all || purge, Purge: purge}, r)

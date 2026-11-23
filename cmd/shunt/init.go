@@ -19,7 +19,7 @@ func cmdInit(args []string, out io.Writer) error {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	host := fs.String("host", "", "deploy target, e.g. deploy@vps.example.com")
 	force := fs.Bool("force", false, "overwrite an existing shunt.toml")
-	if err := fs.Parse(args); err != nil {
+	if err := parseArgs(fs, args); err != nil {
 		return err
 	}
 

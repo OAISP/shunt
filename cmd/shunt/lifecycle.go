@@ -61,11 +61,8 @@ func cmdRollback(ctx context.Context, args []string) error {
 }
 
 // cmdRetire stops the containers of a service that is no longer in the manifest.
-//
-// Deleting a service from shunt.toml used to do nothing at all: `shunt plan`
-// reported it as removed on every run and the container kept serving old code
-// indefinitely. Acting on it automatically would mean `up` stopping containers
-// nobody asked it to stop, so this is its own verb.
+// A deploy only reports such an orphan — stopping containers nobody asked it to
+// stop is not its job — so this is its own verb.
 func cmdRetire(ctx context.Context, args []string) error {
 	var c commonFlags
 	var yes bool
@@ -77,7 +74,7 @@ func cmdRetire(ctx context.Context, args []string) error {
 	}
 	name := fs.Arg(0)
 	if name == "" {
-		return fmt.Errorf("usage: shunt retire <service>")
+		return usagef("usage: shunt retire <service>")
 	}
 
 	e, err := connect(ctx, c.file, c.target)
@@ -135,7 +132,7 @@ func cmdBoot(ctx context.Context, args []string) error {
 	}
 	name := fs.Arg(0)
 	if name == "" {
-		return fmt.Errorf("usage: shunt boot <accessory>")
+		return usagef("usage: shunt boot <accessory>")
 	}
 
 	e, err := connect(ctx, c.file, c.target)

@@ -6,44 +6,81 @@ nav_order: 3
 
 # Bundles
 
-Sometimes the machine that can build a release cannot reach the machine that
-should run it: an air-gapped network, a change-approval queue, a laptop with the
-source but no VPN.
+A bundle is a release in a file. It covers two cases:
+
+- **The builder cannot reach the server** — an air-gapped network, a
+  change-approval queue, a laptop with the source but no VPN.
+- **You want to build once and deploy the same bytes everywhere** — to staging,
+  and after an approval to production.
 
 ```sh
-shunt bundle                          # writes <project>-<release>.shuntpkg
-scp acme-....shuntpkg ops:            # or a USB stick, or an approval queue
+shunt bundle -o release.shuntpkg         # build; never connects to a server
 
-shunt bundle inspect acme-....shuntpkg
-shunt bundle verify  acme-....shuntpkg
-shunt apply --plan   acme-....shuntpkg
-shunt apply          acme-....shuntpkg
+shunt bundle inspect release.shuntpkg    # what is in it
+shunt bundle verify  release.shuntpkg    # are the bytes intact
+shunt apply --plan   release.shuntpkg    # what would it change
+shunt apply          release.shuntpkg    # deploy it
 ```
 
-`shunt bundle` does everything `shunt up` does up to the transfer and writes the
-result to a file instead of a host. It never connects, so it works with the
-target unreachable.
+`shunt bundle` does everything `shunt up` does up to the transfer, then writes
+the result to a file. Without `-o` it is named `<project>-<release>.shuntpkg`.
 
-`shunt apply` needs **no Dockerfile, no `shunt.toml` and no source** — and no
-Docker at all on the machine that runs it. It deploys through exactly the same
-path as `shunt up`: the same lock held across the transfer, the same check that
-the host has not moved on since the plan, the same helper. Layer deduplication
-still applies, so re-applying a bundle to a host that already has most of the
-image ships only the difference.
+`shunt apply` needs no `shunt.toml`, no source and no Docker on the machine
+that runs it — only ssh and rsync. It deploys through the same path as
+`shunt up`: the same lock, the same check that the server has not moved on, the
+same helper. Deduplication still applies, so applying a bundle to a server that
+already has most of the image sends only the difference.
+
+## What a bundle carries
+
+The release description, the image layouts, any artifacts, and the destination
+of every target in the manifest. Deliberately not:
+
+- **Secret values.** A file that waits in a queue or travels on a USB stick is
+  the last place for credentials. The bundle records the provider block and the
+  key names; `shunt apply` resolves the values on the machine applying it, and
+  refuses if a key the release needs is missing. Building a bundle does not
+  need the values either: if they are not reachable, the bundle records the key
+  names `shunt.toml` declares.
+- **The server helper.** The `shunt` that applies the bundle carries its own.
+- **A checksum of its own.** Every blob is named by its hash and rehashed on the
+  server, so a damaged bundle fails on the way in.
+
+A bundle is always complete, never a delta against one server's state: a file
+sitting in a queue cannot promise that state still holds.
+
+## Promoting across targets
+
+A target changes where a release goes and never what it contains, so one bundle
+can be applied to every target in turn:
+
+```sh
+shunt bundle -o release.shuntpkg
+shunt apply -t staging release.shuntpkg   # a target from [targets.*]
+shunt apply release.shuntpkg              # the manifest's own host
+```
+
+Applying with `-t` uses that target's host, project name and secrets provider.
+Staging and production then run identical images, rather than two builds that
+are probably the same. [Deploying from CI]({% link deploying/ci.md %}#build-once-promote)
+has a pipeline with an approval step in between.
+
+Build the bundle without `-t`. A bundle built with `-t staging` treats staging
+as its own destination, and carries no entry for the manifest's own host.
 
 ## Inspecting before you trust
 
-`shunt bundle inspect` is the command for someone handed a bundle to approve:
-which release, from which commit and whose build, for which host, running what,
-and which secrets it will want.
+`shunt bundle inspect` is for whoever is asked to approve a bundle: which
+release, from which commit and whose build, for which server, running what, and
+which secrets it will need.
 
 ```
-acme-20260728-093012.shuntpkg ·  84.2 MB
+release.shuntpkg ·  84.2 MB
 
   release  20260728-093012-a1b2c3
   built    2026-07-28T09:30:14Z
   for      deploy@prod.example.com
-  from     main@d4d427195445 by ci@runner
+  from     main@d4d427195445 by octocat@github-actions
 
   images
     app            a4c78dc30c9f
@@ -56,41 +93,18 @@ acme-20260728-093012.shuntpkg ·  84.2 MB
       DATABASE_URL
 ```
 
-It reads only the description, which is the first entry in the archive, so it
-answers immediately on a bundle of any size. It also says so loudly when the
-build came from a modified working tree, since that is precisely when the commit
-id describes nothing.
+It reads only the description at the start of the file, so it answers at once
+whatever the bundle's size, and it says so plainly when the build came from a
+modified working tree, since then the commit describes nothing.
 
-`shunt bundle verify` rehashes every blob against its own filename and checks
-that the release's images and artifacts are all present. That is the same check
-the host performs on load, run without a host, so a bundle can be proven intact
-before being carried somewhere retrying is expensive.
+`shunt bundle verify` rehashes every blob and checks that the release's images
+and artifacts are all there — the check the server makes on load, done before
+the file travels somewhere a retry is expensive. It proves the bytes are
+intact, not that the release works.
 
-{: .note }
-Verification proves the bytes are intact. It does not prove the release works.
+`shunt apply --plan` shows what applying would change, like `shunt plan`. It
+works where the secrets are not reachable, and says it skipped the secret diff
+rather than reporting every key as removed.
 
-`shunt apply --plan` answers "what will this do to my host" before it does it,
-with the same output and exit codes as `shunt plan`. It works even where the
-secrets are not reachable, saying the secret diff was skipped rather than
-reporting every key as removed.
-
-## What a bundle carries
-
-The release spec, the OCI layouts, and any artifacts. Deliberately not:
-
-- **Secret values.** A file that sits in a queue or on a stick is the last place
-  production credentials belong, and encrypting them into it only moves the key
-  problem. The provider block and the key *names* travel instead, and
-  `shunt apply` resolves the values locally — so whoever applies a bundle needs
-  access to the secrets, which is the correct requirement. Applying refuses if
-  the local provider does not supply a key the release needs.
-- **The host helper.** The CLI applying the bundle already embeds one.
-- **A checksum of its own.** Every blob inside is content-addressed and rehashed
-  on load, so a damaged bundle fails on the way in.
-
-Bundles are always complete rather than a delta against a particular host. A
-delta is only valid against the state it was computed from, and that is not a
-promise a file sitting in a queue can keep.
-
-Applying the same bundle twice is refused: release ids are immutable and the
-host has already recorded that one. Deploy it elsewhere with `--host`.
+Each release id is applied to a server once; applying the same bundle again is
+refused. `--host` sends it to a different server instead.

@@ -1,10 +1,14 @@
 package engine
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/OAISP/shunt/internal/build"
+	"github.com/OAISP/shunt/internal/manifest"
 	"github.com/OAISP/shunt/internal/release"
 )
 
@@ -468,5 +472,88 @@ func TestUnchangedReleaseSettingsAreNotWork(t *testing.T) {
 	// A first deploy has nothing to compare against.
 	if got := diffRelease(nil, same); len(got) != 0 {
 		t.Fatalf("diffRelease against no previous release = %v, want none", got)
+	}
+}
+
+// GitLab checks out a detached HEAD and runs as a service account, so without
+// the CI's own variables a release would record no branch and the wrong person.
+func TestProvenanceFromGitLabCI(t *testing.T) {
+	env := map[string]string{
+		"GITLAB_CI": "true", "GITLAB_USER_LOGIN": "ada", "CI_COMMIT_REF_NAME": "main",
+		"CI_COMMIT_SHA": "0123456789abcdef0123", "CI_JOB_URL": "https://gitlab.example.com/acme/-/jobs/42",
+	}
+	p := release.Provenance{Deployer: "gitlab-runner@ci-host"}
+	fromCI(&p, func(k string) string { return env[k] })
+	if p.Deployer != "ada@gitlab-ci" || p.Branch != "main" || p.Short != "0123456789ab" || p.Run != env["CI_JOB_URL"] {
+		t.Errorf("provenance = %+v", p)
+	}
+
+	// Git's answer wins where it has one.
+	p = release.Provenance{Branch: "release-1", Commit: "feedface", Short: "feedface"}
+	fromCI(&p, func(k string) string { return env[k] })
+	if p.Branch != "release-1" || p.Commit != "feedface" {
+		t.Errorf("CI variables overrode git: %+v", p)
+	}
+}
+
+func TestProvenanceOutsideCIIsUntouched(t *testing.T) {
+	p := release.Provenance{Deployer: "me@laptop"}
+	fromCI(&p, func(string) string { return "" })
+	if p.Deployer != "me@laptop" || p.Run != "" {
+		t.Errorf("provenance changed outside CI: %+v", p)
+	}
+}
+
+// Sized from the delta: a few KB of new layer must not be refused because the
+// whole image would not fit twice.
+func TestPreflightSpaceIsSizedFromTheDelta(t *testing.T) {
+	e := &Engine{M: &manifest.Manifest{Host: "deploy@example.com"}}
+	small := &TransferEstimate{Total: 2 << 30, Missing: 5 << 10}
+	if err := e.PreflightSpace(small, &release.Disk{StoreFree: 1 << 30, DockerFree: 1 << 30}); err != nil {
+		t.Errorf("a 5 KB delta was refused on a host with 1 GB free: %v", err)
+	}
+
+	big := &TransferEstimate{Total: 2 << 30, Missing: 1 << 30}
+	if err := e.PreflightSpace(big, &release.Disk{StoreFree: 10 << 30, DockerFree: 2 << 30}); err == nil ||
+		!strings.Contains(err.Error(), "docker's data root") {
+		t.Errorf("1 GB to unpack into 2 GB of docker root was allowed, or blamed the wrong place: %v", err)
+	}
+	// On one filesystem the store and the daemon draw on the same free space.
+	if err := e.PreflightSpace(big, &release.Disk{StoreFree: 3 << 30, DockerFree: 3 << 30, Shared: true}); err == nil {
+		t.Error("store and daemon needs on one filesystem were not added up")
+	}
+	if err := e.PreflightSpace(big, nil); err != nil {
+		t.Errorf("unknown disk state refused a deploy: %v", err)
+	}
+}
+
+func TestEstimateTransferCountsWhatTheStoreLacks(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "app")
+	blobs := filepath.Join(dir, "blobs", "sha256")
+	if err := os.MkdirAll(blobs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]string{"have": "123", "need": "12345"} {
+		if err := os.WriteFile(filepath.Join(blobs, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	est, err := EstimateTransfer(map[string]*build.Result{"app": {Dir: dir}},
+		&RemoteState{Store: map[string][]string{"app": {"have"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if est.Total != 8 || est.Missing != 5 || est.Blobs != 1 {
+		t.Errorf("estimate = %+v, want total 8, missing 5 in 1 blob", est)
+	}
+}
+
+func TestInitChangeIsAServiceChange(t *testing.T) {
+	if r := diffService(release.Service{Image: "app"}, release.Service{Image: "app", Init: true}); len(r) != 1 {
+		t.Errorf("reasons = %v, want the init change reported", r)
+	}
+	// Absent from an older spec's hash, so existing containers are not drifted.
+	if release.HashService(release.Service{Image: "app"}) != release.HashService(release.Service{Image: "app", Init: false}) {
+		t.Error("init = false changed the hash of an existing service")
 	}
 }

@@ -6,50 +6,58 @@ nav_order: 1
 
 # Images
 
-An image is something shunt builds locally and ships. Images referenced by a
-service but absent from `[images.*]` are treated as external and pulled on the
-host instead.
+An image is something shunt builds on your machine and ships to the server.
 
 ```toml
 [images.app]
 context    = "."
 dockerfile = "Dockerfile"
 platform   = "linux/amd64"        # set this when building on an arm64 Mac
-target     = "production"         # a specific multi-stage target
+target     = "production"         # a stage of a multi-stage Dockerfile
 args       = { PUBLIC_URL = "${env:PUBLIC_URL}" }
 ```
 
 | Key | Default | Meaning |
 |:--|:--|:--|
 | `context` | `.` | Build context, relative to `shunt.toml`. |
-| `dockerfile` | `<context>/Dockerfile` | Path to the Dockerfile. |
-| `platform` | buildx default | Target platform, e.g. `linux/amd64`. |
+| `dockerfile` | `<context>/Dockerfile` | Path to the Dockerfile, relative to `shunt.toml`. |
+| `platform` | the builder's own | Target platform, such as `linux/amd64`. |
 | `target` | none | Multi-stage build target. |
-| `args` | none | Build arguments. `${env:NAME}` interpolates from your environment. |
+| `args` | none | Build arguments. Supports [`${env:NAME}`]({% link manifest/index.md %}#environment-interpolation). |
 
-Several images in one manifest is fine. Declare `[images.<name>]` for each and
-point services at them by name.
+A service, accessory or stage that names an image not declared here — say
+`postgres:18-alpine` — is pulled on the server instead.
+
+Several images in one manifest are built in parallel. Declare
+`[images.<name>]` for each and refer to them by name.
 
 ## Platform
 
-The single most common first-deploy failure is an architecture mismatch: an
-arm64 laptop building for an amd64 server produces an image that loads without
-complaint and then exits immediately.
+The most common first-deploy failure is an architecture mismatch: an arm64
+laptop builds an arm64 image, which loads on an amd64 server without complaint
+and then exits immediately. `shunt audit` compares each image's platform with
+the server's architecture and warns before you hit it. Setting `platform` is the
+fix.
 
-`shunt audit` compares each image's platform against the host architecture and
-warns before you hit it. Setting `platform` explicitly is the fix.
-
-## How the build reaches the host
+## How an image reaches the server
 
 buildx exports an OCI layout — a directory in which every blob's filename is its
-own content hash — and rsync mirrors that directory to the host. Files the host
-already has are skipped, which is layer-level deduplication with no registry
-involved.
+own content hash — and rsync mirrors it into a store on the server. A blob the
+server already has keeps its name, so rsync skips it: layer-level deduplication
+with no registry.
 
-Blob modification times are normalised at export, because a blob's filename
-already identifies its contents and rsync's quick check compares size *and*
-mtime. Without that, a re-export would make every blob look changed and the
-whole image would be re-sent on every deploy.
+Two details make that hold in practice. Blob modification times are fixed at
+export, because rsync's quick check compares size *and* mtime and a fresh
+export would otherwise make every blob look new. And the layout carries the
+small manifest the classic overlay2 image store needs alongside the OCI index
+the containerd store reads, so either kind of server can load it.
 
-The layout is written so that both the containerd snapshotter and the classic
-overlay2 store can load it, so the two ends do not have to match.
+On the server, only the blobs that actually arrived are rehashed and loaded;
+see [Integrity]({% link security.md %}#integrity).
+
+## Builds in CI
+
+A CI runner starts with an empty build cache, so without one every layer after
+the base image is rebuilt with a new digest and shipped again in full.
+`SHUNT_BUILD_CACHE` keeps a cache between jobs; see
+[Deploying from CI]({% link deploying/ci.md %}#give-the-build-a-cache).

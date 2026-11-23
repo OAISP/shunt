@@ -623,3 +623,47 @@ secrets = ["DATABASE_URL"]
 		t.Fatalf("expected a complaint about the missing secrets block, got: %v", err)
 	}
 }
+
+// A bundle records every target, so a target's destination has to come from
+// what the file said rather than from whichever target happens to be selected.
+func TestDestinationIgnoresTheSelectedTarget(t *testing.T) {
+	m := load(t, `
+project = "acme"
+host    = "prod@example.com"
+[images.app]
+context = "."
+[services.app]
+image = "app"
+[secrets]
+provider = "env"
+keys     = ["DB"]
+[targets.staging]
+host = "staging@example.com"
+[targets.staging.secrets]
+provider = "file"
+path     = "staging.env"
+[targets.qa]
+host = "qa@example.com"
+`)
+	if err := m.SelectTarget("staging"); err != nil {
+		t.Fatal(err)
+	}
+	qa, err := m.Destination("qa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if qa.Project != "acme-qa" || qa.Network != "acme-qa-net" {
+		t.Errorf("qa = %s/%s, want acme-qa/acme-qa-net", qa.Project, qa.Network)
+	}
+	// qa declares no secrets, so it falls back to the file's, not staging's.
+	if qa.Secrets == nil || qa.Secrets.Provider != "env" {
+		t.Errorf("qa secrets = %+v, want the manifest's own env provider", qa.Secrets)
+	}
+	own, _ := m.Destination("")
+	if own.Host != "prod@example.com" || own.Project != "acme" {
+		t.Errorf("own destination = %+v, want the file's host and project", own)
+	}
+	if got := len(m.Destinations()); got != 2 {
+		t.Errorf("Destinations() has %d entries, want 2", got)
+	}
+}

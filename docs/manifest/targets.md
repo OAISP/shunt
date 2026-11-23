@@ -6,7 +6,7 @@ nav_order: 7
 
 # Deploy targets
 
-Declare targets only if you deploy the same project to more than one server —
+Declare targets if you deploy the same project to more than one server —
 staging and production, typically.
 
 ```toml
@@ -15,12 +15,11 @@ host    = "deploy@prod.example.com"
 
 [targets.staging]
 host = "deploy@staging.example.com"
+# project = "acme-stg"        # default: "acme-staging"
 
-# project = "acme-stg"        # defaults to "acme-staging"
-#
-# [targets.staging.secrets]   # staging should not hold production credentials
-# provider = "file"
-# path     = "secrets/staging.env"
+[targets.staging.secrets]     # staging should not hold production credentials
+provider = "file"
+path     = "secrets/staging.env"
 ```
 
 ```sh
@@ -28,22 +27,29 @@ shunt up               # the host at the top of the file
 shunt up -t staging    # the staging target
 ```
 
-`-t` / `--target` works on every command that talks to a host.
+`-t` / `--target` works on every command that talks to a server, including
+`shunt apply`, which is how one [bundle]({% link deploying/bundles.md %}#promoting-across-targets)
+goes to staging and then to production.
 
 | Key | Default | Meaning |
 |:--|:--|:--|
 | `host` | — | Required. |
-| `project` | `<project>-<target>` | Namespaces containers, network and ledger. |
-| `secrets` | the manifest's own | A different provider block for this target. |
+| `project` | `<project>-<target>` | The project name on that server. |
+| `secrets` | the manifest's own | A different `[secrets]` block for this target. |
 
 ## What a target may change
 
-A target changes **where** a release goes, never **what** it contains. The
-images, services, stages and artifacts are the ones declared at the top of the
-file, whichever target you select. That preserves the rule that no deploy-time
-flag alters what gets deployed.
+A target changes **where** a release goes — the server, the project name it
+runs under there, and the secrets it gets — and never **what** it contains.
+Images, services, stages and artifacts are the ones declared in the file,
+whichever target you pick.
 
-The project name is namespaced per target by default, so `acme` becomes
-`acme-staging`. Two targets can therefore share one machine without colliding on
-container names, the network, or the ledger — which is the case that otherwise
-corrupts state silently.
+The project name gets the target as a suffix by default, and the network
+follows it unless you set `network` yourself. Two targets can therefore share
+one server without sharing containers, a network or a release history.
+
+They do still share the server's ports and proxy. A `publish` mapping or a
+`proxy` host is part of what a release contains, so it is the same for every
+target, and two targets on one server would claim the same port or hostname.
+Sharing a server suits targets whose services do neither — workers, say.
+Otherwise give each target its own server.

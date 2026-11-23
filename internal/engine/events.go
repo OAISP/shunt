@@ -23,36 +23,59 @@ type EventRenderer interface {
 	Failed() bool
 }
 
-// stream runs a helper command and decodes its NDJSON output. Anything that is
-// not valid JSON is passed through verbatim — that is how a remote panic or a
-// shell error still reaches the operator instead of being swallowed.
+// stream runs a helper command and renders its event stream.
 func (e *Engine) stream(ctx context.Context, in io.Reader, r EventRenderer, argv ...string) error {
 	pr, pw := io.Pipe()
 	done := make(chan struct{})
-
 	go func() {
 		defer close(done)
-		sc := bufio.NewScanner(pr)
-		sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-		for sc.Scan() {
-			line := strings.TrimSpace(sc.Text())
-			if line == "" {
-				continue
-			}
-			var ev release.Event
-			if err := json.Unmarshal([]byte(line), &ev); err != nil || ev.Kind == "" {
-				fmt.Fprintln(os.Stderr, line)
-				continue
-			}
+		evs := newEvents(pr)
+		for ev, ok := evs.next(); ok; ev, ok = evs.next() {
 			r.Handle(ev)
 		}
-		io.Copy(io.Discard, pr)
 	}()
-
 	err := e.Client.Stream(ctx, in, pw, os.Stderr, argv...)
 	pw.Close()
 	<-done
 	return err
+}
+
+// events decodes the helper's NDJSON stream. A line that is not an event is
+// passed through to stderr verbatim — that is how a remote panic or a shell
+// error still reaches the operator instead of being swallowed.
+type events struct {
+	r  io.Reader
+	sc *bufio.Scanner
+}
+
+func newEvents(r io.Reader) *events {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	return &events{r: r, sc: sc}
+}
+
+// next returns the next event, or false once the stream ends. Whatever the
+// scanner could not read is drained, so the remote never blocks on a full pipe.
+func (ev *events) next() (release.Event, bool) {
+	for ev.sc.Scan() {
+		line := strings.TrimSpace(ev.sc.Text())
+		if line == "" {
+			continue
+		}
+		var e release.Event
+		if err := json.Unmarshal([]byte(line), &e); err != nil || e.Kind == "" {
+			fmt.Fprintln(os.Stderr, line)
+			continue
+		}
+		return e, true
+	}
+	io.Copy(io.Discard, ev.r)
+	return release.Event{}, false
+}
+
+func (ev *events) drain() {
+	for _, ok := ev.next(); ok; _, ok = ev.next() {
+	}
 }
 
 // HumanRenderer prints a live, indented step list.

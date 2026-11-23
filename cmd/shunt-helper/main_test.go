@@ -1,9 +1,12 @@
 package main
 
 import (
+	"archive/tar"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -979,11 +982,8 @@ func absentUntil(t *testing.T, n int) {
 	t.Cleanup(func() { docker = prev })
 }
 
-// A daemon declines a partial layout in one of two ways, and only one of them
-// used to be recoverable. The classic overlay2 importer resolves every layer
-// path out of the archive rather than out of the layers it already holds, so it
-// errors — and that error returned before the fallback could run, which left
-// the fallback unreachable on the only store that needs it.
+// A daemon that lacks a layer the partial archive leaves out declines it with
+// an error, and that has to reach the fallback rather than fail the deploy.
 func TestPartialLoadFailureFallsBackToTheWholeLayout(t *testing.T) {
 	// The error path never asks whether the partial load produced anything —
 	// it already knows — so the only inspects are the pre-check and the final one.
@@ -1109,5 +1109,38 @@ func TestSecretDirDropsKeysWithoutRecreatingItself(t *testing.T) {
 	now, _ := os.Stat(dir)
 	if !os.SameFile(mounted, now) {
 		t.Fatal("dropping a key recreated the directory instead of removing the file")
+	}
+}
+
+// The classic image store reads the image config out of the archive even when
+// it holds every layer, so only layers may be left out of a partial load.
+func TestPartialArchiveKeepsEveryBlobThatIsNotALayer(t *testing.T) {
+	dir := blobLayout(t, "config", "old-layer", "new-layer")
+	digest := func(c string) string { sum := sha256.Sum256([]byte(c)); return hex.EncodeToString(sum[:]) }
+	manifest := fmt.Sprintf(`[{"Config":"blobs/sha256/%s","Layers":["blobs/sha256/%s","blobs/sha256/%s"]}]`,
+		digest("config"), digest("old-layer"), digest("new-layer"))
+	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	// Nothing rewritten but the new layer: the config was unchanged.
+	if err := writeLayoutTar(&buf, dir, map[string]bool{digest("new-layer"): true}); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	tr := tar.NewReader(&buf)
+	for {
+		h, err := tr.Next()
+		if err != nil {
+			break
+		}
+		got[filepath.Base(h.Name)] = true
+	}
+	if !got[digest("config")] || !got["manifest.json"] {
+		t.Errorf("the archive dropped the config or the manifest: %v", got)
+	}
+	if !got[digest("new-layer")] || got[digest("old-layer")] {
+		t.Errorf("layers in the archive = %v, want only the new one", got)
 	}
 }

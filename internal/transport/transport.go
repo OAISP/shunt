@@ -46,24 +46,29 @@ func (s Stats) Moved(pull bool) int64 {
 	return s.Sent
 }
 
-// DedupPercent is the share of the image rsync did not have to send because the
-// host already had those blobs — the number that justifies the whole design.
+// DedupPercent is the share of the transfer rsync did not have to send because
+// the host already had it — the number that justifies the whole design.
+//
+// Counted from what was sent literally, not from "Matched data": that counts
+// only delta matches inside files rsync transferred, and an unchanged blob is
+// skipped outright by the quick check, so it appears in neither.
 func (s Stats) DedupPercent() float64 {
 	if s.Total == 0 {
 		return 0
 	}
-	return float64(s.Matched) / float64(s.Total) * 100
+	pct := float64(s.Total-s.Literal) / float64(s.Total) * 100
+	// A flat 100% reads as "nothing sent" while bytes did cross the wire.
+	if pct > 99.9 && s.Literal > 0 {
+		return 99.9
+	}
+	return pct
 }
 
 type Options struct {
 	Client    *sshx.Client
-	LocalDir  string // OCI layout directory
+	LocalDir  string // a directory of OCI layouts, one per image
 	RemoteDir string
 	Verbose   bool
-
-	// RemoteZstd reports whether the host's rsync was built with zstd. Both ends
-	// have to support it or the transfer fails outright.
-	RemoteZstd bool
 }
 
 // localZstd reports whether the rsync on this machine understands zstd.
@@ -75,12 +80,10 @@ var localZstd = sync.OnceValue(func() bool {
 
 // compressArgs picks a compression mode both ends actually support.
 //
-// zstd at level 1 is the right default — layer blobs are already compressed
-// inside, so this is about the cheap win on the small JSON files rather than the
-// bulk. But --compress-choice only exists from rsync 3.2, and plenty of live
-// hosts are older: Ubuntu 20.04 ships 3.1.3, and macOS ships 2.6.9 as
-// /usr/bin/rsync. Sending the flag to either end fails the deploy outright, so
-// fall back to plain -z, which every rsync in circulation understands.
+// --compress-choice only exists from rsync 3.2, and plenty of live hosts are
+// older: Ubuntu 20.04 ships 3.1.3, and macOS ships 2.6.9 as /usr/bin/rsync.
+// Sending the flag to either end fails the transfer outright, so fall back to
+// plain -z, which every rsync in circulation understands.
 func compressArgs(remoteZstd bool) []string {
 	if localZstd() && remoteZstd {
 		return []string{"--compress", "--compress-choice=zstd", "--compress-level=1"}
@@ -88,15 +91,19 @@ func compressArgs(remoteZstd bool) []string {
 	return []string{"--compress"}
 }
 
-// Push mirrors LocalDir to RemoteDir on the host and reports transfer stats.
+// Push mirrors a directory of OCI layouts into the host's store in a single
+// transfer, and reports what crossed the wire.
+//
+// Uncompressed: layer blobs are already gzip or zstd inside, and rsync cannot
+// tell, since a blob's filename is a bare digest with no extension its
+// skip-compress list would recognise. Compressing them again burns CPU on both
+// ends — badly so with the zlib fallback older rsyncs get — to save nothing;
+// the JSON alongside is a few KB.
 func Push(ctx context.Context, o Options) (*Stats, error) {
 	if _, err := os.Stat(o.LocalDir); err != nil {
-		return nil, fmt.Errorf("local layout %s: %w", o.LocalDir, err)
+		return nil, fmt.Errorf("local layouts %s: %w", o.LocalDir, err)
 	}
-	if _, err := o.Client.Run(ctx, "mkdir", "-p", o.RemoteDir); err != nil {
-		return nil, err
-	}
-
+	remote := strings.TrimSuffix(o.RemoteDir, "/")
 	args := []string{
 		"-a",
 		"--stats",
@@ -110,43 +117,15 @@ func Push(ctx context.Context, o Options) (*Stats, error) {
 		// would rehash the whole image every time. Excluding it also protects it
 		// from deletion, since --delete skips excluded files.
 		"--exclude", VerifiedSidecar,
-	}
-	args = append(args, compressArgs(o.RemoteZstd)...)
-	args = append(args,
+		// Creates the store on first use without a round trip of its own.
+		"--rsync-path", "mkdir -p " + sshx.Quote(remote) + " && rsync",
 		"-e", o.Client.SSHCommand(),
-		strings.TrimSuffix(o.LocalDir, "/")+"/",
-		o.Client.Host+":"+strings.TrimSuffix(o.RemoteDir, "/")+"/",
-	)
-	if o.Verbose {
-		args = append([]string{"--info=progress2"}, args...)
+		strings.TrimSuffix(o.LocalDir, "/") + "/",
+		o.Client.Host + ":" + remote + "/",
 	}
-
-	cmd := exec.CommandContext(ctx, "rsync", args...)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("rsync: %w", err)
-	}
-
-	st := &Stats{}
-	sc := bufio.NewScanner(stdout)
-	for sc.Scan() {
-		line := sc.Text()
-		if o.Verbose && strings.Contains(line, "%") {
-			fmt.Fprintf(os.Stderr, "\r%s", strings.TrimSpace(line))
-		}
-		parseStat(line, st)
-	}
-	if err := cmd.Wait(); err != nil {
-		return nil, fmt.Errorf("rsync to %s: %w", o.Client.Host, err)
-	}
-	if o.Verbose {
-		fmt.Fprintln(os.Stderr)
-	}
-	return st, nil
+	return runRsync(ctx, args, o.Verbose, func(err error) error {
+		return fmt.Errorf("rsync to %s: %w", o.Client.Host, err)
+	})
 }
 
 var numRE = regexp.MustCompile(`([0-9][0-9,\.]*)`)
@@ -208,8 +187,7 @@ func PushFile(ctx context.Context, o FileOptions) (*Stats, error) {
 		// means the destination never exists beforehand and rsync would have
 		// nothing to diff against — it would resend the whole artifact every
 		// deploy. --fuzzy lets it find the current copy sitting next to the
-		// staged path and use that as the basis instead. On a 5.6 MB database
-		// with a small change that is the difference between 1.5 MB and 15 KB.
+		// staged path and use that as the basis instead.
 		"--fuzzy",
 		"--times",
 	}
@@ -225,8 +203,7 @@ func PushFile(ctx context.Context, o FileOptions) (*Stats, error) {
 		// destination directory, and the release-scoped staging directory is
 		// empty, so every file in the tree reads as new. --link-dest points at
 		// the live tree instead, so unchanged files become hard links to it and
-		// never cross the wire. Measured on a 195 KB tree with one small file
-		// changed: 195 KB re-sent becomes 158 bytes.
+		// never cross the wire.
 		//
 		// A missing --link-dest is a warning rather than an error, so the first
 		// deploy — when there is no live tree yet — is unaffected.
@@ -237,41 +214,10 @@ func PushFile(ctx context.Context, o FileOptions) (*Stats, error) {
 		remote = strings.TrimSuffix(remote, "/") + "/"
 	}
 	args = append(args, compressArgs(o.RemoteZstd)...)
-	args = append(args,
-		"-e", o.Client.SSHCommand(),
-		local,
-		o.Client.Host+":"+remote,
-	)
-	if o.Verbose {
-		args = append([]string{"--info=progress2"}, args...)
-	}
-
-	cmd := exec.CommandContext(ctx, "rsync", args...)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("rsync: %w", err)
-	}
-
-	st := &Stats{}
-	sc := bufio.NewScanner(stdout)
-	for sc.Scan() {
-		line := sc.Text()
-		if o.Verbose && strings.Contains(line, "%") {
-			fmt.Fprintf(os.Stderr, "\r%s", strings.TrimSpace(line))
-		}
-		parseStat(line, st)
-	}
-	if err := cmd.Wait(); err != nil {
-		return nil, fmt.Errorf("rsync %s to %s: %w", o.LocalPath, o.Client.Host, err)
-	}
-	if o.Verbose {
-		fmt.Fprintln(os.Stderr)
-	}
-	return st, nil
+	args = append(args, "-e", o.Client.SSHCommand(), local, o.Client.Host+":"+remote)
+	return runRsync(ctx, args, o.Verbose, func(err error) error {
+		return fmt.Errorf("rsync %s to %s: %w", o.LocalPath, o.Client.Host, err)
+	})
 }
 
 // Fetch copies a path back down from the host, incrementally.
@@ -290,14 +236,7 @@ func Fetch(ctx context.Context, o FileOptions, isDir bool) (*Stats, error) {
 		remote = strings.TrimSuffix(remote, "/") + "/"
 	}
 	args = append(args, compressArgs(o.RemoteZstd)...)
-	args = append(args,
-		"-e", o.Client.SSHCommand(),
-		o.Client.Host+":"+remote,
-		local,
-	)
-	if o.Verbose {
-		args = append([]string{"--info=progress2"}, args...)
-	}
+	args = append(args, "-e", o.Client.SSHCommand(), o.Client.Host+":"+remote, local)
 	return runRsync(ctx, args, o.Verbose, func(err error) error {
 		return fmt.Errorf("fetch %s from %s: %w", o.RemotePath, o.Client.Host, err)
 	})
@@ -305,6 +244,9 @@ func Fetch(ctx context.Context, o FileOptions, isDir bool) (*Stats, error) {
 
 // runRsync executes rsync and collects its transfer statistics.
 func runRsync(ctx context.Context, args []string, verbose bool, wrap func(error) error) (*Stats, error) {
+	if verbose {
+		args = append([]string{"--info=progress2"}, args...)
+	}
 	cmd := exec.CommandContext(ctx, "rsync", args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -330,60 +272,4 @@ func runRsync(ctx context.Context, args []string, verbose bool, wrap func(error)
 		fmt.Fprintln(os.Stderr)
 	}
 	return st, nil
-}
-
-// FileStat is what the plan knows about a file on the host without moving any
-// of it. Size is -1 when the file is absent.
-type FileStat struct {
-	Size  int64
-	MTime int64 // unix seconds
-}
-
-// Size and mtime together are exactly the heuristic rsync itself uses to decide
-// whether a file needs transferring, which makes it the right basis for deciding
-// whether an artifact counts as a change. Hashing would be exact but means
-// reading the whole file on both sides — most of the cost of just shipping it.
-// RemoteFileStats stats several host paths in a single round trip.
-//
-// Replies are keyed by index rather than by echoing the path back, so a path
-// containing whitespace cannot corrupt the parse.
-//
-// A directory is summarised as the sum of its regular files' sizes and their
-// newest mtime — deliberately the same computation the CLI does locally, and
-// deliberately not `du`, which counts directory inodes too and would make every
-// directory artifact differ from itself on every deploy.
-func RemoteFileStats(ctx context.Context, c *sshx.Client, paths []string) map[string]FileStat {
-	out := make(map[string]FileStat, len(paths))
-	if len(paths) == 0 {
-		return out
-	}
-	for _, p := range paths {
-		out[p] = FileStat{Size: -1}
-	}
-
-	var script strings.Builder
-	for i, p := range paths {
-		q := sshx.Quote(p)
-		fmt.Fprintf(&script,
-			"if [ -d %s ]; then find %s -type f -exec stat -c '%%s %%Y' {} + 2>/dev/null | "+
-				"awk -v i=%d 'BEGIN{b=0;m=0} {b+=$1; if ($2>m) m=$2} END{print i, b, m}'; "+
-				"elif [ -f %s ]; then echo \"%d $(stat -c '%%s %%Y' %s)\"; "+
-				"else echo '%d -1 0'; fi\n",
-			q, q, i, q, i, q, i)
-	}
-	reply, err := c.Run(ctx, "sh", "-c", script.String())
-	if err != nil {
-		return out
-	}
-	for _, ln := range strings.Split(reply, "\n") {
-		var idx int
-		var st FileStat
-		if _, err := fmt.Sscanf(strings.TrimSpace(ln), "%d %d %d", &idx, &st.Size, &st.MTime); err != nil {
-			continue
-		}
-		if idx >= 0 && idx < len(paths) {
-			out[paths[idx]] = st
-		}
-	}
-	return out
 }

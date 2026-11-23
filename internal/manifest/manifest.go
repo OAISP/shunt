@@ -5,6 +5,7 @@ package manifest
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -56,11 +57,21 @@ type Manifest struct {
 	// against it, not against the process working directory.
 	dir string
 
-	// projectBase and networkExplicit remember what the file said, so selecting
-	// a target can re-derive the values that depend on the project name without
-	// mistaking an earlier default for an explicit choice.
-	projectBase     string
-	networkExplicit string
+	// own is the destination the file names before any target is selected, and
+	// networkExplicit whether its network was written rather than defaulted —
+	// a defaulted one is re-derived from each target's project.
+	own             Destination
+	networkExplicit bool
+}
+
+// Destination is everything a target may change: where a release goes, and the
+// name and credentials it lands under there. A bundle carries one per target,
+// which is what lets a single build be promoted from staging to production.
+type Destination struct {
+	Host    string   `json:"host"`
+	Project string   `json:"project"`
+	Network string   `json:"network"`
+	Secrets *Secrets `json:"secrets,omitempty"`
 }
 
 // Image is something shunt builds locally and ships. Images referenced by a service
@@ -105,6 +116,11 @@ type Service struct {
 	// before it is killed. Containers are stopped with SIGTERM and this timeout
 	// rather than SIGKILLed outright.
 	Drain Duration `toml:"drain"`
+
+	// Init runs a minimal init as PID 1. The kernel gives PID 1 no default
+	// signal handlers, so a process that never installs one ignores SIGTERM and
+	// sits out the whole drain before it is killed; under an init it exits.
+	Init bool `toml:"init"`
 
 	// Proxy turns this service blue/green: each release runs under its own
 	// container name and an external proxy is told about it via labels.
@@ -256,6 +272,26 @@ func (d *Duration) UnmarshalText(b []byte) error {
 
 func (d Duration) MarshalText() ([]byte, error) { return []byte(d.String()), nil }
 
+// DeclaredSecretKeys names every secret the manifest itself mentions: the env
+// provider's keys and every service's narrowed set. It is what can be known
+// about a release's secrets without reading them.
+func (m *Manifest) DeclaredSecretKeys() []string {
+	seen := map[string]bool{}
+	if m.Secrets != nil {
+		for _, k := range m.Secrets.Keys {
+			seen[k] = true
+		}
+	}
+	for _, set := range []map[string]Service{m.Services, m.Accessories} {
+		for _, svc := range set {
+			for _, k := range svc.Secrets {
+				seen[k] = true
+			}
+		}
+	}
+	return slices.Sorted(maps.Keys(seen))
+}
+
 // Dir returns the manifest's directory. Relative paths in the manifest are
 // interpreted against it.
 func (m *Manifest) Dir() string { return m.dir }
@@ -274,33 +310,50 @@ func (m *Manifest) SelectTarget(name string) error {
 	if name == "" {
 		return nil
 	}
+	d, err := m.Destination(name)
+	if err != nil {
+		return err
+	}
+	m.Host, m.Project, m.Network, m.Secrets, m.Target = d.Host, d.Project, d.Network, d.Secrets, name
+	return nil
+}
+
+// Destination resolves where a target deploys; the empty name is the manifest's
+// own host. It reads what the file said, so it answers the same whichever
+// target is currently selected.
+func (m *Manifest) Destination(name string) (Destination, error) {
+	if name == "" {
+		return m.own, nil
+	}
 	t, ok := m.Targets[name]
 	if !ok {
-		known := make([]string, 0, len(m.Targets))
-		for k := range m.Targets {
-			known = append(known, k)
-		}
-		slices.Sort(known)
+		known := slices.Sorted(maps.Keys(m.Targets))
 		if len(known) == 0 {
-			return fmt.Errorf("shunt.toml declares no [targets.*], so there is no target %q", name)
+			return Destination{}, fmt.Errorf("shunt.toml declares no [targets.*], so there is no target %q", name)
 		}
-		return fmt.Errorf("no target %q in shunt.toml (declared: %s)", name, strings.Join(known, ", "))
+		return Destination{}, fmt.Errorf("no target %q in shunt.toml (declared: %s)", name, strings.Join(known, ", "))
 	}
-	m.Host = t.Host
+	d := Destination{Host: t.Host, Project: t.Project, Network: m.own.Network, Secrets: m.own.Secrets}
 	if t.Secrets != nil {
-		m.Secrets = t.Secrets
+		d.Secrets = t.Secrets
 	}
-	m.Project = t.Project
-	if m.Project == "" {
-		m.Project = m.projectBase + "-" + name
+	if d.Project == "" {
+		d.Project = m.own.Project + "-" + name
 	}
-	// The network is derived from the project, so it has to be re-derived here
-	// or staging and production would share one network on a shared host.
-	if m.networkExplicit == "" {
-		m.Network = m.Project + "-net"
+	// Otherwise staging and production would share one network on a shared host.
+	if !m.networkExplicit {
+		d.Network = d.Project + "-net"
 	}
-	m.Target = name
-	return nil
+	return d, nil
+}
+
+// Destinations resolves every declared target, keyed by name.
+func (m *Manifest) Destinations() map[string]Destination {
+	out := make(map[string]Destination, len(m.Targets))
+	for name := range m.Targets {
+		out[name], _ = m.Destination(name)
+	}
+	return out
 }
 
 // Find walks up from start looking for shunt.toml, so the CLI works from any
@@ -339,9 +392,9 @@ func Load(path string) (*Manifest, error) {
 		return nil, fmt.Errorf("%s: unknown key(s): %s", filepath.Base(path), strings.Join(keys, ", "))
 	}
 	m.dir = filepath.Dir(path)
-	m.projectBase = m.Project
-	m.networkExplicit = m.Network
+	m.networkExplicit = m.Network != ""
 	m.applyDefaults()
+	m.own = Destination{Host: m.Host, Project: m.Project, Network: m.Network, Secrets: m.Secrets}
 	if err := m.Validate(); err != nil {
 		return nil, err
 	}

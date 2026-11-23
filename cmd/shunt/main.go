@@ -12,7 +12,6 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/OAISP/shunt/internal/engine"
 	"github.com/OAISP/shunt/internal/ui"
 )
 
@@ -39,44 +38,55 @@ func init() {
 	version = strings.TrimPrefix(bi.Main.Version, "v")
 }
 
-const usage = `usage:
-  shunt init                 scaffold a shunt.toml for this project
-  shunt validate             check shunt.toml without touching the network
-  shunt audit                check everything a deploy needs, and change nothing
-  shunt plan                 build, then show what a deploy would change
-  shunt up                   build, ship, run stages, swap containers, health-check
-                             --rollback-on-failure restores the previous release
-                             if this one fails after replacing a container
-  shunt status               what the host is running right now
-  shunt exec <service> ...   run a command in the running container
-  shunt run <service> ...    run a one-off command in a fresh container
-  shunt rollback [release]   restore the previous (or a named) release
-  shunt boot <accessory>     (re)create a stateful accessory — destructive
-  shunt retire <service>     stop a service you removed from shunt.toml
-  shunt down                 stop this project's services on the host
-                             --all also removes accessories; --purge removes
-                             the network, images, history and secrets too
-  shunt bundle               build a release into a portable file
-  shunt bundle inspect <f>   show what a bundle contains, without applying it
-  shunt bundle verify <f>    rehash a bundle's blobs; needs no host
-  shunt apply <bundle>       deploy a bundle, no build toolchain needed
-  shunt apply --plan <f>     show what applying a bundle would change
-  shunt fetch [name|path]    pull an artifact or capture back down
-  shunt logs [service]       tail logs from the host
-  shunt prune                drop superseded images on the host
+const usage = `usage: shunt <command> [flags]
+
+set up
+  shunt init --host <user@host>  write shunt.toml, guessing the port
+  shunt validate                 check shunt.toml offline: no ssh, no build
+  shunt audit                    check everything a deploy needs, read-only
+
+deploy
+  shunt plan                     build, then show what a deploy would change
+                                 --detailed-exitcode  exit 2 on changes
+  shunt up                       build, ship, run stages, swap, health-check
+                                 --rollback-on-failure --no-cache --no-plan -y
+  shunt rollback [release]       restore the previous release, or a named one
+
+inspect and reach
+  shunt status                   what is running, and the release history
+  shunt logs [service]           tail logs (--follow, --tail N)
+  shunt exec <service> -- <cmd>  run a command in the serving container
+  shunt run <service> -- <cmd>   run a one-off command in a fresh container
+  shunt fetch [name|path]        pull an artifact or capture back (-o <path>)
+
+lifecycle
+  shunt boot <accessory>         recreate an accessory (destructive)
+  shunt retire <service>         remove a service you deleted from shunt.toml
+  shunt prune                    drop images and secrets beyond retain
+  shunt down                     stop this project's services
+                                 --all  also its accessories
+                                 --purge  also network, images, history, secrets
+
+bundles
+  shunt bundle [-o <file>]       build a release into a portable file
+  shunt bundle inspect <file>    show what a bundle contains
+  shunt bundle verify <file>     rehash a bundle's blobs; needs no host
+  shunt apply <file>             deploy a bundle (-t <target> to promote it)
+                                 --plan  show what applying would change
   shunt version
 
-common flags:
-  -f, --file <path>   path to shunt.toml (default: nearest one up the tree)
-  -v, --verbose       show build output and per-step detail
-      --json          emit machine-readable events instead of prose
+flags for every command
+  -f, --file <path>     shunt.toml to use (default: nearest one up the tree)
+  -t, --target <name>   deploy to a target from [targets.*]
+  -v, --verbose         build output and per-step detail
+      --json            machine-readable output
 
-exit codes:
-  0  success, or "shunt plan" found nothing to do
-  1  the command failed
-  2  "shunt plan" found changes to apply (and bad usage)
+exit codes: 0 ok, 1 failed, 64 bad usage, 2 changes (plan --detailed-exitcode)
 
-Set SHUNT_NO_BANNER=1 to suppress the banner, NO_COLOR=1 to suppress colour.
+environment: SHUNT_BUILD_CACHE=gha|<dir> keeps the build cache between CI
+jobs; SHUNT_NO_BANNER=1 and NO_COLOR=1 quiet the output.
+
+docs: https://oaisp.github.io/shunt/
 `
 
 // commands is the dispatch table. Keeping it as data means a command listed in
@@ -114,7 +124,7 @@ func main() {
 	// non-zero all the same: no command ran.
 	if len(os.Args) < 2 {
 		help(os.Stderr)
-		os.Exit(2)
+		os.Exit(exitUsage)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -134,7 +144,7 @@ func main() {
 	if !ok {
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", name)
 		help(os.Stderr)
-		os.Exit(2)
+		os.Exit(exitUsage)
 	}
 	exit(cmd(ctx, args))
 }
@@ -145,25 +155,31 @@ func exit(err error) {
 	if err == nil {
 		return
 	}
-	if errors.Is(err, errExitChanges) {
-		os.Exit(2)
-	}
-	if errors.Is(err, errReported) {
-		os.Exit(1)
+	var usage usageError
+	switch {
+	case errors.Is(err, errHelp):
+		os.Exit(0)
+	case errors.Is(err, errExitChanges):
+		os.Exit(exitChanges)
+	case errors.Is(err, errReported):
+		os.Exit(exitFailed)
+	case errors.As(err, &usage):
+		fmt.Fprintf(os.Stderr, "%s %v\n", ui.NewStyle(os.Stderr).Red("error:"), err)
+		os.Exit(exitUsage)
 	}
 	s := ui.NewStyle(os.Stderr)
 	fmt.Fprintf(os.Stderr, "\n%s %v\n", s.Red("error:"), err)
-	os.Exit(1)
+	os.Exit(exitFailed)
 }
 
 func printVersion() {
 	if ui.BannerAllowed(os.Stdout, false) {
 		ui.Banner(os.Stdout, ui.NewStyle(os.Stdout), version)
-		fmt.Printf("helper %s · protocol %d\n", engine.HelperVersion, protocolVersion)
+		fmt.Printf("protocol %d\n", protocolVersion)
 		return
 	}
 	// Piped or scripted: emit one parseable line instead of artwork.
-	fmt.Printf("shunt %s (helper %s, protocol %d)\n", version, engine.HelperVersion, protocolVersion)
+	fmt.Printf("shunt %s (protocol %d)\n", version, protocolVersion)
 }
 
 // help prints the banner, when the destination is a terminal, then usage.

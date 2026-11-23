@@ -2,29 +2,24 @@
 # Exercises the host-compatibility paths against hosts that actually have the
 # problem, rather than reasoning about them.
 #
-# Two cases, neither of which a healthy modern host can reproduce:
+# Two cases, neither of which a healthy modern host can reproduce, exercised
+# together on one host:
 #
 #   old-rsync   Ubuntu 20.04 ships rsync 3.1.3, which has no --compress-choice
 #               at all. Sending it fails the transfer outright, so shunt has to
 #               detect and fall back. This is the case that would break a deploy
 #               to a large share of real VPS hosts.
 #
-#   no-curl     A minimal image without curl. shunt shells out to it on the host
-#               for url health checks, and its absence was historically
-#               discovered only after the container swap.
-#
-#   no-tar      tar used to be required too, for streaming the layout into
-#               `docker load`. The helper writes that archive itself now, so a
-#               host without tar has to deploy — which the old-rsync host, whose
-#               tar is removed, proves.
+#   minimal     No curl and no tar. Both used to be required on the host — curl
+#               for url health checks, tar for streaming the layout into `docker
+#               load` — and the helper now does both itself.
 #
 # Each host is a container running sshd with the daemon's socket mounted, and its
 # ssh port published. Deliberately not --network host: that shares a namespace
 # only when the daemon is local, and on Docker Desktop the daemon lives in its
 # own VM, so the harness would be unrunnable on a developer machine. The fixture
 # health-checks via `docker exec` for the same reason — it needs no agreement
-# about what 127.0.0.1 means, and the curl-less host has no curl to probe with
-# anyway.
+# about what 127.0.0.1 means.
 set -euo pipefail
 
 SHUNT="${SHUNT:-$(cd "$(dirname "$0")/.." && pwd)/shunt}"
@@ -149,39 +144,12 @@ EOF
 chmod +x "$WORK/bin/ssh"
 export PATH="$WORK/bin:$PATH"
 
-# ------------------------------------------------------- missing curl / tar ---
-step "a host missing curl is refused up front"
-start_host "ubuntu:24.04" \
-  "apt-get update -qq && apt-get install -y -qq openssh-server rsync docker.io >/dev/null && apt-get remove -y -qq curl >/dev/null && rm -f /bin/tar /usr/bin/tar"
+# ------------------------------------------------------------- old rsync ------
+step "a host with rsync 3.1.3, no curl and no tar still deploys"
+start_host "ubuntu:20.04" \
+  "apt-get update -qq && apt-get install -y -qq openssh-server rsync docker.io >/dev/null && (apt-get remove -y -qq curl >/dev/null 2>&1 || true) && rm -f /bin/tar /usr/bin/tar"
 
 fixture "$WORK/app"
-cd "$WORK/app"
-
-out="$("$SHUNT" audit 2>&1 || true)"
-if printf '%s' "$out" | grep -qi "curl"; then
-  ok "audit names the missing tool"
-else
-  bad "audit names the missing tool — got: $(printf '%s' "$out" | tail -3)"
-fi
-
-# The deploy must refuse before building or shipping anything, not after the
-# container swap.
-out="$("$SHUNT" up -y 2>&1 || true)"
-if printf '%s' "$out" | grep -qi "missing curl"; then
-  ok "up refuses before doing any work"
-else
-  bad "up refuses before doing any work — got: $(printf '%s' "$out" | tail -3)"
-fi
-if printf '%s' "$out" | grep -qi "apt-get install"; then
-  ok "the refusal says how to fix it"
-else
-  bad "the refusal says how to fix it"
-fi
-
-# ------------------------------------------------------------- old rsync ------
-step "a host with rsync 3.1.3 and no tar still deploys"
-start_host "ubuntu:20.04" \
-  "apt-get update -qq && apt-get install -y -qq openssh-server rsync curl docker.io >/dev/null && rm -f /bin/tar /usr/bin/tar"
 
 ver="$(ssh_host rsync --version | head -1 | awk '{print $3}')"
 case "$ver" in
@@ -193,15 +161,15 @@ if ssh_host rsync --version | grep -qi zstd; then
 else
   ok "this rsync has no zstd, so the fallback is what is under test"
 fi
-if ssh_host "command -v tar" >/dev/null 2>&1; then
-  bad "this host still has tar; the no-tar path would not be exercised"
+if ssh_host "command -v tar || command -v curl" >/dev/null 2>&1; then
+  bad "this host still has tar or curl; the minimal-host path would not be exercised"
 else
-  ok "this host has no tar, so loading without it is what is under test"
+  ok "this host has neither tar nor curl"
 fi
 
 cd "$WORK/app"
 if "$SHUNT" up -y >"$WORK/old-rsync.log" 2>&1; then
-  ok "the deploy succeeded with old rsync and no tar"
+  ok "the deploy succeeded on a host with old rsync, no curl and no tar"
 else
   bad "the deploy failed: $(tail -5 "$WORK/old-rsync.log")"
 fi

@@ -6,36 +6,37 @@ nav_order: 3
 
 # Accessories
 
-An accessory is a stateful dependency the host runs for you: a database, a
-cache, a model server. Declare one only if the host should run it. If yours
-already lives elsewhere — managed Postgres, another host, an existing container
-— skip this entirely and point your app at it with a secret.
+An accessory is a stateful container the server runs for you: a database, a
+cache, a model server. Declare one only if the server should run it. If yours
+lives elsewhere — managed Postgres, another machine — leave this out and give
+your app its address as a secret.
 
 ```toml
 [accessories.db]
 image   = "postgres:18-alpine"
 volumes = ["acme-pgdata:/var/lib/postgresql"]
+env     = { POSTGRES_USER = "acme" }
 
 [accessories.db.health]
 command = ["pg_isready", "-U", "acme"]
 ```
 
-Accessories take the same keys as [services]({% link manifest/services.md %}).
+An accessory takes the same keys as a [service]({% link manifest/services.md %}).
 
-## Accessories versus services
+## Booted once, then left alone
 
-A **service** is stateless and replaced on every release. An **accessory** is
-booted once and then left alone. Shipping a one-line CSS fix must not restart
-Postgres.
+A service is replaced on every release. An accessory is created on the first
+deploy that declares it and never replaced by a deploy afterwards: shipping a
+CSS fix must not restart Postgres. If the container exists but is stopped — a
+server reboot leaves it that way — a deploy starts it.
 
-Accessories come up before stages run, so a migration has its database
-available. An accessory that already exists is started if stopped — a host
-reboot leaves it that way — but never replaced.
+Accessories come up, and pass their health checks, before any stage runs, so a
+migration always has its database.
 
-## Drift
+## Changing one
 
-Changing an accessory's definition does not change the running container.
-`shunt plan` reports the difference and names the fix:
+Editing an accessory does not change the running container. `shunt plan`
+reports the difference and the command that applies it:
 
 ```
 accessories (booted once; never replaced by a deploy)
@@ -44,16 +45,16 @@ accessories (booted once; never replaced by a deploy)
       not applied by `shunt up` — run `shunt boot db` to recreate
 ```
 
-Drift is measured against what the host recorded as *applied* — the definition a
-container was actually created with — rather than against the last release's
-manifest. A deploy records the manifest it was handed even though it
-deliberately left the accessory alone, so comparing against that would make a
-reported drift disappear after any unrelated deploy while the container went on
-running the old configuration.
+The comparison is against the definition the running container was actually
+created with, which the server records, so an unrelated deploy does not make
+the difference disappear.
 
-Applying it is the explicit, destructive `shunt boot db`, which recreates the
-container. Data survives only in named volumes.
+`shunt boot db` recreates the container from the current manifest and records
+it as applied.
 
 {: .warning }
-`shunt boot` destroys and recreates the container. Anything not in a named
-volume is lost.
+`shunt boot` destroys the container and creates a new one. Only data in a
+volume survives — a named volume, as above, or a bind mount.
+
+Accessories are never removed by a rollback or by a plain `shunt down`; see
+[`shunt down`]({% link cli.md %}#shunt-down).

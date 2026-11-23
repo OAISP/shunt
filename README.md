@@ -13,12 +13,12 @@
 shunt up
 ```
 
-Builds your image, ships **only the layers the host doesn't already have**, swaps
-the containers, and fails the release if the app doesn't come up healthy.
+Builds your image, ships **only the layers the server doesn't already have**,
+swaps the containers, and fails the release if the app doesn't come up healthy.
 
 A working manifest is about ten lines. Databases, migrations, data files and
-zero-downtime swaps are all available and all optional — declare them when you
-need them, and shunt skips them entirely when you don't.
+zero-downtime swaps are there when you need them and cost nothing when you
+don't.
 
 **[Documentation →](https://oaisp.github.io/shunt/)**
 
@@ -26,28 +26,25 @@ need them, and shunt skips them entirely when you don't.
 
 ## Why
 
-Deploying a locally-built image usually means pushing it to a registry so the
-server can pull it back down — your bytes cross the network twice, and you
-maintain credentials for a warehouse you never wanted.
+Deploying a locally built image usually means pushing it to a registry so the
+server can pull it back down: your bytes cross the network twice, and you keep
+credentials for a warehouse you never wanted. The usual workaround,
+`docker save | ssh docker load`, uploads the **entire image on every deploy**.
 
-The usual workaround, `docker save | ssh docker load`, re-uploads the **entire
-image every single deploy**, base layers and all.
+shunt exports the image as an OCI layout, in which every file is named by its
+own content hash, and mirrors it with rsync. Files the server already has are
+skipped — layer-level deduplication with no registry in between.
 
-shunt exports an OCI layout, where each blob's filename *is* its content hash,
-and mirrors it with rsync. Files the host already has are skipped. That is
-layer-level deduplication with no registry and no protocol to implement.
-
-Measured on an 81 MB Node image, changing one source file:
+A Node app on `node:22-slim`, changing one source file:
 
 | | `docker save \| zstd` | shunt |
 |:--|--:|--:|
-| first deploy | 81.1 MB | 81.3 MB |
-| code-only redeploy | 81.1 MB | **5.3 KB** |
+| first deploy | 75.9 MB | 76.2 MB |
+| code-only redeploy | 75.9 MB | **11.6 KB** |
 
-Real applications have a fatter top layer than that test app, so expect **30–100×**
-on a typical Next.js or Rails image rather than four orders of magnitude. The
-point isn't the ratio — it's that you stop paying for the base image on every
-deploy.
+Most apps have a bigger top layer than this one — dependencies, compiled
+assets — so the saving on a real project is smaller. What does not change is
+that the base image never crosses the wire again.
 
 ## Install
 
@@ -55,26 +52,26 @@ deploy.
 curl -sSL https://raw.githubusercontent.com/OAISP/shunt/main/install.sh | sh
 ```
 
-Or `go install github.com/OAISP/shunt/cmd/shunt@latest`, or grab a release
-archive. See [Getting started](https://oaisp.github.io/shunt/getting-started/)
-for the other options and the full requirements.
+Or `go install github.com/OAISP/shunt/cmd/shunt@latest`, or a release archive.
+[Getting started](https://oaisp.github.io/shunt/getting-started/) has the
+details.
 
-**Your machine:** docker (with a buildx builder that can export an OCI layout),
-rsync, ssh.
-**The server:** docker, rsync, curl, and an ssh account that can reach the docker
-socket. Nothing else — shunt uploads its own helper.
+- **Your machine:** docker with a buildx builder that can export an OCI layout,
+  rsync, ssh.
+- **The server:** docker, rsync, and an ssh user that can reach the docker
+  socket. shunt uploads its own helper.
 
 ## Quick start
 
 ```sh
 cd my-project
-shunt init --host deploy@vps.example.com   # writes shunt.toml, guesses the port
-shunt audit                                # check the host can accept a deploy
-shunt plan                                 # see exactly what would change
-shunt up
+shunt init --host deploy@vps.example.com   # writes shunt.toml
+shunt audit                                # checks both machines, changes nothing
+shunt plan                                 # shows what a deploy would change
+shunt up                                   # deploys
 ```
 
-A complete, working manifest:
+`shunt init` writes a complete manifest:
 
 ```toml
 project = "acme"
@@ -91,40 +88,39 @@ publish = ["127.0.0.1:9090:3000"]
 url = "/health"
 ```
 
-Everything else — accessories, stages, artifacts, secrets, deploy targets,
-zero-downtime proxying, portable bundles — is optional and documented at
-**[oaisp.github.io/shunt](https://oaisp.github.io/shunt/)**.
+## What else it does
 
-## Commands
+All optional, and each a block in the same file:
 
-| | |
-|:--|:--|
-| `shunt init` · `validate` · `audit` | scaffold, check offline, check the host |
-| `shunt plan` · `up` | diff, then apply |
-| `shunt status` · `logs` · `exec` · `run` | see and reach what's running |
-| `shunt rollback` · `boot` · `retire` · `prune` | lifecycle |
-| `shunt down` | take it back off the host — `--purge` removes the secrets too |
-| `shunt fetch` | pull artifacts and captures back down |
-| `shunt bundle` · `apply` | deploy where the builder can't reach |
+- **Accessories** — a database or cache, booted once and never restarted by a
+  code deploy.
+- **Stages** — migrations or backups that must succeed before anything running
+  is replaced.
+- **Artifacts** — large files and directories, shipped incrementally and swapped
+  in atomically.
+- **Secrets** — from a dotenv file, your environment or sops; delivered as
+  environment variables or as files.
+- **Zero-downtime** — blue/green through Traefik or caddy-docker-proxy labels.
+- **Rollback** — to any retained release in seconds, optionally automatic.
+- **Targets and bundles** — staging and production from one manifest; build
+  once and promote, or carry a release to a host the builder cannot reach.
+- **CI** — a build cache for fresh runners, and deploys that finish even when
+  the job is cancelled. See
+  [Deploying from CI](https://oaisp.github.io/shunt/deploying/ci/).
 
-Full reference: [oaisp.github.io/shunt/cli](https://oaisp.github.io/shunt/cli/)
+Every command: [CLI reference](https://oaisp.github.io/shunt/cli/).
 
 ## Non-goals
 
 Multi-host orchestration, service discovery, autoscaling, a web UI, running its
-own reverse proxy, terminating TLS. If you need those you need a real
-orchestrator — and shunt is not trying to grow into one.
-
-It exists for the case no orchestrator serves well: one app, one server, and a
-Dockerfile. A static site with a single container and a small API with a
-database, a migration step and a shipped index file are both squarely in scope —
-the second just declares more.
+own reverse proxy, terminating TLS. shunt is for one app on one server, and is
+not trying to grow into an orchestrator.
 
 ## Contributing
 
-Issues and pull requests welcome. `make test && make build` covers most of CI;
-`test/e2e.sh <host>` runs a real deploy against any host you can ssh to. See
-[Contributing](https://oaisp.github.io/shunt/contributing/).
+Issues and pull requests are welcome. `make fmt vet test build` runs the unit
+checks CI runs, and `test/e2e.sh <host>` runs a real deploy against any host you
+can ssh to. See [Contributing](https://oaisp.github.io/shunt/contributing/).
 
 ## License
 

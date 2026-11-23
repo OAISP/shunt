@@ -27,10 +27,28 @@ const protocolVersion = release.Protocol
 // one explanation instead of two.
 var errReported = errors.New("already reported")
 
-// errExitChanges makes `shunt plan` exit 2 when the host does not match the
-// manifest. It is not a failure — it is the answer to the question — but a
-// distinct code lets CI branch on it without parsing output.
+// errExitChanges makes `shunt plan --detailed-exitcode` exit 2 when the host
+// does not match the manifest. It is not a failure — it is the answer to the
+// question — but a distinct code lets CI branch on it without parsing output.
 var errExitChanges = errors.New("plan has changes")
+
+// Exit codes. Usage has its own so a mistyped command or flag can never be read
+// as "the plan has changes".
+const (
+	exitFailed  = 1
+	exitChanges = 2
+	exitUsage   = 64 // EX_USAGE
+)
+
+// usageError is a command invoked wrongly, as opposed to one that failed.
+type usageError struct{ msg string }
+
+func (e usageError) Error() string { return e.msg }
+
+func usagef(format string, a ...any) error { return usageError{fmt.Sprintf(format, a...)} }
+
+// errHelp is -h on a command; the flag package has already printed its usage.
+var errHelp = errors.New("help shown")
 
 // commonFlags are accepted by every command that talks to a host.
 type commonFlags struct {
@@ -109,7 +127,14 @@ func parseArgs(fs *flag.FlagSet, args []string) error {
 	}
 	// The terminator has to survive re-assembly: without it a positional that
 	// begins with a dash would be re-interpreted as a flag.
-	return fs.Parse(append(append(flags, "--"), positional...))
+	err := fs.Parse(append(append(flags, "--"), positional...))
+	switch {
+	case errors.Is(err, flag.ErrHelp):
+		return errHelp
+	case err != nil:
+		return usageError{err.Error()}
+	}
+	return nil
 }
 
 func isBoolFlag(f *flag.Flag) bool {
@@ -160,10 +185,7 @@ type buildOut struct {
 	built  map[string]*build.Result
 	state  *engine.RemoteState
 
-	// Phase timings, so `up` can report where the wall clock actually went
-	// rather than one opaque total.
 	buildTook time.Duration
-	shipTook  time.Duration
 }
 
 // prepare connects, builds every image, assembles the release spec and reads the
@@ -183,10 +205,10 @@ func prepare(ctx context.Context, c *commonFlags, noCache bool) (*buildOut, erro
 		return nil, err
 	}
 
-	// Everything checkable is checked before the expensive steps: building and
-	// shipping hundreds of megabytes only to fail on mkdir wastes minutes and
-	// tells the operator nothing useful.
-	if err := e.PreflightArtifacts(ctx); err != nil {
+	// Everything checkable is checked before the expensive steps, in the same
+	// round trip that reads the host's state.
+	state, err := e.PlanState(ctx, e.ArtifactDests())
+	if err != nil {
 		return fail(err)
 	}
 
@@ -203,15 +225,13 @@ func prepare(ctx context.Context, c *commonFlags, noCache bool) (*buildOut, erro
 			ui.ShortDigest(built[name].Digest), ui.Bytes(built[name].Bytes))
 	}
 
-	if err := e.PreflightSpace(built); err != nil {
-		return fail(err)
+	if est, err := engine.EstimateTransfer(built, state); err == nil {
+		if err := e.PreflightSpace(est, state.Disk); err != nil {
+			return fail(err)
+		}
 	}
 
 	spec, err := e.Spec(ctx, id, built)
-	if err != nil {
-		return fail(err)
-	}
-	state, err := e.State(ctx)
 	if err != nil {
 		return fail(err)
 	}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"io"
 	"strings"
 	"testing"
 
@@ -164,5 +165,22 @@ func TestPurgeRefusesToInferConsentFromAMissingTerminal(t *testing.T) {
 		if got := purgeNeedsConsent(tc.purge, tc.yes, tc.interactive); got != tc.want {
 			t.Errorf("%s: purgeNeedsConsent = %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+// A mistyped flag must not exit 2, which `plan --detailed-exitcode` uses to say
+// there are changes: CI would read a typo as "deploy needed".
+func TestParseArgsSeparatesUsageFromFailure(t *testing.T) {
+	var c commonFlags
+	fs := newFlagSet("plan", &c)
+	fs.SetOutput(io.Discard)
+	var u usageError
+	if err := parseArgs(fs, []string{"--no-such-flag"}); !errors.As(err, &u) {
+		t.Errorf("an unknown flag returned %v, want a usage error", err)
+	}
+	fs = newFlagSet("plan", &c)
+	fs.SetOutput(io.Discard)
+	if err := parseArgs(fs, []string{"-h"}); !errors.Is(err, errHelp) {
+		t.Errorf("-h returned %v, want errHelp", err)
 	}
 }
