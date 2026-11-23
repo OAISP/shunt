@@ -6,15 +6,14 @@ nav_order: 4
 
 # Stages
 
-A stage is a one-shot container that must run to completion *before* any running
-service is replaced. What it does is up to you. Database migrations and
-pre-deploy backups are the common cases, but a stage is just "run this, and stop
-the deploy if it fails".
+A stage is a one-shot container that must exit successfully before any running
+service is replaced. Migrations and pre-deploy backups are the usual ones, but a
+stage is simply "run this, and stop the deploy if it fails".
 
 ```toml
 [[stages]]
 name    = "migrate"
-image   = "app"                  # any image in this manifest, or a pullable ref
+image   = "app"                  # an image from this manifest, or a pullable one
 command = ["npm", "run", "migrate"]
 ```
 
@@ -23,20 +22,24 @@ command = ["npm", "run", "migrate"]
 | `name` | — | Required, unique. |
 | `image` | — | Required. |
 | `command` | — | Required. |
-| `env` | none | Extra environment for this stage. |
-| `capture` | none | Redirect stdout to a file on the host. |
-| `require_nonempty` | false | Fail the deploy if the capture is empty. |
-| `retain` | 10 | Capture generations to keep. |
+| `env` | none | Extra environment. Supports [`${env:NAME}`]({% link manifest/index.md %}#environment-interpolation). |
+| `capture` | none | Write the stage's stdout to this file on the server. |
+| `require_nonempty` | `false` | Fail the deploy if the capture comes out empty. |
+| `retain` | `10` | Capture files to keep for this stage. |
 
-Stages run after accessories and before anything is swapped. If one fails,
-production is exactly as it was — that ordering is the safety property the whole
-pipeline is built around.
+Stages run in order, after accessories are up and before anything is replaced,
+on the deploy network and with every secret. If one fails, production is
+exactly as it was.
+
+Stages run on every deploy, not only when they change — a migration that has
+nothing to do should exit 0. Adding or changing a stage counts as a change, so
+a manifest whose only edit is a new migration still deploys.
 
 ## Captures
 
-`capture` redirects a stage's stdout to a file on the host, and
-`require_nonempty` fails the deploy if that file comes out empty. Together they
-are what makes a pre-migration dump trustworthy rather than decorative:
+`capture` sends a stage's stdout to a file on the server, and
+`require_nonempty` fails the deploy if that file is empty. Together they turn a
+pre-migration dump from decorative into something you can rely on:
 
 {% raw %}
 ```toml
@@ -50,16 +53,17 @@ retain           = 10
 ```
 {% endraw %}
 
-{% raw %}`{{.Release}}`{% endraw %} expands to the release id and
-{% raw %}`{{.Timestamp}}`{% endraw %} to a UTC timestamp. Captures are written `0600`: a `pg_dump` is every row of production,
-and the host has other people's containers on it.
+In the path, {% raw %}`{{.Release}}`{% endraw %} becomes the release id and
+{% raw %}`{{.Timestamp}}`{% endraw %} a UTC timestamp. Captures are written
+`0600`: a database dump is every row of production.
 
-Retention keeps the newest `retain` generations of each stage's capture, matched
-on the template's literal prefix and suffix rather than on the rendered filename.
+`retain` keeps the newest captures of that stage. Without a placeholder in the
+path, every deploy overwrites the same file.
 
-Pull a capture back down with `shunt fetch`:
+Fetch one with `shunt fetch`, which lists the captures on the server when run
+with no arguments:
 
 ```sh
-shunt fetch                                              # list what is available
-shunt fetch /opt/acme/backups/pre-migrate-20260728.sql
+shunt fetch
+shunt fetch /opt/acme/backups/pre-migrate-20260728-093012-a1b2c3.sql
 ```

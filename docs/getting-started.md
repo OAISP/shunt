@@ -7,104 +7,92 @@ nav_order: 2
 
 ## Install
 
-The installer detects your platform, verifies the checksum, and needs no
-toolchain:
+The installer detects your platform, verifies the archive against the release's
+`checksums.txt`, and needs no toolchain:
 
 ```sh
 curl -sSL https://raw.githubusercontent.com/OAISP/shunt/main/install.sh | sh
 ```
 
-It never invokes sudo: it installs to `/usr/local/bin` when that is writable and
-`~/.local/bin` otherwise. Pin a release with `SHUNT_VERSION=v0.1.0`, choose a
-directory with `PREFIX=...`, and read the script first if you would rather not
-pipe one into a shell. That is a reasonable instinct for a tool that ends up
-holding ssh access to your servers.
+It never runs sudo. It installs to `/usr/local/bin` when that is writable and to
+`~/.local/bin` otherwise. `SHUNT_VERSION=v0.2.0` pins a release and
+`PREFIX=<dir>` chooses the directory. Read the script first if you would rather
+not pipe one into a shell — a reasonable instinct for a tool that will hold ssh
+access to your servers.
 
-Archives are published for `linux_amd64`, `linux_arm64`, `darwin_amd64` and
-`darwin_arm64`, with `checksums.txt` alongside:
+Release archives exist for `linux_amd64`, `linux_arm64`, `darwin_amd64` and
+`darwin_arm64`:
 
 ```sh
 curl -sSL https://github.com/OAISP/shunt/releases/latest/download/shunt_linux_amd64.tar.gz | tar xz
 sudo install -m755 shunt /usr/local/bin/shunt
 ```
 
-With Go:
+With Go — note the `/cmd/shunt` suffix:
 
 ```sh
 go install github.com/OAISP/shunt/cmd/shunt@latest
 ```
 
-Note the `/cmd/shunt` suffix — the module root is a library, not a command. A
-`go install` build carries no prebuilt host helper, so shunt compiles one from
-its own source the first time it connects to a host. That takes a second and
-uses the Go toolchain you already have; the helper is cached on the host
-afterwards.
+A `go install` build carries no prebuilt host helper, so the first time it
+connects to a host it compiles one with your Go toolchain. That takes a second,
+and the host keeps the result.
 
 From source:
 
 ```sh
 git clone https://github.com/OAISP/shunt && cd shunt
-make install    # builds ./shunt with helpers embedded, installs to ~/.local/bin
+make install    # builds ./shunt with the helpers embedded, installs to ~/.local/bin
 ```
 
 ## Requirements
 
 **Your machine:** docker with a buildx builder that can export an OCI layout,
-rsync, ssh.
+rsync and ssh.
 
-**The server:** docker, rsync, curl, and an ssh account that can reach the
-docker socket. Nothing else — shunt uploads its own helper.
+**The server:** docker, rsync, and an ssh user that can reach the docker socket.
+Nothing else — shunt uploads its own helper, which does the health probes and
+builds the load archive itself.
 
-That OCI layout is how shunt ships an image, so exporting one is not optional.
-Docker's default `docker` builder can only do it when the daemon runs the
-containerd image store; without that it refuses outright. Either fix works:
+### A builder that can export an OCI layout
+
+The OCI layout is how shunt ships an image, so this is not optional. Docker's
+default `docker` builder can only export one when the daemon uses the
+containerd image store, which is the default on new Docker 29 installs but not
+on older or upgraded ones. If yours cannot, create a builder that can:
 
 ```sh
 docker buildx create --use --name shunt --driver docker-container
 ```
 
-`shunt audit` reports which of the two you have and names the fix if you have
-neither — worth running once before your first deploy, since otherwise this
-surfaces as a build error on the very first `shunt up`.
+`shunt audit` reports which case you are in and prints that command when it is
+needed.
 
-`curl` runs url health checks. It is present on essentially every distro image
-but not on some minimal ones, so `shunt audit` checks for it, and so does every
-command that connects.
+### Either image store on the server
 
-rsync 3.2 or newer on *both* ends gets zstd transfer compression. Older versions
-still work: Ubuntu 20.04 ships 3.1.3 and macOS ships 2.6.9 as `/usr/bin/rsync`,
-and shunt detects both and falls back rather than failing.
+The server needs nothing of the kind. shunt writes a layout that both the
+containerd image store and the classic overlay2 store can load, so a laptop on
+one can deploy to a server on the other.
 
-Either image store works **on the server**. shunt writes a layout that both the
-containerd snapshotter and the classic overlay2 store can load, so a laptop can
-deploy to a server running either one with no daemon configuration there. The
-builder side is the asymmetric one, for the reason above: loading a layout works
-everywhere, producing one does not.
+### rsync versions
+
+Any rsync works. Image layers travel as they are, since they are already
+compressed. Artifacts are compressed in transit: with zstd when both ends run
+rsync 3.2 or newer, and with plain `-z` otherwise — Ubuntu 20.04 ships 3.1.3 and
+macOS ships 2.6.9.
 
 ## A first deploy
 
 ```sh
 cd my-project
-shunt init --host deploy@vps.example.com   # writes shunt.toml, guesses the port
-shunt audit                                # check the host can accept a deploy
-shunt plan                                 # see exactly what would change
+shunt init --host deploy@vps.example.com
+shunt audit
+shunt plan
 shunt up
 ```
 
-`shunt init` scaffolds a manifest, taking the port from the first `EXPOSE` in
-your Dockerfile. It guesses rather than interrogates: a wrong guess in a file you
-are about to edit is cheaper than a wizard.
-
-`shunt audit` connects and checks everything a deploy depends on — docker and
-buildx locally, ssh, docker, rsync and curl on the host, free disk, artifact
-paths, and whether the image platform matches the host architecture. It changes
-nothing. Running it before the first deploy turns most first-deploy failures
-into a list you can read.
-
-`shunt plan` builds and diffs but changes nothing on the host. Read it before
-your first `up`.
-
-## The manifest it writes
+**`shunt init`** writes `shunt.toml`, taking the port from the first `EXPOSE` in
+your Dockerfile:
 
 ```toml
 project = "acme"
@@ -121,25 +109,36 @@ publish = ["127.0.0.1:9090:3000"]
 url = "/health"
 ```
 
-That is a complete, working manifest. Everything else in the
-[manifest reference]({% link manifest/index.md %}) is optional, and each block
-does nothing at all unless you declare it.
+That is a complete manifest. It guesses rather than asks: a wrong guess in a
+file you are about to read is cheaper than a wizard. `host` is resolved through
+your own `~/.ssh/config`, so an alias works.
 
-{: .note }
-Unknown keys are a hard error. A typo in a field that silently does nothing is
-worse than a failed load.
+**`shunt audit`** connects and checks everything a deploy depends on — docker,
+buildx and rsync here; ssh, docker, rsync and free disk on the server; artifact
+destinations; and whether each image's platform matches the server's
+architecture. It changes nothing.
 
-## Common first-deploy problems
+**`shunt plan`** builds, then shows what a deploy would change. It changes
+nothing on the server either.
 
-**Architecture mismatch.** Building on an arm64 Mac for an amd64 server produces
-an image that loads fine and then exits immediately. Set
-`platform = "linux/amd64"` under `[images.app]`. `shunt audit` warns about this
-before you hit it.
+**`shunt up`** builds, ships, swaps and health-checks. It shows the plan and asks
+before applying when run in a terminal; in CI, where there is no terminal, it
+proceeds.
 
-**`/opt` is root-owned.** Artifact destinations under `/opt` are not writable by
-a normal deploy user. shunt checks every destination before building anything
-and prints the `mkdir`/`chown` to run.
+## When the first deploy fails
 
-**Health check passes on a broken app.** By default a 3xx counts as healthy,
-which proves only that the server is listening. See
+**The image exits immediately.** An arm64 Mac builds arm64 images, which load
+on an amd64 server and then fail to run. Set `platform = "linux/amd64"` under
+`[images.app]`. `shunt audit` warns about the mismatch.
+
+**An artifact destination is not writable.** Paths under `/opt` belong to root.
+shunt checks every destination before it builds anything and prints the
+`mkdir` and `chown` that fix it.
+
+**The health check passes on a broken app.** A redirect counts as healthy by
+default, which proves only that something is listening. See
 [health checks]({% link manifest/services.md %}#health-checks).
+
+**`ssh` works by hand but shunt cannot connect.** shunt runs ssh with
+`BatchMode=yes`, so a key that needs a passphrase must already be in your agent,
+and the host key must already be in `known_hosts`.

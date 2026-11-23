@@ -6,19 +6,18 @@ nav_order: 5
 
 # Artifacts
 
-An artifact is a large file, or a directory, that your app needs and the image
-does not carry: a SQLite database, model weights, a prebuilt index, a dataset.
-Declare one only if you need it — if your state lives in a database server or
-object storage, you do not.
+An artifact is a large file or directory your app needs and the image does not
+carry: a SQLite database, model weights, a prebuilt index. If your state lives
+in a database server or object storage, you do not need one.
 
 ```toml
 [[artifacts]]
 name     = "index"
-src      = "data/index.db"            # local, relative to shunt.toml
-dest     = "/opt/acme/data/index.db"  # on the host
+src      = "data/index.db"            # on your machine, relative to shunt.toml
+dest     = "/opt/acme/data/index.db"  # on the server
 magic    = "SQLite format 3"          # refuse a file that is not one
-retain   = 1                          # generations kept for recovery
-required = true                       # absent locally fails the deploy
+retain   = 1                          # superseded copies kept for recovery
+required = true                       # fail the deploy if src is missing
 
 [services.app]
 volumes = ["/opt/acme/data:/data:ro"]
@@ -27,21 +26,24 @@ volumes = ["/opt/acme/data:/data:ro"]
 | Key | Default | Meaning |
 |:--|:--|:--|
 | `name` | — | Required, unique. |
-| `src` | — | Local file or directory, relative to `shunt.toml`. |
-| `dest` | — | Absolute path on the host. |
-| `magic` | none | Literal prefix the file must start with. |
-| `retain` | 1 | Superseded generations kept for recovery. |
-| `required` | false | Fail the deploy when the local copy is missing. |
+| `src` | — | Required. A file or directory, relative to `shunt.toml`. |
+| `dest` | — | Required. An absolute path on the server. |
+| `magic` | none | A literal prefix the file must start with. Files only. |
+| `retain` | `1` | Superseded copies kept beside `dest`. |
+| `required` | `false` | Fail the deploy when `src` is missing, instead of skipping it. |
 
-An artifact that is absent locally and not `required` is skipped, and the host
-keeps whatever it already has. That is the right default for a file produced by
-an occasional ETL run.
+An artifact whose `src` is missing and not `required` is skipped, and the
+server keeps the copy it has — the right default for a file an occasional job
+regenerates.
+
+A changed artifact is a deploy in its own right: regenerate the file, run
+`shunt up`, and only the changed blocks travel. "Changed" means a different
+size or modification time, the same test rsync uses.
 
 ## Directories
 
-`src` may be a directory — model weights, a prebuilt index, an asset tree. The
-whole tree is mirrored and swapped in as a unit, and unchanged files inside it
-are not re-sent.
+`src` may be a directory. The whole tree is mirrored and swapped in as one
+unit, and files inside it that did not change are not sent again.
 
 ```toml
 [[artifacts]]
@@ -52,73 +54,58 @@ dest = "/opt/acme/models/embed"
 
 ## How the swap works
 
-The new copy lands beside the old under a `.new.<release-id>` suffix. Before
-anything is promoted, *every* artifact in the release is validated: exact size
-against what the release recorded, `magic` if set, and non-empty. Only then are
-they promoted, and if a later promotion fails the earlier ones are put back.
+The new copy is transferred next to the old one, as `<dest>.new.<release-id>`.
+After the stages have run, every artifact in the release is checked — exact
+size, non-empty, and `magic` if set — and only when all of them pass are they
+swapped in. If one swap fails, the ones already done are put back.
 
-A file is promoted by hard-linking the old copy aside and renaming the new one
-over the top, so the destination only ever holds the old contents or the new
-ones — never nothing.
+- A **file** is swapped by renaming the new copy over the old one, after
+  linking the old one aside, so `dest` always holds either the old contents or
+  the new — never nothing.
+- A **directory** is swapped with `RENAME_EXCHANGE`, which exchanges the two
+  trees in one atomic step. On kernels older than 3.15, or filesystems without
+  it, shunt moves the old tree aside first and says the swap is not atomic.
 
-A directory is swapped with `RENAME_EXCHANGE`, which exchanges the two trees in
-a single atomic step. Verified by polling the destination continuously across a
-live swap: 12,104 checks, zero misses. On a kernel older than 3.15, or a
-filesystem without `renameat2`, shunt falls back to moving the old tree aside
-and says that the guarantee is weaker there.
-
-The superseded copy is kept as `<dest>.prev.<release-id>`, and a failed health
-check prints the exact `mv` that puts it back.
+The superseded copy stays as `<dest>.prev.<release-id>`, and if the release then
+fails its health check, the error includes the `mv` that puts it back.
 
 {: .warning }
-`shunt rollback` does not revert data. It restores containers and images.
-Silently rolling a database back as a side effect of rolling code back is the
-kind of helpfulness that loses data — the `.prev` copy and the exact command are
-printed instead.
+`shunt rollback` restores containers, not data. Rolling a database back as a
+side effect of rolling code back is the kind of help that loses data, so the
+`.prev` copy and the command to restore it are what you get instead.
 
-## `magic`
+## Checks on arrival
 
-`magic` is a literal prefix the file must begin with. Every SQLite database
-starts with `SQLite format 3`; a truncated or half-written upload almost never
-does. It is worth setting for any format that has one, because it turns a
-truncated upload into a failed deploy instead of an outage.
+A file shorter than the release recorded is an interrupted transfer. It is kept,
+so the next deploy resumes it rather than starting again. A file that fails its
+`magic` check is the wrong file, not a partial one, so it is deleted.
 
-A file that fails its magic check is deleted rather than kept — it is the wrong
-file, not a partial one, and leaving it would give the next transfer a bogus
-delta basis. A file that is merely *short* is kept, so `--partial` can resume.
+`magic` is worth setting for any format that has one. Every SQLite database
+starts with `SQLite format 3`; a truncated or mistaken upload almost never does,
+and the check turns it into a failed deploy instead of an outage.
 
 ## Transfers are incremental
 
-Measured on a 5.5 MB file with a small change:
+Measured on a 5.5 MB SQLite file with a small change:
 
 | | On the wire |
 |:--|--:|
 | Whole file | 1.5 MB |
 | rsync delta | **31 KB** |
 
-That delta works because shunt passes `--fuzzy`: the file is staged under a name
-that does not exist yet, so rsync has nothing to diff against unless told to
-find the current copy next door.
-
-A directory uses `--link-dest` against the live tree instead, because `--fuzzy`
-looks for a basis inside the destination directory and a release-scoped staging
-directory is empty. Measured on a 195 KB tree with one small file changed:
-195 KB re-sent becomes 249 B.
-
-A data-only change is a deploy in its own right. Regenerate the file, run
-`shunt up`, and only the changed blocks move — no image is rebuilt.
+A file uses rsync's `--fuzzy`, which finds the current copy next to the staged
+name and diffs against it. A directory uses `--link-dest` against the live tree,
+so unchanged files become hard links instead of transfers; on a 195 KB tree with
+one small change, 249 bytes moved.
 
 ## Getting data back
 
-rsync does not care which end is the source, so the transport works in both
-directions:
+The same transport works in the other direction:
 
 ```sh
-shunt fetch                        # list what can be fetched
-shunt fetch index                  # pull it back over its local source
-shunt fetch index -o /tmp/prod.db  # ...or somewhere else
+shunt fetch                        # list artifacts and captures on the server
+shunt fetch index                  # pull an artifact back over its src
+shunt fetch index -o /tmp/prod.db  # or somewhere else
 ```
 
-Incrementally, like everything else: refreshing a stale local copy of a 500 MB
-database moves only the blocks that changed. Useful for working against real
-data, and for retrieving a capture a stage produced.
+Refreshing a stale local copy of a large database moves only the changed blocks.
