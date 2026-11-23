@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // layout writes a minimal OCI layout: an index pointing at a manifest that names
@@ -288,5 +289,214 @@ func TestCacheForADirectoryRotates(t *testing.T) {
 	again := CacheFor(root, "acme-app")
 	if again.From != "type=local,src="+filepath.Join(root, "acme-app") {
 		t.Errorf("second build did not import the rotated cache: %q", again.From)
+	}
+}
+
+// ociLayout writes a layout as registry tools and buildx produce it: blobs named
+// by digest, and an index.json with one entry pointing at top.
+type ociLayout struct {
+	t   *testing.T
+	dir string
+}
+
+func newLayout(t *testing.T) *ociLayout {
+	t.Helper()
+	l := &ociLayout{t, t.TempDir()}
+	l.file("oci-layout", `{"imageLayoutVersion":"1.0.0"}`)
+	return l
+}
+
+func (l *ociLayout) file(rel, body string) {
+	l.t.Helper()
+	p := filepath.Join(l.dir, rel)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		l.t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		l.t.Fatal(err)
+	}
+}
+
+func (l *ociLayout) blob(digest string, v any) {
+	l.t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		l.t.Fatal(err)
+	}
+	l.file(blobPath(digest), string(b))
+}
+
+// image adds a manifest, its config and one layer, all named after tag.
+func (l *ociLayout) image(tag, arch string) string {
+	l.blob("sha256:cfg-"+tag, map[string]any{"os": "linux", "architecture": arch})
+	l.file(blobPath("sha256:layer-"+tag), "layer "+tag)
+	l.blob("sha256:man-"+tag, map[string]any{
+		"mediaType": "application/vnd.oci.image.manifest.v1+json",
+		"config":    map[string]any{"digest": "sha256:cfg-" + tag},
+		"layers":    []any{map[string]any{"digest": "sha256:layer-" + tag}},
+	})
+	return "sha256:man-" + tag
+}
+
+func (l *ociLayout) top(digest string) string {
+	b, _ := json.Marshal(map[string]any{"schemaVersion": 2, "manifests": []any{map[string]any{"digest": digest}}})
+	l.file("index.json", string(b))
+	return l.dir
+}
+
+func entry(digest, os, arch string, ann map[string]string) map[string]any {
+	return map[string]any{"digest": digest, "platform": map[string]any{"os": os, "architecture": arch}, "annotations": ann}
+}
+
+// What `buildx build --provenance --sbom --output type=oci` writes, and what
+// build-push-action pushes by default: the image beside an attestation manifest.
+func attested(t *testing.T) string {
+	l := newLayout(t)
+	l.image("att", "unknown")
+	l.blob("sha256:idx", map[string]any{"manifests": []any{
+		entry(l.image("amd", "amd64"), "linux", "amd64", nil),
+		entry("sha256:man-att", "unknown", "unknown", map[string]string{"vnd.docker.reference.type": "attestation-manifest"}),
+	}})
+	return l.top("sha256:idx")
+}
+
+// What `regctl image copy <multi-arch ref> ocidir://` writes.
+func multiPlatform(t *testing.T) string {
+	l := newLayout(t)
+	l.blob("sha256:idx", map[string]any{"manifests": []any{
+		entry(l.image("amd", "amd64"), "linux", "amd64", nil),
+		entry(l.image("arm", "arm64"), "linux", "arm64", nil),
+	}})
+	return l.top("sha256:idx")
+}
+
+func importOK(t *testing.T, src, platform string) (*Result, string) {
+	t.Helper()
+	out := filepath.Join(t.TempDir(), "app")
+	r, err := Import(src, out, "app", platform)
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	return r, out
+}
+
+// The result must look like a fresh single-image export: one index entry for the
+// chosen manifest, only that image's blobs, and pinned blob times.
+func TestImportOfASinglePlatformLayout(t *testing.T) {
+	l := newLayout(t)
+	src := l.top(l.image("amd", "amd64"))
+	l.file("notes.txt", "not part of the layout")
+
+	r, out := importOK(t, src, "")
+	if r.Digest != "sha256:man-amd" {
+		t.Errorf("Digest = %q, want sha256:man-amd", r.Digest)
+	}
+	if _, err := os.Stat(filepath.Join(out, "notes.txt")); !os.IsNotExist(err) {
+		t.Errorf("a file outside the layout was copied: %v", err)
+	}
+	fi, err := os.Stat(filepath.Join(out, blobPath("sha256:layer-amd")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.ModTime().Equal(blobEpoch) {
+		t.Errorf("blob mtime = %v, want the pinned epoch", fi.ModTime())
+	}
+	if err := WriteDockerArchiveManifest(out, "shunt/demo-app:r1"); err != nil {
+		t.Errorf("imported layout is not loadable: %v", err)
+	}
+}
+
+func TestImportSkipsAttestations(t *testing.T) {
+	r, out := importOK(t, attested(t), "")
+	if r.Digest != "sha256:man-amd" {
+		t.Errorf("Digest = %q, want the image, not the index or attestation", r.Digest)
+	}
+	if _, err := os.Stat(filepath.Join(out, blobPath("sha256:layer-att"))); !os.IsNotExist(err) {
+		t.Error("attestation blobs were shipped")
+	}
+}
+
+func TestImportPicksTheRequestedPlatform(t *testing.T) {
+	r, out := importOK(t, multiPlatform(t), "linux/arm64")
+	if r.Digest != "sha256:man-arm" {
+		t.Errorf("Digest = %q, want sha256:man-arm", r.Digest)
+	}
+	if _, err := os.Stat(filepath.Join(out, blobPath("sha256:layer-amd"))); !os.IsNotExist(err) {
+		t.Error("blobs of another platform were shipped")
+	}
+}
+
+func TestImportOfAMultiPlatformLayoutNeedsAPlatform(t *testing.T) {
+	_, err := Import(multiPlatform(t), filepath.Join(t.TempDir(), "app"), "app", "")
+	if err == nil || !strings.Contains(err.Error(), "linux/amd64, linux/arm64") || !strings.Contains(err.Error(), "set platform") {
+		t.Fatalf("err = %v, want the platforms listed and the fix named", err)
+	}
+	_, err = Import(multiPlatform(t), filepath.Join(t.TempDir(), "app"), "app", "linux/riscv64")
+	if err == nil || !strings.Contains(err.Error(), "no image for linux/riscv64") {
+		t.Fatalf("err = %v, want a missing-platform error", err)
+	}
+}
+
+// Pinning blob times on a hard link would rewrite the source's mtimes too, and
+// age-based cleanup of a CI cache would then read them as decades old.
+func TestImportLeavesTheSourceAlone(t *testing.T) {
+	src := attested(t)
+	blob := filepath.Join(src, blobPath("sha256:layer-amd"))
+	old := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(blob, old, old); err != nil {
+		t.Fatal(err)
+	}
+	index, _ := os.ReadFile(filepath.Join(src, "index.json"))
+
+	_, out := importOK(t, src, "")
+	if err := Retag(out, "shunt/demo-app:r1"); err != nil {
+		t.Fatal(err)
+	}
+
+	fi, err := os.Stat(blob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.ModTime().Equal(old) {
+		t.Errorf("source blob mtime changed to %v", fi.ModTime())
+	}
+	copied, _ := os.Stat(filepath.Join(out, blobPath("sha256:layer-amd")))
+	if os.SameFile(fi, copied) {
+		t.Error("source blob is linked into the import, not copied")
+	}
+	if after, _ := os.ReadFile(filepath.Join(src, "index.json")); string(after) != string(index) {
+		t.Errorf("source index.json changed:\n%s", after)
+	}
+}
+
+func TestImportRejectsALayoutWithTwoImages(t *testing.T) {
+	l := newLayout(t)
+	l.image("amd", "amd64")
+	l.file("index.json", `{"manifests":[{"digest":"sha256:man-amd"},{"digest":"sha256:man-amd"}]}`)
+	_, err := Import(l.dir, filepath.Join(t.TempDir(), "app"), "app", "")
+	if err == nil || !strings.Contains(err.Error(), "empty directory") {
+		t.Fatalf("err = %v, want a refusal naming the fix", err)
+	}
+}
+
+func TestImportOfAMissingLayoutSaysSo(t *testing.T) {
+	_, err := Import(filepath.Join(t.TempDir(), "nope"), filepath.Join(t.TempDir(), "app"), "app", "")
+	if err == nil || !strings.Contains(err.Error(), "not an OCI image layout") {
+		t.Fatalf("err = %v, want a missing-layout error", err)
+	}
+}
+
+func TestLayoutPlatform(t *testing.T) {
+	for _, tc := range []struct{ src, platform, want string }{
+		{attested(t), "", "linux/amd64"},
+		{multiPlatform(t), "linux/arm64", "linux/arm64"},
+	} {
+		got, err := LayoutPlatform(tc.src, tc.platform)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != tc.want {
+			t.Errorf("LayoutPlatform(%q) = %q, want %q", tc.platform, got, tc.want)
+		}
 	}
 }

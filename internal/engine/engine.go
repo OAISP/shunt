@@ -176,18 +176,25 @@ func (e *Engine) Build(ctx context.Context, id string, o BuildOptions) (map[stri
 	return res, nil
 }
 
-// buildOne builds one image and tags its layout for this release.
+// buildOne builds or imports one image and tags its layout for this release.
 func (e *Engine) buildOne(ctx context.Context, name, id string, o build.Options) (*build.Result, error) {
 	img := e.M.Images[name]
-	args, err := secrets.InterpolateMap(img.Args)
-	if err != nil {
-		return nil, fmt.Errorf("image %s build args: %w", name, err)
-	}
-	o.Name, o.Args, o.Platform, o.Target = name, args, img.Platform, img.Target
-	o.Context, o.Dockerfile = e.M.Abs(img.Context), e.M.Abs(img.Dockerfile)
-	r, err := build.Build(ctx, o)
-	if err != nil {
-		return nil, err
+	var r *build.Result
+	if img.Layout != "" {
+		var err error
+		if r, err = build.Import(e.M.Abs(img.Layout), o.OutDir, name, img.Platform); err != nil {
+			return nil, err
+		}
+	} else {
+		args, err := secrets.InterpolateMap(img.Args)
+		if err != nil {
+			return nil, fmt.Errorf("image %s build args: %w", name, err)
+		}
+		o.Name, o.Args, o.Platform, o.Target = name, args, img.Platform, img.Target
+		o.Context, o.Dockerfile = e.M.Abs(img.Context), e.M.Abs(img.Dockerfile)
+		if r, err = build.Build(ctx, o); err != nil {
+			return nil, err
+		}
 	}
 	ref := e.ImageRef(name, id)
 	if err := build.Retag(r.Dir, ref); err != nil {

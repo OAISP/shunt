@@ -90,6 +90,14 @@ func (m *Manifest) Validate() error {
 		if !nameRE.MatchString(name) {
 			add("image %q: name must be lowercase alphanumeric with - or _", name)
 		}
+		// A layout is usually produced by an earlier CI step, so its absence here
+		// is normal; Import reports it when a deploy actually needs it.
+		if img.Layout != "" {
+			if img.Context != "" || img.Dockerfile != "" || img.Target != "" || len(img.Args) > 0 {
+				add("image %q: layout ships a prebuilt image, so context, dockerfile, target and args do not apply", name)
+			}
+			continue
+		}
 		if _, err := os.Stat(m.Abs(img.Dockerfile)); err != nil {
 			add("image %q: dockerfile %s not found", name, img.Dockerfile)
 		}

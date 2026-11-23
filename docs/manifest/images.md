@@ -21,15 +21,55 @@ args       = { PUBLIC_URL = "${env:PUBLIC_URL}" }
 |:--|:--|:--|
 | `context` | `.` | Build context, relative to `shunt.toml`. |
 | `dockerfile` | `<context>/Dockerfile` | Path to the Dockerfile, relative to `shunt.toml`. |
-| `platform` | the builder's own | Target platform, such as `linux/amd64`. |
+| `platform` | the builder's own | Target platform, such as `linux/amd64`. With `layout`, which image of a multi-platform layout to ship. |
 | `target` | none | Multi-stage build target. |
 | `args` | none | Build arguments. Supports [`${env:NAME}`]({% link manifest/index.md %}#environment-interpolation). |
+| `layout` | none | Ship a [prebuilt image](#prebuilt-images) from this OCI layout directory instead of building. |
 
 A service, accessory or stage that names an image not declared here — say
 `postgres:18-alpine` — is pulled on the server instead.
 
 Several images in one manifest are built in parallel. Declare
 `[images.<name>]` for each and refer to them by name.
+
+## Prebuilt images
+
+When an image is built somewhere else — typically by an earlier CI job that also
+scans and signs it — point `layout` at it instead of building:
+
+```toml
+[images.app]
+layout = ".ci/oci/app"
+```
+
+shunt skips the build and ships that layout exactly as it would ship its own
+export: the same transfer, the same deduplication, the same release tag. The
+image keeps its digest, so the server runs byte for byte what the pipeline
+checked. The machine running shunt needs no Docker for it.
+
+Any registry tool can write the layout from an image reference, into an empty
+directory:
+
+```sh
+regctl image copy registry.example.com/app@sha256:… ocidir://.ci/oci/app:release
+```
+
+The layout's `index.json` must name one image, which is what an export into an
+empty directory gives; exporting into a layout that already holds one adds a
+second entry, and shunt refuses to guess between them. That image may be a
+multi-platform index:
+
+- **Attestations** — the provenance and SBOM manifests buildx adds — are skipped.
+- **One platform** left over is shipped as it is.
+- **Several platforms** need `platform` to pick one, such as `linux/arm64`.
+
+Only the chosen image's manifest, config and layers are shipped, never the other
+platforms'. The layout itself is only read: shunt works on a copy.
+
+`context`, `dockerfile`, `target` and `args` describe a build, so they are
+rejected next to `layout`. `shunt audit` reads the platform from the layout, and
+`shunt validate` does not need the layout to exist yet, so it still runs on a
+pull request before anything is built.
 
 ## Platform
 

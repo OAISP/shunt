@@ -195,6 +195,25 @@ jobs:
 Secrets are resolved by the job that applies the bundle, so give each deploy
 job the variables its target's provider reads.
 
+## Deploy an image your pipeline already built
+
+If the pipeline already builds, scans and signs the image, rebuilding it in the
+deploy job would ship a different image from the one that was checked. Export
+the checked image by digest into an OCI layout and let shunt ship that instead;
+see [prebuilt images]({% link manifest/images.md %}#prebuilt-images). The deploy
+job then needs no Docker and no build cache, only shunt, ssh, rsync and a
+registry client. Start from the [GitLab CI](#gitlab-ci) job above, drop
+docker, dind and the build cache, install `regctl`, and replace the script:
+
+```yaml
+  script:
+    - regctl image copy "$IMAGE@$IMAGE_DIGEST" ocidir://.ci/oci/app:release
+    - shunt up --rollback-on-failure
+```
+
+with `layout = ".ci/oci/app"` under `[images.app]` in `shunt.toml`. The server
+never talks to the registry, so it works for a registry the server cannot reach.
+
 ## Checks on pull requests
 
 `shunt validate` needs no ssh and no build, so it is safe on every pull request,

@@ -82,6 +82,11 @@ type Image struct {
 	Platform   string            `toml:"platform"`
 	Target     string            `toml:"target"`
 	Args       map[string]string `toml:"args"`
+
+	// Layout ships an OCI image layout built elsewhere instead of building, so the
+	// exact image a CI pipeline scanned and signed is the one the host runs.
+	// Platform then picks one image from a multi-platform layout.
+	Layout string `toml:"layout"`
 }
 
 // Target is a named deploy destination.
@@ -409,6 +414,9 @@ func (m *Manifest) applyDefaults() {
 		m.Retain = 5
 	}
 	for name, img := range m.Images {
+		if img.Layout != "" {
+			continue // nothing is built, so build defaults would only mislead Validate
+		}
 		if img.Context == "" {
 			img.Context = "."
 		}
