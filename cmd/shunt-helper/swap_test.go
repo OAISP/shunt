@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -224,7 +225,7 @@ func TestRetireStopsEveryContainerGracefully(t *testing.T) {
 			t.Fatalf("%s was not stopped; calls:\n%s", name, strings.Join(f.calls, "\n"))
 		}
 	}
-	if f.did("rm -f demo-old-a") && !f.did("docker stop --timeout 10 demo-old-a") {
+	if f.did("rm -f demo-old-a") && !f.did("docker stop -t 10 demo-old-a") {
 		t.Fatal("containers were killed rather than drained")
 	}
 }
@@ -499,7 +500,7 @@ func TestRollbackRemovesAServiceTheUndoneReleaseIntroduced(t *testing.T) {
 		t.Fatalf("the failed release's container was left running; calls:\n%s", strings.Join(f.calls, "\n"))
 	}
 	// Its own drain, not a default: it is still serving something until it stops.
-	if !f.did("docker stop --timeout 3 demo-broken") {
+	if !f.did("docker stop -t 3 demo-broken") {
 		t.Error("the outgoing service's drain was not honoured")
 	}
 	if f.did("docker stop", "demo-app") {
@@ -560,5 +561,54 @@ func TestMemoryLimitsAreSetAtCreate(t *testing.T) {
 	}
 	if !f.did("docker create", "--memory 1g", "--memory-swap 1536m") {
 		t.Errorf("create did not carry the limits:\n%s", strings.Join(f.calls, "\n"))
+	}
+}
+
+// A rollback returns to a release whose container a failed deploy may never
+// have replaced. Stopping it to start the same thing again is a gap for nothing
+// — and for a proxied service, the outage blue/green exists to avoid.
+func TestSwapServicesLeavesAContainerAlreadyOnTheRelease(t *testing.T) {
+	svc := release.Service{
+		Image: "app", Restart: "always", Expose: 3000,
+		Proxy: &release.Proxy{Kind: "traefik", Host: "x.example.com", Port: 3000},
+	}
+	f := newFake().on("{{.State.Running}}", "true "+testRelease+" "+release.HashService(svc)+"\n", nil)
+	withFake(t, f)
+
+	started, mutated, err := swapServices(svcSpec(map[string]release.Service{"app": svc}, "app"), nil, "")
+	if err != nil || mutated || len(started) != 1 {
+		t.Fatalf("started = %v, mutated = %v, err = %v; want the service counted and nothing changed", started, mutated, err)
+	}
+	if f.did("docker create") || f.did("docker stop") {
+		t.Errorf("a container already on the release was replaced:\n%s", strings.Join(f.calls, "\n"))
+	}
+}
+
+// An accessory is found again by its stable name, so a proxied one must not be
+// named per release: every deploy would boot another copy on the same volumes.
+func TestAProxiedAccessoryKeepsItsStableName(t *testing.T) {
+	acc := release.Service{Image: "app", Proxy: &release.Proxy{Kind: "traefik", Host: "s3.example.com", Port: 9000}}
+	spec := svcSpec(nil)
+	spec.Accessories = map[string]release.Service{"minio": acc}
+	if got := serviceContainer(spec, "minio", acc); got != "demo-minio" {
+		t.Errorf("container = %q, want demo-minio", got)
+	}
+}
+
+// An accessory is never recreated, so it goes on mounting the secrets directory
+// of the release that booted it long after the ledger has forgotten that one.
+func TestPruneSecretDirsKeepsWhatAContainerStillMounts(t *testing.T) {
+	t.Setenv("SHUNT_ROOT", t.TempDir())
+	withFake(t, newFake().on("docker ps -a --filter label=shunt.project=demo", "r-booted\nr-current\n", nil))
+	for _, id := range []string{"r-booted", "r-current", "r-gone", "r-gone.scope"} {
+		if err := os.MkdirAll(filepath.Join(projectDir("demo"), "secrets", id), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pruneSecretDirs("demo", map[string]bool{"r-current": true})
+
+	got := lsNames(t, filepath.Join(projectDir("demo"), "secrets"))
+	if want := []string{"r-booted", "r-current"}; !slices.Equal(got, want) {
+		t.Errorf("after prune = %v, want %v", got, want)
 	}
 }

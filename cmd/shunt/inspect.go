@@ -32,6 +32,11 @@ func cmdStatus(ctx context.Context, args []string) error {
 		return err
 	}
 	if c.asJSON {
+		// The salt is what keeps the ledger's secret hashes from being guessed
+		// offline, so it does not belong in output that ends up in a CI log.
+		if st.Ledger != nil {
+			st.Ledger.Salt = ""
+		}
 		return json.NewEncoder(os.Stdout).Encode(st)
 	}
 

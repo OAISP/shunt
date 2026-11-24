@@ -11,10 +11,13 @@ package transport
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -214,7 +217,10 @@ func PushFile(ctx context.Context, o FileOptions) (*Stats, error) {
 		remote = strings.TrimSuffix(remote, "/") + "/"
 	}
 	args = append(args, compressArgs(o.RemoteZstd)...)
-	args = append(args, "-e", o.Client.SSHCommand(), local, o.Client.Host+":"+remote)
+	args = append(args,
+		// Creates the destination's directory on first use, as Push does its store.
+		"--rsync-path", "mkdir -p "+sshx.Quote(filepath.Dir(o.RemotePath))+" && rsync",
+		"-e", o.Client.SSHCommand(), local, o.Client.Host+":"+remote)
 	return runRsync(ctx, args, o.Verbose, func(err error) error {
 		return fmt.Errorf("rsync %s to %s: %w", o.LocalPath, o.Client.Host, err)
 	})
@@ -242,6 +248,19 @@ func Fetch(ctx context.Context, o FileOptions, isDir bool) (*Stats, error) {
 	})
 }
 
+// scanRedraws splits on carriage returns as well as newlines. rsync redraws its
+// progress line with bare \r, so read by lines a long transfer is one line that
+// outgrows the scanner — which then stops reading, and rsync blocks for good.
+func scanRedraws(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if i := bytes.IndexAny(data, "\r\n"); i >= 0 {
+		return i + 1, data[:i], nil
+	}
+	if atEOF && len(data) > 0 {
+		return len(data), data, nil
+	}
+	return 0, nil, nil
+}
+
 // runRsync executes rsync and collects its transfer statistics.
 func runRsync(ctx context.Context, args []string, verbose bool, wrap func(error) error) (*Stats, error) {
 	if verbose {
@@ -258,6 +277,7 @@ func runRsync(ctx context.Context, args []string, verbose bool, wrap func(error)
 	}
 	st := &Stats{}
 	sc := bufio.NewScanner(stdout)
+	sc.Split(scanRedraws)
 	for sc.Scan() {
 		line := sc.Text()
 		if verbose && strings.Contains(line, "%") {
@@ -265,6 +285,8 @@ func runRsync(ctx context.Context, args []string, verbose bool, wrap func(error)
 		}
 		parseStat(line, st)
 	}
+	// Whatever stopped the scan, rsync must not be left blocked on a full pipe.
+	io.Copy(io.Discard, stdout)
 	if err := cmd.Wait(); err != nil {
 		return nil, wrap(err)
 	}

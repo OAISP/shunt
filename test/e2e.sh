@@ -97,6 +97,11 @@ host    = "$HOST"
 [images.app]
 context = "."
 
+[accessories.cache]
+image   = "app"
+command = ["sh", "-c", "while true; do sleep 5; done"]
+init    = true
+
 [services.app]
 image   = "app"
 publish = ["127.0.0.1:$PORT:8080"]
@@ -199,9 +204,14 @@ eq "rollback restored that release's memory limit" "$(memory)" "$((64 << 20))"
 # ------------------------------------------------------------------- drift ---
 # A plan built from the ledger alone would call this "unchanged".
 step "drift detection"
+# The ledger records that an accessory was booted, not that it is still up.
+ssh -o BatchMode=yes "$HOST" "docker stop -t 1 $PROJECT-cache" >/dev/null 2>&1 || true
+exits "a stopped accessory is reported as work" 2 "$SHUNT" plan --detailed-exitcode
 ssh -o BatchMode=yes "$HOST" "docker rm -f $PROJECT-worker" >/dev/null 2>&1 || true
 exits "a hand-deleted container is reported as work" 2 "$SHUNT" plan --detailed-exitcode
 "$SHUNT" up -y </dev/null >/dev/null
+eq "the stopped accessory was started again" \
+  "$(ssh -o BatchMode=yes "$HOST" "docker inspect -f '{{.State.Running}}' $PROJECT-cache")" "true"
 if ssh -o BatchMode=yes "$HOST" "docker ps --filter name=$PROJECT-worker --format '{{.Names}}'" | grep -q worker; then
   ok "the missing container was restored"
 else
@@ -375,8 +385,14 @@ echo "v6" > index.html
 R_SEC="$(current)"
 eq "the container reads its secret as a file" "$(secret_seen)" "$TOKEN"
 
-echo "v7" > index.html
+# No service definition mentions a secret's value, so a rotation is a change
+# that nothing else in the plan would show.
+exits "plan is clean with the secret deployed" 0 "$SHUNT" plan --detailed-exitcode
+ROTATED='r0tated'
+printf 'APP_TOKEN=%s\n' "$ROTATED" > secrets.env
+exits "a rotated secret is reported as work" 2 "$SHUNT" plan --detailed-exitcode
 "$SHUNT" up -y </dev/null >/dev/null
+eq "the container reads the rotated secret" "$(secret_seen)" "$ROTATED"
 
 succeeds "rollback accepts a release whose services all scoped their secrets" \
   "$SHUNT" rollback "$R_SEC" -y
@@ -408,11 +424,12 @@ fi
 # afterwards on purpose: this section asserts that `down` works, and the trap
 # guarantees the host is clean even when it does not.
 step "down"
-running() { ssh -o BatchMode=yes "$HOST" "docker ps -aq --filter label=shunt.project=$PROJECT" | tr -d '[:space:]'; }
+running() { ssh -o BatchMode=yes "$HOST" "docker ps -aq --filter label=shunt.project=$PROJECT $*" | tr -d '[:space:]'; }
 onhost()  { ssh -o BatchMode=yes "$HOST" "$@" >/dev/null 2>&1; }
 
 "$SHUNT" down -y </dev/null >/dev/null
-eq "down removed every container" "$(running)" ""
+eq "down removed every service container" "$(running --filter label=shunt.kind=service)" ""
+succeeds "down kept the accessory" onhost "docker inspect $PROJECT-cache"
 
 # Reversible: the release history and the secrets are what make that true, so
 # they have to have survived.

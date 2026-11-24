@@ -5,6 +5,7 @@
 #
 # Environment:
 #   SHUNT_VERSION   pin a release, e.g. v0.3.0 (default: latest)
+#   SHUNT_SKIP_VERIFY=1   install even when the checksum cannot be verified
 #   PREFIX          install directory (default: /usr/local/bin, else ~/.local/bin)
 #
 # This script never invokes sudo. If it cannot write to /usr/local/bin it
@@ -65,7 +66,13 @@ fetch "${base}/${asset}" "${tmp}/${asset}" || die "download failed: ${base}/${as
 # The release publishes checksums.txt; refusing to install an unverified binary
 # is cheap insurance for something that will hold ssh access to your servers.
 
-if fetch "${base}/checksums.txt" "${tmp}/checksums.txt" 2>/dev/null; then
+unverified="set SHUNT_SKIP_VERIFY=1 to install without verifying"
+
+if [ "${SHUNT_SKIP_VERIFY:-}" = 1 ]; then
+  say "warning: SHUNT_SKIP_VERIFY=1, installing without checksum verification"
+else
+  fetch "${base}/checksums.txt" "${tmp}/checksums.txt" 2>/dev/null ||
+    die "could not download checksums.txt; ${unverified}"
   expected=$(grep " ${asset}\$" "${tmp}/checksums.txt" | awk '{print $1}')
   [ -n "$expected" ] || die "checksums.txt has no entry for ${asset}"
 
@@ -74,18 +81,13 @@ if fetch "${base}/checksums.txt" "${tmp}/checksums.txt" 2>/dev/null; then
   elif command -v shasum >/dev/null 2>&1; then
     actual=$(shasum -a 256 "${tmp}/${asset}" | awk '{print $1}')
   else
-    actual=""
-    say "warning: no sha256 tool found, skipping checksum verification"
+    die "no sha256sum or shasum found; ${unverified}"
   fi
 
-  if [ -n "$actual" ]; then
-    [ "$actual" = "$expected" ] || die "checksum mismatch for ${asset}
+  [ "$actual" = "$expected" ] || die "checksum mismatch for ${asset}
   expected $expected
   got      $actual"
-    say "checksum verified"
-  fi
-else
-  say "warning: checksums.txt unavailable, skipping verification"
+  say "checksum verified"
 fi
 
 # ---- install ----------------------------------------------------------------

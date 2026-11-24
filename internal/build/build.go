@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -173,6 +174,10 @@ func Import(src, outDir, name, platform string) (*Result, error) {
 	}
 	blobs := append([]string{d.Digest, man.Config.Digest}, layerDigests(man)...)
 	for _, dg := range blobs {
+		// A digest becomes a path on both sides of this copy.
+		if !digestRE.MatchString(dg) {
+			return nil, fmt.Errorf("import image %q: %q is not a digest", name, dg)
+		}
 		if err := copyFile(filepath.Join(src, blobPath(dg)), filepath.Join(outDir, blobPath(dg))); err != nil {
 			return nil, fmt.Errorf("import image %q: %w", name, err)
 		}
@@ -195,6 +200,8 @@ func Import(src, outDir, name, platform string) (*Result, error) {
 	}
 	return &Result{Name: name, Dir: outDir, Digest: d.Digest, Bytes: DirSize(outDir)}, nil
 }
+
+var digestRE = regexp.MustCompile(`^[a-z0-9]+:[A-Za-z0-9=_-]+$`)
 
 // LayoutPlatform reads the os/arch of the image Import would take from a layout.
 func LayoutPlatform(dir, platform string) (string, error) {
@@ -260,6 +267,9 @@ func selectImage(dir, platform string) (descriptor, *ociManifest, error) {
 	}
 	d := top.Manifests[0]
 	for depth := 0; depth <= 4; depth++ {
+		if !digestRE.MatchString(d.Digest) {
+			return descriptor{}, nil, fmt.Errorf("%q is not a digest", d.Digest)
+		}
 		mb, err := os.ReadFile(filepath.Join(dir, blobPath(d.Digest)))
 		if err != nil {
 			return descriptor{}, nil, fmt.Errorf("read blob %s: %w", d.Digest, err)

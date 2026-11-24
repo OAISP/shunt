@@ -10,6 +10,7 @@ package secrets
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -116,19 +117,7 @@ func fromSops(path string) (map[string]string, error) {
 		}
 		return nil, fmt.Errorf("secrets: sops: %w", err)
 	}
-	res := map[string]string{}
-	for i, ln := range strings.Split(string(out), "\n") {
-		s := strings.TrimSpace(ln)
-		if s == "" || strings.HasPrefix(s, "#") {
-			continue
-		}
-		k, v, ok := strings.Cut(s, "=")
-		if !ok {
-			return nil, fmt.Errorf("secrets: sops output line %d: expected KEY=VALUE", i+1)
-		}
-		res[strings.TrimSpace(k)] = strings.Trim(strings.TrimSpace(v), `"'`)
-	}
-	return res, nil
+	return parseDotenv(bytes.NewReader(out), "sops output")
 }
 
 // Keys returns the sorted key names — safe to print, unlike the values.

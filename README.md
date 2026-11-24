@@ -66,7 +66,7 @@ details.
 ```sh
 cd my-project
 shunt init --host deploy@vps.example.com   # writes shunt.toml
-shunt audit                                # checks both machines, changes nothing
+shunt audit                                # checks both machines
 shunt plan                                 # shows what a deploy would change
 shunt up                                   # deploys
 ```
@@ -100,10 +100,14 @@ All optional, and each a block in the same file:
   in atomically.
 - **Secrets** — from a dotenv file, your environment or sops; delivered as
   environment variables or as files.
+- **Memory limits** — per service, set when the container is created, so a
+  runaway process cannot take the server down with it.
 - **Zero-downtime** — blue/green through Traefik or caddy-docker-proxy labels.
 - **Rollback** — to any retained release in seconds, optionally automatic.
 - **Targets and bundles** — staging and production from one manifest; build
   once and promote, or carry a release to a host the builder cannot reach.
+- **Prebuilt images** — ship the image your pipeline already built, scanned and
+  signed, straight from an OCI layout, with no Docker on the deploy runner.
 - **CI** — a build cache for fresh runners, and deploys that finish even when
   the job is cancelled. See
   [Deploying from CI](https://oaisp.github.io/shunt/deploying/ci/).

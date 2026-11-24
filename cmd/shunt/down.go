@@ -56,9 +56,9 @@ func cmdDown(ctx context.Context, args []string) error {
 		return err
 	}
 
-	s := c.out()
+	s := c.err()
 	if !describeDown(state, e, all || purge, purge, s) {
-		fmt.Printf("\n  nothing on %s is running for %s\n\n", e.M.Host, e.M.Project)
+		fmt.Fprintf(os.Stderr, "\n  nothing on %s is running for %s\n\n", e.M.Host, e.M.Project)
 		return nil
 	}
 
@@ -87,7 +87,7 @@ func purgeNeedsConsent(purge, yes, interactive bool) bool {
 // blast radius an operator cannot infer from the verb, and a container they did
 // not expect to see in the list is the signal to answer no.
 func describeDown(state *engine.RemoteState, e *engine.Engine, accessories, purge bool, s ui.Style) bool {
-	fmt.Printf("\n  down %s on %s\n", s.Bold(e.M.Project), e.M.Host)
+	fmt.Fprintf(os.Stderr, "\n  down %s on %s\n", s.Bold(e.M.Project), e.M.Host)
 
 	var services, accs []engine.Container
 	for _, ct := range state.Containers {
@@ -101,38 +101,38 @@ func describeDown(state *engine.RemoteState, e *engine.Engine, accessories, purg
 	found := false
 	if len(services) > 0 {
 		found = true
-		fmt.Printf("\n    %s\n", s.Dim("services"))
+		fmt.Fprintf(os.Stderr, "\n    %s\n", s.Dim("services"))
 		for _, ct := range services {
-			fmt.Printf("      %-30s %s\n", ui.Truncate(ct.Name, 30), s.Dim(ct.Status))
+			fmt.Fprintf(os.Stderr, "      %-30s %s\n", ui.Truncate(ct.Name, 30), s.Dim(ct.Status))
 		}
 	}
 	if len(accs) > 0 {
 		if accessories {
 			found = true
-			fmt.Printf("\n    %s\n", s.Dim("accessories"))
+			fmt.Fprintf(os.Stderr, "\n    %s\n", s.Dim("accessories"))
 		} else {
-			fmt.Printf("\n    %s\n", s.Dim("accessories  (kept — pass --all to remove)"))
+			fmt.Fprintf(os.Stderr, "\n    %s\n", s.Dim("accessories  (kept — pass --all to remove)"))
 		}
 		for _, ct := range accs {
-			fmt.Printf("      %-30s %s\n", ui.Truncate(ct.Name, 30), s.Dim(ct.Status))
+			fmt.Fprintf(os.Stderr, "      %-30s %s\n", ui.Truncate(ct.Name, 30), s.Dim(ct.Status))
 		}
 	}
 
-	fmt.Println()
+	fmt.Fprintln(os.Stderr)
 	if found {
-		fmt.Printf("  %s\n", s.Amber("this stops and removes the container(s) above"))
+		fmt.Fprintf(os.Stderr, "  %s\n", s.Amber("this stops and removes the container(s) above"))
 	}
 	if purge {
-		fmt.Printf("  %s\n", s.Amber("--purge also removes the network, every release-tagged image,"))
-		fmt.Printf("  %s\n", s.Amber("  the release history and this project's secrets on the host"))
+		fmt.Fprintf(os.Stderr, "  %s\n", s.Amber("--purge also removes the network, every release-tagged image,"))
+		fmt.Fprintf(os.Stderr, "  %s\n", s.Amber("  the release history and this project's secrets on the host"))
 		if state.Ledger != nil && len(state.Ledger.Releases) > 0 {
-			fmt.Printf("  %s\n", s.Red(fmt.Sprintf("there will be nothing left to `shunt rollback` to (%d release(s) recorded)",
+			fmt.Fprintf(os.Stderr, "  %s\n", s.Red(fmt.Sprintf("there will be nothing left to `shunt rollback` to (%d release(s) recorded)",
 				len(state.Ledger.Releases))))
 		}
 	}
 	// Said at every depth, because it is the question anyone about to run this
 	// is actually asking.
-	fmt.Printf("  %s\n", s.Dim("named volumes are never touched — your data stays"))
+	fmt.Fprintf(os.Stderr, "  %s\n", s.Dim("named volumes are never touched — your data stays"))
 
 	// Purge always has work — a network, images and the secrets outlive the
 	// containers, and reaching for it on a host whose containers are already

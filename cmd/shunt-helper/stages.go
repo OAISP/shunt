@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -71,13 +72,18 @@ func runStage(spec *release.Spec, st release.Stage, envFile string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
+	// Written beside the path and renamed over it only on success, so a failed
+	// run never costs a fixed-path capture its last good copy.
+	//
 	// 0600, not os.Create's 0644. The canonical capture is a pg_dump: every row
 	// of production, sitting world-readable on a host that by definition has
 	// other people's containers on it.
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	partial := path + ".partial"
+	f, err := os.OpenFile(partial, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}
+	defer os.Remove(partial)
 	cmd.Stdout = f
 	var errBuf strings.Builder
 	cmd.Stderr = &errBuf
@@ -88,23 +94,28 @@ func runStage(spec *release.Spec, st release.Stage, envFile string) error {
 		logline(ln)
 	}
 	if runErr != nil {
-		os.Remove(path)
 		return runErr
 	}
 	if st.RequireNonEmpty {
-		fi, err := os.Stat(path)
+		fi, err := os.Stat(partial)
 		if err != nil {
 			return err
 		}
 		if fi.Size() == 0 {
-			os.Remove(path)
 			return fmt.Errorf("capture %s is empty — refusing to continue", path)
 		}
 		info(fmt.Sprintf("captured %s (%s)", path, ui.Bytes(fi.Size())))
 	}
+	if err := os.Rename(partial, path); err != nil {
+		return err
+	}
 	pruneCaptures(st.Capture, st.Retain)
 	return nil
 }
+
+// generationRE matches what a capture placeholder expands to: a timestamp, or a
+// release id, which is a timestamp with a suffix.
+var generationRE = regexp.MustCompile(`^\d{8}-\d{6}(-[0-9a-f]+)?$`)
 
 // pruneCaptures keeps the newest `retain` generations of one stage's capture.
 //
@@ -124,13 +135,15 @@ func pruneCaptures(template string, retain int) {
 	if err != nil {
 		return
 	}
+	// Matched on the generation itself, not only on what surrounds it: a template
+	// such as `{{.Release}}.sql` must not claim every .sql file in the directory.
 	var matches []string
 	for _, e := range ents {
 		n := e.Name()
-		if e.IsDir() || len(n) <= len(prefix)+len(suffix) {
+		if e.IsDir() || len(n) <= len(prefix)+len(suffix) || !strings.HasPrefix(n, prefix) || !strings.HasSuffix(n, suffix) {
 			continue
 		}
-		if strings.HasPrefix(n, prefix) && strings.HasSuffix(n, suffix) {
+		if generationRE.MatchString(n[len(prefix) : len(n)-len(suffix)]) {
 			matches = append(matches, n)
 		}
 	}

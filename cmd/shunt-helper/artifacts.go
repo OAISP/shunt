@@ -21,15 +21,15 @@ import (
 // stale — and if a promotion still fails partway, the ones already promoted are
 // put back. Without that, the surrounding error saying "no services were
 // replaced — production is untouched" would be a lie about the data.
-func swapArtifacts(spec *release.Spec) error {
-	if len(spec.Artifacts) == 0 {
-		return nil
-	}
-
+//
+// The promotions are returned so the caller can undo them too: a release whose
+// services then fail to replace anything must not leave the old code running on
+// the new data.
+func swapArtifacts(spec *release.Spec) ([]promotion, error) {
 	for _, a := range spec.Artifacts {
 		step("artifact:"+a.Name, "checking "+filepath.Base(a.Staged))
 		if err := validateStaged(a); err != nil {
-			return fmt.Errorf("artifact %q: %w", a.Name, err)
+			return nil, fmt.Errorf("artifact %q: %w", a.Name, err)
 		}
 	}
 
@@ -38,28 +38,37 @@ func swapArtifacts(spec *release.Spec) error {
 		step("artifact:"+a.Name, "swapping in "+a.Dest)
 		p, err := promote(spec, a)
 		if err != nil {
-			restored, failed := rollbackPromotions(done)
-			msg := fmt.Errorf("artifact %q: %w", a.Name, err)
-			if restored > 0 {
-				msg = fmt.Errorf("%w\n  %d earlier artifact(s) were restored to their previous contents", msg, restored)
-			}
-			if len(failed) > 0 {
-				msg = fmt.Errorf("%w\n  COULD NOT restore: %s — recover these by hand before restarting the app",
-					msg, strings.Join(failed, ", "))
-			}
-			return msg
+			return nil, fmt.Errorf("artifact %q: %w%s", a.Name, err, undoPromotions(done))
 		}
 		done = append(done, p)
 		ok("artifact:"+a.Name, fmt.Sprintf("%s in place (%s)", a.Dest, ui.Bytes(p.bytes)))
 	}
+	return done, nil
+}
 
-	// Retention and stale-fragment cleanup run only once everything has landed —
-	// until then the superseded copies are the restore path.
+// undoPromotions puts back what the swaps replaced and says so, as a suffix for
+// the error that made it necessary.
+func undoPromotions(done []promotion) string {
+	restored, failed := rollbackPromotions(done)
+	var msg string
+	if restored > 0 {
+		msg = fmt.Sprintf("\n  %d artifact(s) were restored to their previous contents", restored)
+	}
+	if len(failed) > 0 {
+		msg += fmt.Sprintf("\n  COULD NOT restore: %s — recover these by hand before restarting the app",
+			strings.Join(failed, ", "))
+	}
+	return msg
+}
+
+// settleArtifacts applies retention and clears stale fragments. Only a release
+// that came up healthy may do this: until then the superseded copies are the
+// restore path.
+func settleArtifacts(spec *release.Spec) {
 	for _, a := range spec.Artifacts {
 		prunePrevious(a.Dest, a.Retain)
 		clearStaleStaged(a)
 	}
-	return nil
 }
 
 // validateStaged checks a transferred file is exactly what the release said it

@@ -23,55 +23,42 @@ func proxy() *release.Proxy {
 
 // A label-discovered router is defined by every container carrying its labels.
 // Traefik drops a router that two containers define differently — a total
-// outage, not a blip — so overlap is only safe when the proxy config matches.
-func TestSameProxy(t *testing.T) {
-	a := proxy()
-	if !sameProxy(a, proxy()) {
-		t.Error("identical proxies compared unequal")
-	}
-	if sameProxy(nil, a) || sameProxy(a, nil) {
-		t.Error("nil must not compare equal to a configured proxy")
-	}
-	if !sameProxy(nil, nil) {
-		t.Error("two nil proxies should compare equal")
-	}
-
-	for name, mutate := range map[string]func(*release.Proxy){
-		"host":        func(p *release.Proxy) { p.Host = "other.example.com" },
-		"kind":        func(p *release.Proxy) { p.Kind = "caddy" },
-		"path":        func(p *release.Proxy) { p.Path = "/api" },
-		"port":        func(p *release.Proxy) { p.Port = 8080 },
-		"retry":       func(p *release.Proxy) { p.Retry = 0 },
-		"entrypoints": func(p *release.Proxy) { p.EntryPoints = []string{"websecure"} },
-	} {
-		b := proxy()
-		mutate(b)
-		if sameProxy(a, b) {
-			t.Errorf("change to %s was not detected", name)
-		}
-	}
-}
-
+// outage, not a blip — so overlap is only safe when the labels match exactly.
 func TestCanOverlap(t *testing.T) {
-	svc := release.Service{Proxy: proxy()}
+	specOf := func(svc release.Service) *release.Spec {
+		return &release.Spec{Project: "demo", Services: map[string]release.Service{"app": svc}}
+	}
+	base := release.Service{Proxy: proxy(), Health: &release.Health{URL: "/health"}}
+	spec := specOf(base)
 
-	if !canOverlap(nil, "app", svc) {
+	if !canOverlap(nil, spec, "app") {
 		t.Error("first deploy should be allowed to overlap")
 	}
-	if !canOverlap(&release.Spec{Services: map[string]release.Service{}}, "app", svc) {
+	if !canOverlap(&release.Spec{Project: "demo"}, spec, "app") {
 		t.Error("a service absent from the previous release should be allowed to overlap")
 	}
-
-	same := &release.Spec{Services: map[string]release.Service{"app": {Proxy: proxy()}}}
-	if !canOverlap(same, "app", svc) {
+	if !canOverlap(specOf(base), spec, "app") {
 		t.Error("unchanged proxy config should overlap")
 	}
+	if canOverlap(specOf(release.Service{}), spec, "app") {
+		t.Error("a service that was not proxied must not overlap with one that is")
+	}
 
-	changed := proxy()
-	changed.Host = "new.example.com"
-	diff := &release.Spec{Services: map[string]release.Service{"app": {Proxy: changed}}}
-	if canOverlap(diff, "app", svc) {
-		t.Error("changed proxy config must not overlap — it would drop the router")
+	for name, mutate := range map[string]func(*release.Service){
+		"host":        func(s *release.Service) { s.Proxy.Host = "other.example.com" },
+		"kind":        func(s *release.Service) { s.Proxy.Kind = "caddy" },
+		"path":        func(s *release.Service) { s.Proxy.Path = "/api" },
+		"port":        func(s *release.Service) { s.Proxy.Port = 8080 },
+		"retry":       func(s *release.Service) { s.Proxy.Retry = 0 },
+		"entrypoints": func(s *release.Service) { s.Proxy.EntryPoints = []string{"websecure"} },
+		"health path": func(s *release.Service) { s.Health = &release.Health{URL: "/ready"} },
+	} {
+		old := base
+		old.Proxy = proxy()
+		mutate(&old)
+		if canOverlap(specOf(old), spec, "app") {
+			t.Errorf("change to %s was not detected — it would drop the router", name)
+		}
 	}
 }
 
@@ -332,6 +319,21 @@ func TestPruneCapturesIgnoresATemplateWithoutAPlaceholder(t *testing.T) {
 	}
 }
 
+// A template that starts with its placeholder has no literal prefix to match
+// on, and must still not claim every file sharing its extension.
+func TestPruneCapturesLeavesFilesThatAreNotGenerations(t *testing.T) {
+	dir := t.TempDir()
+	for _, n := range []string{"20260720-100000-aaa111.sql", "20260721-100000-bbb222.sql", "schema.sql"} {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pruneCaptures(filepath.Join(dir, "{{.Release}}.sql"), 1)
+	if got, want := lsNames(t, dir), []string{"20260721-100000-bbb222.sql", "schema.sql"}; !slices.Equal(got, want) {
+		t.Fatalf("after prune = %v, want %v", got, want)
+	}
+}
+
 // A pg_dump is every row of production. os.Create's 0644 left it readable by
 // every other user and container on the host.
 func TestCapturesAreWrittenPrivate(t *testing.T) {
@@ -425,7 +427,7 @@ func TestSwapArtifactsRestoresEarlierPromotionsOnFailure(t *testing.T) {
 	b := unpromotable(t, dir, "second")
 
 	spec := &release.Spec{ID: testRelease, Artifacts: []release.Artifact{a, b}}
-	err := swapArtifacts(spec)
+	_, err := swapArtifacts(spec)
 	if err == nil {
 		t.Fatal("swapArtifacts succeeded despite an unpromotable artifact")
 	}
@@ -445,7 +447,7 @@ func TestSwapArtifactsRemovesFirstTimeFilesOnRollback(t *testing.T) {
 	b := unpromotable(t, dir, "second")
 
 	spec := &release.Spec{ID: testRelease, Artifacts: []release.Artifact{a, b}}
-	if err := swapArtifacts(spec); err == nil {
+	if _, err := swapArtifacts(spec); err == nil {
 		t.Fatal("swapArtifacts succeeded despite an unpromotable artifact")
 	}
 	if _, err := os.Stat(a.Dest); !os.IsNotExist(err) {
@@ -463,7 +465,7 @@ func TestSwapArtifactsValidatesAllBeforePromotingAny(t *testing.T) {
 	c.Bytes = 9999 // as if the transfer had been cut short
 
 	spec := &release.Spec{ID: testRelease, Artifacts: []release.Artifact{a, b, c}}
-	if err := swapArtifacts(spec); err == nil {
+	if _, err := swapArtifacts(spec); err == nil {
 		t.Fatal("swapArtifacts accepted a truncated artifact")
 	}
 	for _, want := range []struct{ path, contents string }{
@@ -529,7 +531,7 @@ func TestPromoteBacksUpByHardLink(t *testing.T) {
 }
 
 // Fragments from abandoned deploys must not accumulate beside the destination.
-func TestSwapArtifactsClearsStaleStagedFiles(t *testing.T) {
+func TestSettleArtifactsClearsStaleStagedFiles(t *testing.T) {
 	dir := t.TempDir()
 	a := artifactFixture(t, dir, "data", "OLD", "NEW")
 	stale := a.Dest + ".new.20260101-000000-old999"
@@ -541,9 +543,10 @@ func TestSwapArtifactsClearsStaleStagedFiles(t *testing.T) {
 	}
 
 	spec := &release.Spec{ID: testRelease, Artifacts: []release.Artifact{a}}
-	if err := swapArtifacts(spec); err != nil {
+	if _, err := swapArtifacts(spec); err != nil {
 		t.Fatal(err)
 	}
+	settleArtifacts(spec)
 	for _, p := range []string{stale, legacy} {
 		if _, err := os.Stat(p); !os.IsNotExist(err) {
 			t.Fatalf("stale fragment %s survived", filepath.Base(p))
@@ -709,7 +712,7 @@ func TestSwapArtifactsPromotesADirectoryTree(t *testing.T) {
 	os.WriteFile(filepath.Join(a.Dest, "stale.txt"), []byte("gone in v2"), 0o644)
 
 	spec := &release.Spec{ID: testRelease, Artifacts: []release.Artifact{a}}
-	if err := swapArtifacts(spec); err != nil {
+	if _, err := swapArtifacts(spec); err != nil {
 		t.Fatal(err)
 	}
 	if got := readFile(t, filepath.Join(a.Dest, "model.bin")); got != "weights-v2" {

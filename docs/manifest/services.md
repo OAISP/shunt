@@ -30,7 +30,7 @@ init    = true
 | `publish` | none | Host port mappings, in `docker run -p` form. |
 | `expose` | none | A container port for a proxy to reach, with no host port. |
 | `volumes` | none | Bind mounts and named volumes, in `docker run -v` form. |
-| `restart` | `unless-stopped` | Docker restart policy. |
+| `restart` | `unless-stopped` | Docker restart policy: `no`, `always`, `unless-stopped` or `on-failure[:N]`. |
 | `requires` | none | Services that must be healthy before this one starts. |
 | `secrets` | all of them | The secret keys this service receives. |
 | `drain` | `10s` | How long a stopped container gets to finish in-flight work. |
@@ -130,6 +130,9 @@ A `url` that is a bare path is probed wherever the service is reachable: its
 published host port — on the bind address you gave it, so `10.0.0.5:9090:3000`
 is probed on `10.0.0.5` — or else its address on the deploy network, on the
 `expose` port. A path therefore needs one of the two.
+
+One probe is given up after 30 seconds and counts as a failed attempt, so a
+check that hangs cannot hold a deploy open.
 
 `command` suits services that speak no HTTP:
 

@@ -1,6 +1,10 @@
 package main
 
-import "os/exec"
+import (
+	"context"
+	"os/exec"
+	"time"
+)
 
 // runner is how the helper reaches docker.
 //
@@ -13,6 +17,8 @@ import "os/exec"
 type runner interface {
 	// Run executes a command and returns its combined output.
 	Run(name string, args ...string) (string, error)
+	// RunFor is Run for a command that must not be waited on forever.
+	RunFor(limit time.Duration, name string, args ...string) (string, error)
 	// Ok reports whether a command succeeded, discarding its output.
 	Ok(name string, args ...string) bool
 }
@@ -22,6 +28,16 @@ type execRunner struct{}
 
 func (execRunner) Run(name string, args ...string) (string, error) {
 	out, err := exec.Command(name, args...).CombinedOutput()
+	return string(out), err
+}
+
+func (execRunner) RunFor(limit time.Duration, name string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), limit)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+	if ctx.Err() != nil {
+		return string(out), ctx.Err()
+	}
 	return string(out), err
 }
 

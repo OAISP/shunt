@@ -104,6 +104,26 @@ func Write(w io.Writer, c Contents) error {
 	return tw.Close()
 }
 
+// decodeMeta reads bundle.json strictly. A field this shunt does not know is one
+// a newer shunt wrote and meant — a memory limit, say — and applying the release
+// without it would drop the setting in silence.
+func decodeMeta(r io.Reader) (Meta, error) {
+	var m Meta
+	dec := json.NewDecoder(r)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&m); err != nil {
+		if strings.Contains(err.Error(), "unknown field") {
+			return Meta{}, fmt.Errorf("%s: %w — this bundle was built by a newer shunt; apply it with that version", metaName, err)
+		}
+		return Meta{}, fmt.Errorf("%s: %w", metaName, err)
+	}
+	if m.Version != Version {
+		return Meta{}, fmt.Errorf("this bundle is format v%d and this shunt speaks v%d — use a matching version",
+			m.Version, Version)
+	}
+	return m, nil
+}
+
 // ReadMeta reads only a bundle's description.
 //
 // bundle.json is written first precisely so this can stop after one entry: an
@@ -122,15 +142,7 @@ func ReadMeta(r io.Reader) (Meta, error) {
 		if h.Name != metaName {
 			continue
 		}
-		var m Meta
-		if err := json.NewDecoder(tr).Decode(&m); err != nil {
-			return Meta{}, fmt.Errorf("%s: %w", metaName, err)
-		}
-		if m.Version != Version {
-			return Meta{}, fmt.Errorf("this bundle is format v%d and this shunt speaks v%d — use a matching version",
-				m.Version, Version)
-		}
-		return m, nil
+		return decodeMeta(tr)
 	}
 	return Meta{}, fmt.Errorf("not a shunt bundle: no %s inside", metaName)
 }
@@ -252,16 +264,14 @@ func Read(r io.Reader, dir string) (*Extracted, error) {
 		}
 
 		if h.Name == metaName {
-			b, err := os.ReadFile(clean)
+			mf, err := os.Open(clean)
 			if err != nil {
 				return nil, err
 			}
-			if err := json.Unmarshal(b, &out.Meta); err != nil {
-				return nil, fmt.Errorf("bundle.json: %w", err)
-			}
-			if out.Meta.Version != Version {
-				return nil, fmt.Errorf("this bundle is format v%d and this shunt speaks v%d — use a matching version",
-					out.Meta.Version, Version)
+			out.Meta, err = decodeMeta(mf)
+			mf.Close()
+			if err != nil {
+				return nil, err
 			}
 			continue
 		}

@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The release workflow runs these same jobs before it publishes anything.
+  workflow_call:
 
 # A second push to the same branch makes the first run pointless; cancel it
 # rather than queue behind it.

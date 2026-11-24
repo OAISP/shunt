@@ -20,6 +20,14 @@ shunt rollback 20260726-225110-3fa9c1  # a specific release
 `degraded` is never picked as "previous" — rolling onto it would repeat the
 problem.
 
+A container already running the target release is left alone. After a deploy
+that failed partway, a rollback therefore replaces only what that deploy
+replaced, and a proxied service the deploy never got to keeps serving
+throughout.
+
+If a rollback itself fails after replacing a container, the serving release is
+marked `degraded`, like a deploy that failed the same way.
+
 ## Recovering from a partial failure
 
 A deploy that fails *after* replacing a container leaves the server running a
@@ -54,9 +62,10 @@ Accessories are never touched by a rollback.
 
 ## What rollback does not restore
 
-Data. An artifact's superseded copy is kept as `<dest>.prev.<release-id>`, and a
-release that fails after swapping one prints the `mv` that puts it back. A
-database migrated by a stage stays migrated.
+Data. An artifact's superseded copy is kept as `<dest>.prev.<release-id>`. A
+release that fails before replacing any service puts its artifacts back itself;
+one that fails later prints the `mv` that does, because by then some of the new
+code is running on them. A database migrated by a stage stays migrated.
 
 ## How far back you can go
 

@@ -23,6 +23,15 @@ import (
 // version-skew misdeploy into a clean error.
 const Protocol = 2
 
+// A deploy session holds the project lock while the CLI transfers, with nothing
+// passing between the two. The CLI therefore sends a heartbeat, and a helper
+// that stops hearing it gives the lock up: a client that vanishes without
+// closing the connection would otherwise hold it until TCP notices, hours later.
+const (
+	HeartbeatInterval = 30 * time.Second
+	HeartbeatTimeout  = 5 * time.Minute
+)
+
 // Spec is a complete, self-contained description of one release. Everything the
 // helper needs is here; it never reads the manifest and never phones home.
 type Spec struct {

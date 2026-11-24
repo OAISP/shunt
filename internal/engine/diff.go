@@ -180,6 +180,15 @@ func diffService(old, nw release.Service) []string {
 	if old.Restart != nw.Restart {
 		r = append(r, fmt.Sprintf("restart %s → %s", old.Restart, nw.Restart))
 	}
+	if !reflect.DeepEqual(old.Health, nw.Health) {
+		r = append(r, "health check changed")
+	}
+	if !slices.Equal(old.Requires, nw.Requires) {
+		r = append(r, fmt.Sprintf("requires %v → %v", old.Requires, nw.Requires))
+	}
+	if !slices.Equal(old.Secrets, nw.Secrets) {
+		r = append(r, "secrets scope changed")
+	}
 	for _, k := range mapKeys(old.Env, nw.Env) {
 		ov, oo := old.Env[k]
 		nv, no := nw.Env[k]

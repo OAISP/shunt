@@ -22,13 +22,16 @@ command = ["pg_isready", "-U", "acme"]
 ```
 
 An accessory takes the same keys as a [service]({% link manifest/services.md %}).
+A `proxy` block gives it the proxy's labels, but not blue/green: an accessory
+is always one container under one name.
 
 ## Booted once, then left alone
 
 A service is replaced on every release. An accessory is created on the first
 deploy that declares it and never replaced by a deploy afterwards: shipping a
 CSS fix must not restart Postgres. If the container exists but is stopped — a
-server reboot leaves it that way — a deploy starts it.
+server reboot leaves it that way — a deploy starts it, and one that has been
+removed is booted again. `shunt plan` reports either as work to do.
 
 Accessories come up, and pass their health checks, before any stage runs, so a
 migration always has its database.

@@ -50,7 +50,7 @@ func cmdBundle(ctx context.Context, args []string) error {
 	}
 
 	if fs.NArg() > 0 {
-		return fmt.Errorf("shunt bundle takes no arguments; did you mean `shunt bundle inspect %s`?", fs.Arg(0))
+		return usagef("shunt bundle takes no arguments; did you mean `shunt bundle inspect %s`?", fs.Arg(0))
 	}
 
 	m, err := loadManifest(c.file, c.target)
@@ -276,7 +276,11 @@ func cmdApply(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		p.SecretsUnknown = !secretsKnown
+		// An unresolved set would diff as every key removed, and count as work.
+		if !secretsKnown {
+			p.SecretsUnknown, p.Secrets = true, engine.SecretChange{}
+			p.HasChanges = p.Changed()
+		}
 		if c.asJSON {
 			if err := json.NewEncoder(os.Stdout).Encode(p); err != nil {
 				return err

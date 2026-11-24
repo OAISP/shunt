@@ -108,3 +108,7 @@ rather than reporting every key as removed.
 
 Each release id is applied to a server once; applying the same bundle again is
 refused. `--host` sends it to a different server instead.
+
+Apply a bundle with the shunt that built it, or a newer one. An older shunt
+refuses a bundle that uses a setting it does not know, rather than deploying
+the release without it.
