@@ -35,10 +35,11 @@ test/compat.sh                                     # needs local docker
 
 - **`test/e2e.sh`** deploys a small project to the host and checks the result:
   first deploy, no-op, code change, a failing stage leaving production serving,
-  rollback, drift after a container deleted by hand, exec and logs, automatic
-  rollback, a deploy cancelled midway, a deploy queued behind another, bundles,
-  secrets surviving a rollback, retire, and `down`. It cleans up after itself.
-  CI points it at the runner itself.
+  memory limits, rollback, drift after a container deleted or an accessory
+  stopped by hand, exec and logs, automatic rollback, a deploy cancelled midway,
+  a deploy queued behind another, bundles, a rotated secret, secrets surviving a
+  rollback, retire, and `down`. It cleans up after itself. CI points it at the
+  runner itself.
 - **`test/compat.sh`** builds a throwaway server in a container with rsync 3.1.3
   and neither `curl` nor `tar`, and deploys to it.
 
@@ -51,6 +52,11 @@ calls and scripts failures, which is how swaps, health gating and rollback are
 tested without a daemon. If you touch container swapping, health checks, the
 lock or the transport, add a case there, and say in the pull request what you
 ran against a real server.
+
+## Releases
+
+Pushing a `v*` tag runs the same jobs as a push to `main` — tests, `e2e` and
+`compat` — and publishes the release only if they pass.
 
 ## Documentation
 

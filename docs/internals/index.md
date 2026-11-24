@@ -31,7 +31,9 @@ one multiplexed connection:
 3. **`helper apply`.** Opened before anything is shipped. The helper takes the
    project lock and reports the serving release; the CLI checks its plan still
    holds, then runs the transfer, then sends the spec on this session's stdin.
-   The helper applies it and streams events back.
+   The helper applies it and streams events back. During the transfer the CLI
+   sends a heartbeat on the same stdin, and a helper that stops hearing it gives
+   the lock up.
 4. **rsync**, between 3's lock and its spec: every image layout in one
    transfer, then each artifact.
 

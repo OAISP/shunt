@@ -8,15 +8,17 @@ nav_order: 2
 ## Install
 
 The installer detects your platform, verifies the archive against the release's
-`checksums.txt`, and needs no toolchain:
+`checksums.txt` — and refuses to install one it cannot verify — and needs no
+toolchain:
 
 ```sh
 curl -sSL https://raw.githubusercontent.com/OAISP/shunt/main/install.sh | sh
 ```
 
 It never runs sudo. It installs to `/usr/local/bin` when that is writable and to
-`~/.local/bin` otherwise. `SHUNT_VERSION=v0.3.0` pins a release and
-`PREFIX=<dir>` chooses the directory. Read the script first if you would rather
+`~/.local/bin` otherwise. `SHUNT_VERSION=v0.3.0` pins a release,
+`PREFIX=<dir>` chooses the directory, and `SHUNT_SKIP_VERIFY=1` installs without
+the checksum on a machine that has no `sha256sum` or `shasum`. Read the script first if you would rather
 not pipe one into a shell — a reasonable instinct for a tool that will hold ssh
 access to your servers.
 
@@ -77,7 +79,8 @@ one can deploy to a server on the other.
 
 ### rsync versions
 
-Any rsync works. Image layers travel as they are, since they are already
+Any rsync works, though `-v` shows transfer progress only with rsync 3.1 or
+newer on your machine. Image layers travel as they are, since they are already
 compressed. Artifacts are compressed in transit: with zstd when both ends run
 rsync 3.2 or newer, and with plain `-z` otherwise — Ubuntu 20.04 ships 3.1.3 and
 macOS ships 2.6.9.
@@ -117,10 +120,10 @@ your own `~/.ssh/config`, so an alias works.
 **`shunt audit`** connects and checks everything a deploy depends on — docker,
 buildx and rsync here; ssh, docker, rsync and free disk on the server; artifact
 destinations; and whether each image's platform matches the server's
-architecture. It changes nothing.
+architecture. Like `shunt plan`, it only looks: the one thing either leaves on
+the server is shunt's own helper, uploaded the first time it connects.
 
-**`shunt plan`** builds, then shows what a deploy would change. It changes
-nothing on the server either.
+**`shunt plan`** builds, then shows what a deploy would change.
 
 **`shunt up`** builds, ships, swaps and health-checks. It shows the plan and asks
 before applying when run in a terminal; in CI, where there is no terminal, it

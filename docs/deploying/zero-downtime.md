@@ -35,6 +35,8 @@ url = "/health"
 
 A proxied service needs `expose` (or `proxy.port`) instead of `publish`, and a
 health check — without one a broken release would go straight into rotation.
+shunt probes the new container on its own address, using only the path of a
+full `url`: through the proxy, the container being replaced would answer.
 
 shunt does not run a proxy. It sets the container labels that Traefik and
 caddy-docker-proxy already watch, so the proxy does the switchover and shunt
@@ -84,6 +86,7 @@ Use a `url` health check to close that gap.
 
 A router discovered from labels is defined by every container that carries
 them, and Traefik drops a router that two containers define differently — a
-full outage, not a blip. So a deploy that changes the `proxy` block stops the
-old container before starting the new one, once. `shunt plan` says so, and the
-next deploy overlaps normally again.
+full outage, not a blip. So a deploy that changes the `proxy` block, or the path
+of the health check the proxy polls, stops the old container before starting
+the new one, once. `shunt plan` says so, and the next deploy overlaps normally
+again.

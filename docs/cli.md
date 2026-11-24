@@ -33,13 +33,13 @@ terminal to ask at — in CI — they proceed without asking, except `down --pur
 |:--|:--|
 | `shunt init --host <user@host>` | Write a `shunt.toml` for the Dockerfile in this directory, taking the port from its first `EXPOSE`. `--force` overwrites an existing one. |
 | `shunt validate` | Check `shunt.toml` with no ssh and no build. |
-| `shunt audit` | Check this machine and the server can deploy; changes nothing. Exits 1 if any check fails, with or without `--json`. |
+| `shunt audit` | Check this machine and the server can deploy. Exits 1 if any check fails, with or without `--json`. |
 
 ### Deploy
 
 | Command | |
 |:--|:--|
-| `shunt plan` | Build, then show what a deploy would change. Changes nothing on the server. |
+| `shunt plan` | Build, then show what a deploy would change. |
 | `shunt up` | Build, ship, run stages, swap containers, health-check. Does nothing when the server already matches. |
 | `shunt rollback [release]` | Restore the release before the serving one, or the one named. |
 
@@ -132,11 +132,12 @@ code of its own, so a typo can never read as "deploy needed".
 print the server's progress as one JSON event per line, each with a `kind`:
 `step` (work starting), `ok` (work done), `info`, `log` (container output),
 `fail` (with a `message`), and — when a deploy or rollback succeeds — a final
-`result` naming the `release` and its `status`. Build and transfer progress
-goes to stderr, so stdout carries only events.
+`result` naming the `release` and its `status`. Build and transfer progress,
+and what a command says before it asks to proceed, go to stderr, so stdout
+carries only events.
 
 **`status --json`** prints the release history and the project's containers as
-the server reports them. **`audit --json`** prints a list of checks, each with
+the server reports them, without the salt its secret hashes are keyed with. **`audit --json`** prints a list of checks, each with
 `name`, `status` (`ok`, `warn` or `fail`), `detail` and, where there is one, a
 `fix`. **`validate --json`** prints `valid` and, if it is not, the `error`.
 Only the plan document is versioned.

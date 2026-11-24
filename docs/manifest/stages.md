@@ -58,7 +58,9 @@ In the path, {% raw %}`{{.Release}}`{% endraw %} becomes the release id and
 `0600`: a database dump is every row of production.
 
 `retain` keeps the newest captures of that stage. Without a placeholder in the
-path, every deploy overwrites the same file.
+path, every deploy overwrites the same file — but only with a capture that
+succeeded: a stage that fails, or comes out empty under `require_nonempty`,
+leaves the previous one in place.
 
 Fetch one with `shunt fetch`, which lists the captures on the server when run
 with no arguments:

@@ -24,7 +24,8 @@ ship to services. Where they are declared, the order is the safety property:
 3. **Stages** must all succeed before anything running is touched. If one
    fails, production is exactly as it was.
 4. **Artifacts** are checked and swapped in only after the stages pass, because
-   that swap is the point of no return for data.
+   that swap is the point of no return for data. If the release then fails
+   before any service is replaced, they are put back.
 5. **Services** are replaced in dependency order.
 6. **Health** gates the release: a service that never becomes healthy fails it.
 
@@ -37,7 +38,8 @@ the plan finds any of these:
 - an image whose digest changed, or a service, stage or release-wide setting
   (network, secret delivery mode) whose definition changed;
 - an artifact whose size or modification time differs from the server's copy;
-- an accessory that does not exist yet;
+- a secret that was added, removed or given a new value;
+- an accessory that does not exist, or exists but is not running;
 - a container that differs from what the server recorded — deleted, stopped or
   replaced by hand. Every container carries a hash of the definition it was
   created from, so the plan describes the server rather than the last deploy;
@@ -77,6 +79,11 @@ job, so what an interruption does depends on when it happens:
   deploy, records the outcome and only then releases the lock. A cancelled job
   cannot leave a container stopped with its replacement never started.
   `shunt status` shows how it ended.
+
+A machine that vanishes without closing the connection — a laptop lid, a dead
+NAT mapping — sends no such signal. So the CLI sends a heartbeat while it
+transfers, and a helper that hears nothing for five minutes releases the lock,
+having changed nothing.
 
 ## Outcomes
 

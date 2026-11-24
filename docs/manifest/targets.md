@@ -48,8 +48,13 @@ The project name gets the target as a suffix by default, and the network
 follows it unless you set `network` yourself. Two targets can therefore share
 one server without sharing containers, a network or a release history.
 
-They do still share the server's ports and proxy. A `publish` mapping or a
-`proxy` host is part of what a release contains, so it is the same for every
-target, and two targets on one server would claim the same port or hostname.
-Sharing a server suits targets whose services do neither — workers, say.
+They do still share everything a release names on the server itself, because
+what a release contains is the same for every target:
+
+- a `publish` port or a `proxy` host, which two targets would both claim;
+- an artifact `dest`, a stage's `capture` path, a bind mount or a named volume,
+  which two targets would both write. Deploying staging would replace
+  production's data.
+
+Sharing a server suits targets that use none of these — stateless workers, say.
 Otherwise give each target its own server.
