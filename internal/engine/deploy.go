@@ -85,6 +85,11 @@ func (d *Deploy) Apply(ctx context.Context, spec *release.Spec, r EventRenderer)
 	if err != nil {
 		return err
 	}
+	// Cancelled before the hand-over: nothing has been sent, so nothing changes.
+	if err := ctx.Err(); err != nil {
+		d.Close()
+		return err
+	}
 	d.done = true
 	d.stopBeat()
 	_, werr := d.stdin.Write(b)

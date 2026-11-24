@@ -65,7 +65,7 @@ func TestAccessoryDriftSurvivesAnUnrelatedDeploy(t *testing.T) {
 	// The previous deploy already recorded the *new* definition in its spec,
 	// which is exactly the state that used to hide the drift.
 	oldSpec := &release.Spec{Accessories: map[string]release.Service{"db": wanted}}
-	state := &RemoteState{Ledger: &release.Ledger{
+	state := &RemoteState{Containers: dbContainer("running"), Ledger: &release.Ledger{
 		Current:     "r1",
 		Releases:    []release.Entry{{ID: "r1", Status: release.StatusActive, Spec: oldSpec}},
 		Accessories: map[string]string{"db": release.HashService(running)},
@@ -91,7 +91,7 @@ func TestAccessoryDriftSurvivesAnUnrelatedDeploy(t *testing.T) {
 // and must stop being reported.
 func TestAccessoryIsUnchangedOnceApplied(t *testing.T) {
 	svc := release.Service{Image: "postgres:18-alpine", Restart: "unless-stopped"}
-	state := &RemoteState{Ledger: &release.Ledger{
+	state := &RemoteState{Containers: dbContainer("running"), Ledger: &release.Ledger{
 		Accessories: map[string]string{"db": release.HashService(svc)},
 	}}
 	spec := &release.Spec{Accessories: map[string]release.Service{"db": svc}}
@@ -99,6 +99,68 @@ func TestAccessoryIsUnchangedOnceApplied(t *testing.T) {
 	got := (&Engine{}).planAccessories(&Plan{}, spec, state, nil)
 	if got[0].Action != "unchanged" {
 		t.Fatalf("accessory action = %q, want unchanged", got[0].Action)
+	}
+}
+
+func dbContainer(state string) []Container {
+	return []Container{{Name: "demo-db", Service: "db", Kind: "accessory", State: state}}
+}
+
+// The ledger records that an accessory was booted, not that it is still there.
+// A deploy boots one that is gone and starts one that stopped, so the plan has
+// to call both work rather than "running".
+func TestAnAccessoryThatIsGoneOrStoppedIsWork(t *testing.T) {
+	svc := release.Service{Image: "postgres:18-alpine", Restart: "unless-stopped"}
+	spec := &release.Spec{Accessories: map[string]release.Service{"db": svc}}
+	ledger := &release.Ledger{
+		Current:     "r1",
+		Releases:    []release.Entry{{ID: "r1", Status: release.StatusActive}},
+		Accessories: map[string]string{"db": release.HashService(svc)},
+	}
+	for want, containers := range map[string][]Container{"create": nil, "start": dbContainer("exited")} {
+		state := &RemoteState{Ledger: ledger, Containers: containers}
+		p := &Plan{Current: &ledger.Releases[0]}
+		p.Accessories = (&Engine{}).planAccessories(p, spec, state, nil)
+		if got := p.Accessories[0].Action; got != want {
+			t.Errorf("accessory action = %q, want %q", got, want)
+		}
+		if !p.Changed() {
+			t.Errorf("a plan whose accessory needs a %s reported nothing to do", want)
+		}
+	}
+}
+
+// No service definition mentions a secret's value, so a rotation shows up
+// nowhere else in the plan — and used to print "value changed", then "nothing
+// to do".
+func TestASecretChangeIsWork(t *testing.T) {
+	p := &Plan{Current: &release.Entry{Status: release.StatusActive}}
+	if p.Changed() {
+		t.Fatal("an empty plan reported work")
+	}
+	p.Secrets.Changed = []string{"DATABASE_URL"}
+	if !p.Changed() {
+		t.Error("a rotated secret was not counted as a change")
+	}
+}
+
+// One deploy after a service is dropped, the last release no longer mentions
+// it, and only its container says it is still running.
+func TestAnOrphanIsFoundFromItsContainer(t *testing.T) {
+	spec := &release.Spec{ID: "r3", Services: map[string]release.Service{"app": {Image: "app"}}}
+	state := &RemoteState{
+		Ledger: &release.Ledger{Current: "r2", Releases: []release.Entry{{ID: "r2", Status: release.StatusActive, Spec: spec}}},
+		Containers: []Container{
+			{Name: "demo-app", Service: "app", Kind: "service", State: "running", Config: release.HashService(spec.Services["app"])},
+			{Name: "demo-worker", Service: "worker", Kind: "service", State: "running"},
+		},
+	}
+	p, err := (&Engine{}).BuildPlan(t.Context(), spec, nil, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Services) != 2 || p.Services[1].Name != "worker" || p.Services[1].Action != "orphaned" {
+		t.Errorf("services = %+v, want worker reported as orphaned", p.Services)
 	}
 }
 

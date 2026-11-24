@@ -500,3 +500,17 @@ func TestLayoutPlatform(t *testing.T) {
 		}
 	}
 }
+
+// A layout's digests become paths, on the read and on the write.
+func TestImportRejectsADigestThatIsNotOne(t *testing.T) {
+	l := newLayout(t)
+	l.blob("sha256:man", map[string]any{
+		"config": map[string]any{"digest": "sha256:cfg"},
+		"layers": []any{map[string]any{"digest": "sha256:../../../escaped"}},
+	})
+	l.blob("sha256:cfg", map[string]any{"os": "linux", "architecture": "amd64"})
+	out := filepath.Join(t.TempDir(), "app")
+	if _, err := Import(l.top("sha256:man"), out, "app", ""); err == nil || !strings.Contains(err.Error(), "not a digest") {
+		t.Fatalf("err = %v, want the digest refused", err)
+	}
+}

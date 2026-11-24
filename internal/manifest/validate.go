@@ -30,6 +30,37 @@ func sizeBytes(s string) (int64, bool) {
 	return n << shift, true
 }
 
+// restartRE is docker's own set of restart policies. One it does not know fails
+// at create, which is after stages have run and artifacts have been swapped.
+var restartRE = regexp.MustCompile(`^(no|always|unless-stopped|on-failure(:[0-9]+)?)$`)
+
+// secretsProblems checks one [secrets] block, the manifest's own or a target's.
+func secretsProblems(s *Secrets) []string {
+	if s == nil {
+		return nil
+	}
+	var out []string
+	switch s.Provider {
+	case "file", "sops":
+		if s.Path == "" {
+			out = append(out, fmt.Sprintf("provider %q requires path", s.Provider))
+		}
+	case "env":
+		if len(s.Keys) == 0 {
+			out = append(out, `provider "env" requires keys`)
+		}
+	case "":
+		out = append(out, "provider is required")
+	default:
+		out = append(out, fmt.Sprintf("unknown provider %q (want file, env, or sops)", s.Provider))
+	}
+	// An unknown mode would fall back to environment delivery without a word.
+	if s.Mode != "" && s.Mode != "env" && s.Mode != "file" {
+		out = append(out, fmt.Sprintf("unknown mode %q (want env or file)", s.Mode))
+	}
+	return out
+}
+
 // memoryProblems catches at validate time what docker would only reject on the
 // host, at create.
 func memoryProblems(svc Service) []string {
@@ -109,6 +140,9 @@ func (m *Manifest) Validate() error {
 			add("service %q: health url %q is a path, so the service needs `expose` or a `publish` mapping with a host port",
 				name, svc.Health.URL)
 		}
+		if !restartRE.MatchString(svc.Restart) {
+			add("service %q: restart %q is not a docker restart policy (no, always, unless-stopped, on-failure[:N])", name, svc.Restart)
+		}
 		for _, problem := range memoryProblems(svc) {
 			add("service %q: %s", name, problem)
 		}
@@ -164,6 +198,9 @@ func (m *Manifest) Validate() error {
 		seenStage[st.Name] = true
 		if st.Image == "" {
 			add("stage %q: image is required", st.Name)
+		} else if _, built := m.Images[st.Image]; !built && !strings.ContainsAny(st.Image, ":/.") {
+			add("stage %q: image %q is not defined in [images.%s] and does not look like a pullable reference",
+				st.Name, st.Image, st.Image)
 		}
 		if len(st.Command) == 0 {
 			add("stage %q: command is required", st.Name)
@@ -200,26 +237,8 @@ func (m *Manifest) Validate() error {
 		}
 	}
 
-	if m.Secrets != nil {
-		switch m.Secrets.Provider {
-		case "file", "sops":
-			if m.Secrets.Path == "" {
-				add("secrets: provider %q requires path", m.Secrets.Provider)
-			}
-		case "env":
-			if len(m.Secrets.Keys) == 0 {
-				add("secrets: provider \"env\" requires keys")
-			}
-		case "":
-			add("secrets: provider is required")
-		default:
-			add("secrets: unknown provider %q (want file, env, or sops)", m.Secrets.Provider)
-		}
-		switch m.Secrets.Mode {
-		case "", "env", "file":
-		default:
-			add("secrets: unknown mode %q (want env or file)", m.Secrets.Mode)
-		}
+	for _, problem := range secretsProblems(m.Secrets) {
+		add("secrets: %s", problem)
 	}
 
 	for name, t := range m.Targets {
@@ -232,21 +251,8 @@ func (m *Manifest) Validate() error {
 		if t.Project != "" && !nameRE.MatchString(t.Project) {
 			add("target %q: project %q must be lowercase alphanumeric with - or _", name, t.Project)
 		}
-		if t.Secrets != nil {
-			switch t.Secrets.Provider {
-			case "file", "sops":
-				if t.Secrets.Path == "" {
-					add("target %q: secrets provider %q requires path", name, t.Secrets.Provider)
-				}
-			case "env":
-				if len(t.Secrets.Keys) == 0 {
-					add("target %q: secrets provider \"env\" requires keys", name)
-				}
-			case "":
-				add("target %q: secrets provider is required", name)
-			default:
-				add("target %q: unknown secrets provider %q", name, t.Secrets.Provider)
-			}
+		for _, problem := range secretsProblems(t.Secrets) {
+			add("target %q: secrets: %s", name, problem)
 		}
 	}
 

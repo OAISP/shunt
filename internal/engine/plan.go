@@ -58,7 +58,7 @@ type ImageChange struct {
 
 type ServiceChange struct {
 	Name    string   `json:"name"`
-	Action  string   `json:"action"` // create | update | unchanged | orphaned | drift
+	Action  string   `json:"action"` // create | update | unchanged | orphaned | drift | start
 	Reasons []string `json:"reasons,omitempty"`
 
 	// ZeroDowntime is true for proxied services, which start alongside the
@@ -156,9 +156,14 @@ func (p *Plan) Changed() bool {
 		}
 	}
 	for _, a := range p.Accessories {
-		if a.Action == "create" {
+		if a.Action == "create" || a.Action == "start" {
 			return true
 		}
+	}
+	// A rotated secret reaches a container only when it is recreated, and no
+	// service definition mentions the value, so nothing above would notice.
+	if len(p.Secrets.Added)+len(p.Secrets.Removed)+len(p.Secrets.Changed) > 0 {
+		return true
 	}
 	// Data is work in its own right: re-running an ETL and shipping only the
 	// new database is a deploy, even though no image or service changed.
@@ -233,8 +238,8 @@ func (e *Engine) BuildPlan(ctx context.Context, spec *release.Spec, built map[st
 					sc.Action = "update"
 				}
 				// An overlap is only safe when the proxy labels are unchanged;
-				// see sameProxy in the helper.
-				if !reflect.DeepEqual(old.Proxy, svc.Proxy) {
+				// see canOverlap in the helper.
+				if !reflect.DeepEqual(old.Proxy, svc.Proxy) || release.HealthProbePath(old) != release.HealthProbePath(svc) {
 					sc.ZeroDowntime = false
 					sc.Reasons = append(sc.Reasons,
 						"proxy config changed — this one deploy stops the old container first")
@@ -252,11 +257,25 @@ func (e *Engine) BuildPlan(ctx context.Context, spec *release.Spec, built map[st
 		}
 		p.Services = append(p.Services, sc)
 	}
+	// From the containers as well as the last release: one deploy after a
+	// service is dropped, the last release no longer mentions it either, while
+	// its container is still running.
+	orphans := map[string]bool{}
 	if oldSpec != nil {
-		for _, name := range slices.Sorted(maps.Keys(oldSpec.Services)) {
-			if _, ok := spec.Services[name]; !ok {
-				p.Services = append(p.Services, orphanChange(state, name))
+		for name := range oldSpec.Services {
+			orphans[name] = true
+		}
+	}
+	if state != nil {
+		for _, c := range state.Containers {
+			if c.Kind == "service" && c.Service != "" {
+				orphans[c.Service] = true
 			}
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(orphans)) {
+		if _, ok := spec.Services[name]; !ok {
+			p.Services = append(p.Services, orphanChange(state, name))
 		}
 	}
 
@@ -341,6 +360,18 @@ func (e *Engine) planAccessories(p *Plan, spec *release.Spec, state *RemoteState
 					ac.Action = "drift"
 					ac.Reasons = append(reasons, hint+name+"` to recreate")
 				}
+			}
+		}
+		// The ledger says an accessory was booted; only the containers say whether
+		// it is still there. A deploy boots one that is gone and starts one that
+		// has stopped, so both are work.
+		if ac.Action != "create" && state != nil {
+			switch found := state.ServiceContainers(name); {
+			case len(found) == 0:
+				ac = ServiceChange{Name: name, Action: "create"}
+			case !found[0].Running():
+				ac.Action = "start"
+				ac.Reasons = []string{fmt.Sprintf("container %s is %s, not running", found[0].Name, orUnknown(found[0].State))}
 			}
 		}
 		out = append(out, ac)

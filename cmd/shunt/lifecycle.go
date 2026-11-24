@@ -43,8 +43,8 @@ func cmdRollback(ctx context.Context, args []string) error {
 		want = prev.ID
 	}
 
-	s := c.out()
-	fmt.Printf("\n  roll back %s → %s\n", st.Ledger.Current, s.Bold(want))
+	s := c.err()
+	fmt.Fprintf(os.Stderr, "\n  roll back %s → %s\n", st.Ledger.Current, s.Bold(want))
 	ok, err := confirmed(yes, "  proceed?")
 	if err != nil || !ok {
 		return err
@@ -98,16 +98,16 @@ func cmdRetire(ctx context.Context, args []string) error {
 	}
 	running := state.ServiceContainers(name)
 	if len(running) == 0 {
-		fmt.Printf("\n  nothing on %s is running for %q\n", e.M.Host, name)
+		fmt.Fprintf(os.Stderr, "\n  nothing on %s is running for %q\n", e.M.Host, name)
 		return nil
 	}
 
-	s := c.out()
-	fmt.Printf("\n  retire %s on %s\n", s.Bold(name), e.M.Host)
+	s := c.err()
+	fmt.Fprintf(os.Stderr, "\n  retire %s on %s\n", s.Bold(name), e.M.Host)
 	for _, ct := range running {
-		fmt.Printf("    %s  %s\n", ct.Name, s.Dim(ct.Status))
+		fmt.Fprintf(os.Stderr, "    %s  %s\n", ct.Name, s.Dim(ct.Status))
 	}
-	fmt.Printf("  %s\n", s.Amber("this stops and removes the container(s) above"))
+	fmt.Fprintf(os.Stderr, "  %s\n", s.Amber("this stops and removes the container(s) above"))
 	ok, err := confirmed(yes, "  proceed?")
 	if err != nil || !ok {
 		return err
@@ -155,9 +155,9 @@ func cmdBoot(ctx context.Context, args []string) error {
 		return err
 	}
 
-	s := c.out()
-	fmt.Printf("\n  recreate accessory %s on %s\n", s.Bold(name), e.M.Host)
-	fmt.Printf("  %s — data survives only in named volumes\n", s.Amber("this destroys the running container"))
+	s := c.err()
+	fmt.Fprintf(os.Stderr, "\n  recreate accessory %s on %s\n", s.Bold(name), e.M.Host)
+	fmt.Fprintf(os.Stderr, "  %s — data survives only in named volumes\n", s.Amber("this destroys the running container"))
 	ok, err := confirmed(yes, "  proceed?")
 	if err != nil || !ok {
 		return err

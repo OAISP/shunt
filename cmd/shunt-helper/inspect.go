@@ -154,7 +154,8 @@ func existingParent(p string) string {
 }
 
 // statPath summarises an artifact destination and checks its directory can
-// receive the staged copy that lands beside it.
+// receive the staged copy that lands beside it. It only looks: a plan must not
+// change the host, so a missing directory is created by the transfer instead.
 func statPath(dest string) release.PathState {
 	st := release.PathState{Size: -1}
 	if fi, err := os.Stat(dest); err == nil {
@@ -164,10 +165,12 @@ func statPath(dest string) release.PathState {
 		}
 	}
 	dir := filepath.Dir(dest)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		st.Problem = dir + " could not be created"
-	} else if syscall.Access(dir, 2 /* W_OK */) != nil {
+	switch parent := existingParent(dir); {
+	case syscall.Access(parent, 2 /* W_OK */) == nil:
+	case parent == dir:
 		st.Problem = dir + " is not writable"
+	default:
+		st.Problem = dir + " could not be created"
 	}
 	return st
 }

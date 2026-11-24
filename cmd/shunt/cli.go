@@ -241,7 +241,7 @@ func prepare(ctx context.Context, c *commonFlags, noCache bool) (*buildOut, erro
 // confirm asks a yes/no question. Callers must only reach it when stdin is a
 // terminal, so CI never blocks on a prompt nobody can answer.
 func confirm(prompt string) (bool, error) {
-	fmt.Printf("%s [y/N] ", prompt)
+	fmt.Fprintf(os.Stderr, "%s [y/N] ", prompt)
 	sc := bufio.NewScanner(os.Stdin)
 	if !sc.Scan() {
 		return false, sc.Err()
@@ -261,7 +261,7 @@ func confirmed(yes bool, prompt string) (bool, error) {
 		return false, err
 	}
 	if !ok {
-		fmt.Println("  aborted")
+		fmt.Fprintln(os.Stderr, "  aborted")
 	}
 	return ok, nil
 }

@@ -75,6 +75,9 @@ func (p *Plan) renderAccessories(w io.Writer, s ui.Style) {
 			fmt.Fprintf(w, "    %s\n", s.Dim(fmt.Sprintf("%-*s running", nameCol, a.Name)))
 		case "create":
 			fmt.Fprintf(w, "  %s %-*s boot\n", s.Add(), nameCol, a.Name)
+		case "start":
+			fmt.Fprintf(w, "  %s %-*s start\n", s.Change(), nameCol, a.Name)
+			renderReasons(w, s, a.Reasons)
 		case "drift":
 			fmt.Fprintf(w, "  %s %-*s %s\n", s.Warn(), nameCol, a.Name, s.Amber("drifted from shunt.toml"))
 			renderReasons(w, s, a.Reasons)

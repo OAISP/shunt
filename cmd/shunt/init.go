@@ -59,8 +59,9 @@ dockerfile = "Dockerfile"
 # architecture mismatch is the single most common first-deploy failure.
 # platform = "linux/amd64"
 
-# Secrets are resolved on your machine and streamed to the host over ssh into a
-# 0600 env-file. They never enter the image, argv, or ` + "`docker inspect`" + `.
+# Secrets are resolved on your machine and streamed to the host over ssh into
+# 0600 files. They never enter the image or argv; mode = "file" also keeps them
+# out of ` + "`docker inspect`" + `.
 # [secrets]
 # provider = "file"     # file | env | sops
 # path     = "secrets/prod.env"
