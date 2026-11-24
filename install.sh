@@ -4,7 +4,7 @@
 #   curl -sSL https://raw.githubusercontent.com/OAISP/shunt/main/install.sh | sh
 #
 # Environment:
-#   SHUNT_VERSION   pin a release, e.g. v0.3.0 (default: latest)
+#   SHUNT_VERSION   pin a release, e.g. v0.4.0 (default: latest)
 #   SHUNT_SKIP_VERIFY=1   install even when the checksum cannot be verified
 #   PREFIX          install directory (default: /usr/local/bin, else ~/.local/bin)
 #
