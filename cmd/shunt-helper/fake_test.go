@@ -1,6 +1,9 @@
 package main
 
-import "strings"
+import (
+	"strings"
+	"time"
+)
 
 // fakeRunner records what it was asked to do and replays scripted answers.
 //
@@ -36,6 +39,10 @@ func (f *fakeRunner) Run(name string, args ...string) (string, error) {
 	return "", nil
 }
 
+func (f *fakeRunner) RunFor(_ time.Duration, name string, args ...string) (string, error) {
+	return f.Run(name, args...)
+}
+
 func (f *fakeRunner) Ok(name string, args ...string) bool {
 	_, err := f.Run(name, args...)
 	return err == nil
@@ -63,6 +70,9 @@ func (f *fakeRunner) did(parts ...string) bool {
 type runnerFunc func(name string, args ...string) (string, error)
 
 func (r runnerFunc) Run(name string, args ...string) (string, error) { return r(name, args...) }
+func (r runnerFunc) RunFor(_ time.Duration, name string, args ...string) (string, error) {
+	return r(name, args...)
+}
 func (r runnerFunc) Ok(name string, args ...string) bool {
 	_, err := r(name, args...)
 	return err == nil

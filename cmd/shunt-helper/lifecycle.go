@@ -63,10 +63,18 @@ func cmdRollback(args []string) error {
 			}
 		}
 		outgoing := previousSpec(ledger)
-		if _, _, err := swapServices(spec, outgoing, envFile); err != nil {
-			return err
+		_, mutated, err := swapServices(spec, outgoing, envFile)
+		if err == nil {
+			err = healthCheck(spec)
+			mutated = mutated || err != nil
 		}
-		if err := healthCheck(spec); err != nil {
+		if err != nil {
+			// The host is now a mix that the ledger would go on calling active.
+			if cur := ledger.Find(ledger.Current); mutated && cur != nil {
+				cur.Status = release.StatusDegraded
+				cur.Error = "rollback to " + target.ID + " failed: " + err.Error()
+				err = errors.Join(err, saveLedger(ledger))
+			}
 			return err
 		}
 		// Only once the restore is proven good. Removing the newer release's

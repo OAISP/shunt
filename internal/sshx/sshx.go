@@ -166,16 +166,24 @@ func (c *Client) Interactive(ctx context.Context, argv ...string) error {
 // Upload copies a local file to the host with the given mode, via a single
 // `cat > file` over the multiplexed connection. Used for the helper binary and
 // nothing else; bulk data goes through rsync.
+//
+// The size is checked before the file is moved into place: a session that drops
+// mid-upload ends `cat` with a clean EOF, and a truncated helper installed under
+// its content-addressed name would be trusted from then on.
 func (c *Client) Upload(ctx context.Context, local, remote string, mode os.FileMode) error {
 	f, err := os.Open(local)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
 
-	script := fmt.Sprintf("mkdir -p %s && cat > %s.tmp && chmod %o %s.tmp && mv -f %s.tmp %s",
-		shellQuote(filepath.Dir(remote)), shellQuote(remote), mode.Perm(),
-		shellQuote(remote), shellQuote(remote), shellQuote(remote))
+	tmp := shellQuote(remote) + ".$$" // per shell, so concurrent uploads do not collide
+	script := fmt.Sprintf(`mkdir -p %s && cat > %s && [ "$(wc -c < %s)" -eq %d ] && chmod %o %s && mv -f %s %s || { rm -f %s; exit 1; }`,
+		shellQuote(filepath.Dir(remote)), tmp, tmp, fi.Size(), mode.Perm(), tmp, tmp, shellQuote(remote), tmp)
 
 	args := append(c.baseArgs(), c.Host, "--", script)
 	cmd := exec.CommandContext(ctx, "ssh", args...)

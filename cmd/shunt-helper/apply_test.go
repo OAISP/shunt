@@ -3,10 +3,13 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/OAISP/shunt/internal/release"
 )
@@ -117,5 +120,20 @@ func TestPlanReportsStoreAndArtifactDestinations(t *testing.T) {
 	}
 	if st.Disk == nil || st.Disk.StoreFree <= 0 || !st.Disk.Shared {
 		t.Errorf("disk = %+v, want free space on one shared filesystem", st.Disk)
+	}
+}
+
+// A client that vanishes without closing the connection sends neither a spec
+// nor EOF, and would hold the lock until TCP noticed.
+func TestASilentClientLosesTheLock(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	in, heard := untilSilent(pr, 20*time.Millisecond)
+	defer heard.Stop()
+
+	go pw.Write([]byte("\n")) // one heartbeat, then nothing
+	var spec release.Spec
+	if err := json.NewDecoder(in).Decode(&spec); !errors.Is(err, errSilent) {
+		t.Fatalf("err = %v, want the session given up", err)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"time"
 
 	"github.com/OAISP/shunt/internal/release"
 )
@@ -21,6 +22,9 @@ type Deploy struct {
 	stdin  io.WriteCloser
 	events *events
 	done   bool
+	// stopBeat ends the heartbeat and waits for it, so it cannot write into the
+	// middle of the spec.
+	stopBeat func()
 
 	// Serving is the release the host was serving when the lock was taken.
 	Serving string
@@ -33,6 +37,7 @@ func (e *Engine) BeginDeploy(ctx context.Context, notify func(string)) (*Deploy,
 		return nil, fmt.Errorf("open deploy session on %s: %w", e.M.Host, err)
 	}
 	d := &Deploy{cmd: cmd, stdin: stdin, events: newEvents(stdout)}
+	d.stopBeat = heartbeat(stdin)
 	for {
 		ev, ok := d.events.next()
 		if !ok {
@@ -54,6 +59,26 @@ func (e *Engine) BeginDeploy(ctx context.Context, notify func(string)) (*Deploy,
 	}
 }
 
+// heartbeat writes a newline to the helper every interval — whitespace its JSON
+// decoder skips — until the returned function is called.
+func heartbeat(w io.Writer) (stop func()) {
+	quit, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		t := time.NewTicker(release.HeartbeatInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-quit:
+				return
+			case <-t.C:
+				w.Write([]byte("\n"))
+			}
+		}
+	}()
+	return func() { close(quit); <-done }
+}
+
 // Apply hands the spec to the helper and renders the deploy as it happens.
 func (d *Deploy) Apply(ctx context.Context, spec *release.Spec, r EventRenderer) error {
 	b, err := json.Marshal(spec)
@@ -61,6 +86,7 @@ func (d *Deploy) Apply(ctx context.Context, spec *release.Spec, r EventRenderer)
 		return err
 	}
 	d.done = true
+	d.stopBeat()
 	_, werr := d.stdin.Write(b)
 	d.stdin.Close()
 	for ev, ok := d.events.next(); ok; ev, ok = d.events.next() {
@@ -81,6 +107,7 @@ func (d *Deploy) Close() {
 		return
 	}
 	d.done = true
+	d.stopBeat()
 	d.stdin.Close()
 	d.events.drain()
 	d.cmd.Wait()

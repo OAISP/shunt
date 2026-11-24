@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/OAISP/shunt/internal/release"
@@ -75,34 +76,14 @@ func proxyLabels(spec *release.Spec, name string, svc release.Service) []string 
 	return out
 }
 
-// sameProxy reports whether two releases would emit identical proxy labels.
+// canOverlap reports whether the new container for a proxied service may run
+// alongside the old one, which is only when both carry identical proxy labels.
 //
 // This matters more than it looks: a label-discovered router is defined by every
 // container carrying its labels, and Traefik refuses to serve a router that two
 // containers define differently — it drops the route entirely, which is a total
-// outage rather than a blip. So an overlap is only safe when the proxy config is
-// unchanged.
-func sameProxy(a, b *release.Proxy) bool {
-	if a == nil || b == nil {
-		return a == b
-	}
-	if a.Kind != b.Kind || a.Host != b.Host || a.Path != b.Path || a.Port != b.Port || a.Retry != b.Retry {
-		return false
-	}
-	if len(a.EntryPoints) != len(b.EntryPoints) {
-		return false
-	}
-	for i := range a.EntryPoints {
-		if a.EntryPoints[i] != b.EntryPoints[i] {
-			return false
-		}
-	}
-	return true
-}
-
-// canOverlap reports whether the new container for a proxied service may run
-// alongside the old one.
-func canOverlap(prev *release.Spec, name string, svc release.Service) bool {
+// outage rather than a blip.
+func canOverlap(prev, spec *release.Spec, name string) bool {
 	if prev == nil {
 		return true
 	}
@@ -110,5 +91,5 @@ func canOverlap(prev *release.Spec, name string, svc release.Service) bool {
 	if !present {
 		return true
 	}
-	return sameProxy(old.Proxy, svc.Proxy)
+	return slices.Equal(proxyLabels(prev, name, old), proxyLabels(spec, name, spec.Services[name]))
 }

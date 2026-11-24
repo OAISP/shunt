@@ -51,7 +51,7 @@ func TestDownRemovesDependentsFirstAndAccessoriesLast(t *testing.T) {
 
 	var order []string
 	for _, c := range f.calls {
-		if name, found := strings.CutPrefix(c, "docker stop --timeout 30 "); found {
+		if name, found := strings.CutPrefix(c, "docker stop -t 30 "); found {
 			order = append(order, name)
 		}
 	}

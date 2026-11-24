@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"fmt"
 	"io"
 	"net"
@@ -85,6 +86,10 @@ func waitHealthy(spec *release.Spec, order []string, set map[string]release.Serv
 	return nil
 }
 
+// probeTimeout bounds one probe. Without it a health command that blocks would
+// hold the deploy lock, and an in-place service's gap, open indefinitely.
+const probeTimeout = 30 * time.Second
+
 // probe runs one health check.
 //
 // An absolute url is fetched as-is, which matches a service with a published
@@ -95,17 +100,22 @@ func waitHealthy(spec *release.Spec, order []string, set map[string]release.Serv
 func probe(spec *release.Spec, container string, svc release.Service, h *release.Health) (string, error) {
 	if h.URL != "" {
 		target := h.URL
+		// A proxied service is always probed on its own address: an absolute url
+		// goes through the proxy, where the container being replaced answers it.
+		if svc.Proxied() {
+			target = cmp.Or(release.HealthProbePath(svc), "/")
+		}
 		if strings.HasPrefix(target, "/") {
 			base, err := probeBase(spec, container, svc)
 			if err != nil {
 				return "", err
 			}
-			target = base + h.URL
+			target = base + target
 		}
 		return probeURL(target, h.Follow)
 	}
 	args := append([]string{"exec", container}, h.Command...)
-	out, err := docker.Run("docker", args...)
+	out, err := docker.RunFor(probeTimeout, "docker", args...)
 	if err != nil {
 		return "", fmt.Errorf("%v: %s", err, strings.TrimSpace(out))
 	}
@@ -173,7 +183,7 @@ func publishedHostPort(svc release.Service) (host, port string, ok bool) {
 // historical default and stays for compatibility, but follow asks for the
 // stronger gate: chase the redirect and require the page at the end of it.
 func probeURL(target string, follow bool) (string, error) {
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: probeTimeout}
 	if !follow {
 		client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	}

@@ -31,10 +31,15 @@ func cmdApply(args []string, in io.Reader) error {
 		emit(release.Event{Kind: release.KindHeld, Release: ledger.Current})
 
 		var spec release.Spec
-		if err := json.NewDecoder(in).Decode(&spec); err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
+		in, heard := untilSilent(in, release.HeartbeatTimeout)
+		err = json.NewDecoder(in).Decode(&spec)
+		heard.Stop()
+		switch {
+		case errors.Is(err, io.EOF):
+			return nil
+		case errors.Is(err, errSilent):
+			return err
+		case err != nil:
 			return fmt.Errorf("decode release spec: %w", err)
 		}
 		if spec.Protocol != release.Protocol {
@@ -49,6 +54,31 @@ func cmdApply(args []string, in io.Reader) error {
 		}
 		return apply(&spec)
 	})
+}
+
+var errSilent = errors.New("the CLI went silent before sending the release — giving up the deploy lock")
+
+// untilSilent relays in, and fails the read once nothing has arrived for limit.
+// The returned timer is stopped when the spec is in: applying it takes as long
+// as it takes.
+func untilSilent(in io.Reader, limit time.Duration) (io.Reader, *time.Timer) {
+	pr, pw := io.Pipe()
+	silent := time.AfterFunc(limit, func() { pw.CloseWithError(errSilent) })
+	go func() {
+		buf := make([]byte, 32<<10)
+		for {
+			n, err := in.Read(buf)
+			silent.Reset(limit)
+			if n > 0 {
+				pw.Write(buf[:n])
+			}
+			if err != nil {
+				pw.CloseWithError(err)
+				return
+			}
+		}
+	}()
+	return pr, silent
 }
 
 func apply(spec *release.Spec) error {
@@ -138,7 +168,8 @@ func apply(spec *release.Spec) error {
 
 	// Data lands after stages and before services, so the swap is as late as it
 	// can be while the old container still holds the old inode.
-	if err := swapArtifacts(spec); err != nil {
+	promoted, err := swapArtifacts(spec)
+	if err != nil {
 		return finish(fmt.Errorf("%w\n  no services were replaced — production is untouched", err))
 	}
 
@@ -149,6 +180,8 @@ func apply(spec *release.Spec) error {
 		if mutated {
 			err = fmt.Errorf("%w\n  this host is now running a mix of releases — `shunt rollback` restores the previous one%s",
 				err, artifactRecovery(spec))
+		} else {
+			err = fmt.Errorf("%w%s", err, undoPromotions(promoted))
 		}
 		return finish(err)
 	}
@@ -170,7 +203,12 @@ func apply(spec *release.Spec) error {
 	}
 	pruneEnvFiles(spec.Project, keepIDs)
 	pruneSecretDirs(spec.Project, keepIDs)
+	settleArtifacts(spec)
 
+	// Success is announced only once it is on record.
+	if err := finish(nil); err != nil {
+		return err
+	}
 	emit(release.Event{Kind: release.KindResult, Release: spec.ID, Status: release.StatusActive})
-	return finish(nil)
+	return nil
 }

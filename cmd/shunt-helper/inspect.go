@@ -404,16 +404,26 @@ func projectImages(project string, ledger *release.Ledger, current *release.Spec
 // Gated together deliberately, for the same reason: these are the only
 // plaintext copy of a release's secrets, so dropping one while its images
 // survive leaves a release that looks restorable and is not.
+//
+// A directory some container still mounts is kept whatever the ledger says: an
+// accessory is never recreated, so it goes on mounting the directory of the
+// release that booted it long after that release has left the keep set.
 func pruneSecretDirs(project string, keepIDs map[string]bool) {
 	dir := filepath.Join(projectDir(project), "secrets")
 	ents, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
+	out, err := docker.Run("docker", "ps", "-a", "--filter", "label=shunt.project="+project,
+		"--format", "{{.Label \"shunt.release\"}}")
+	if err != nil {
+		return // not knowing what is mounted is no time to delete
+	}
+	mounted := splitLines(out)
 	for _, e := range ents {
 		// "<id>" or, for a narrowed service, "<id>.<scope>".
 		id, _, _ := strings.Cut(e.Name(), ".")
-		if !keepIDs[id] {
+		if !keepIDs[id] && !slices.Contains(mounted, id) {
 			os.RemoveAll(filepath.Join(dir, e.Name()))
 		}
 	}

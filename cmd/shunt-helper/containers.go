@@ -20,9 +20,10 @@ func releaseContainerName(project, service, releaseID string) string {
 
 // serviceContainer picks the naming scheme: proxied services are blue/green and
 // need a unique name per release; everything else keeps a stable name, because
-// a published host port allows only one container at a time anyway.
+// a published host port allows only one container at a time anyway. So does an
+// accessory, proxied or not: it is booted once and found again by that name.
 func serviceContainer(spec *release.Spec, name string, svc release.Service) string {
-	if svc.Proxied() {
+	if _, accessory := spec.Accessories[name]; svc.Proxied() && !accessory {
 		return releaseContainerName(spec.Project, name, spec.ID)
 	}
 	return containerName(spec.Project, name)
@@ -45,7 +46,8 @@ func stopAndRemove(container string, drain int) bool {
 		return false
 	}
 	start := time.Now()
-	docker.Ok("docker", "stop", "--timeout", fmt.Sprint(drain), container)
+	// -t, not --timeout: docker only learned the long name in 28.
+	docker.Ok("docker", "stop", "-t", fmt.Sprint(drain), container)
 	took := time.Since(start)
 	docker.Ok("docker", "rm", "-f", container)
 
@@ -149,6 +151,15 @@ func retireUndeclaredServices(spec, outgoing *release.Spec) {
 		stopAndRemove(f[0], drain)
 		ok("rollback", f[0]+" removed; it belonged to the release being undone")
 	}
+}
+
+// servesRelease reports whether a container is already running this release's
+// definition of a service — as it is when a rollback returns to a release whose
+// container a failed deploy never got as far as replacing.
+func servesRelease(container string, spec *release.Spec, svc release.Service) bool {
+	out, err := docker.Run("docker", "inspect", "-f",
+		`{{.State.Running}} {{index .Config.Labels "shunt.release"}} {{index .Config.Labels "shunt.config"}}`, container)
+	return err == nil && strings.TrimSpace(out) == "true "+spec.ID+" "+release.HashService(svc)
 }
 
 // containerExists reports whether a container of that name is present in any
@@ -323,6 +334,15 @@ func swapServices(spec, prev *release.Spec, envFile string) (started []string, m
 		}
 		container := serviceContainer(spec, name, svc)
 
+		// Stopping it only to start the same thing again would be a gap for
+		// nothing; what is left of a newer release beside it still has to go.
+		if servesRelease(container, spec, svc) {
+			retireOldContainers(spec, name, svc)
+			started = append(started, name)
+			ok("swap:"+name, container+" is already running this release")
+			continue
+		}
+
 		if !svc.Proxied() {
 			step("swap:"+name, "replacing "+container)
 			replaced, err := startContainer(spec, name, svc, envFile, "service")
@@ -353,7 +373,8 @@ func swapServices(spec, prev *release.Spec, envFile string) (started []string, m
 
 		// Changing the proxy config makes an overlap unsafe, so this one deploy
 		// degrades to stop-then-start: a short gap instead of a dropped route.
-		if !canOverlap(prev, name, svc) {
+		overlap := canOverlap(prev, spec, name)
+		if !overlap {
 			info("proxy config for " + name + " changed — retiring the old container first to avoid a router conflict (brief gap)")
 			mutated = true
 			retireOldContainers(spec, name, svc)
@@ -368,7 +389,11 @@ func swapServices(spec, prev *release.Spec, envFile string) (started []string, m
 		// Nothing was replaced, so this alone does not count as mutating.
 		if err := waitHealthy(spec, []string{name}, spec.Services); err != nil {
 			stopAndRemove(container, 0)
-			return started, mutated, fmt.Errorf("%w\n  the new container was removed; the previous release is still serving", err)
+			left := "the previous release is still serving"
+			if !overlap {
+				left = "the previous one was already retired, so " + name + " is down"
+			}
+			return started, mutated, fmt.Errorf("%w\n  the new container was removed; %s", err, left)
 		}
 		started = append(started, name)
 		ok("swap:"+name, container+" healthy and in rotation")
