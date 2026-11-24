@@ -35,6 +35,8 @@ init    = true
 | `secrets` | all of them | The secret keys this service receives. |
 | `drain` | `10s` | How long a stopped container gets to finish in-flight work. |
 | `init` | `false` | Run a minimal init as PID 1. See [stopping cleanly](#stopping-cleanly). |
+| `memory` | unlimited | A memory limit, such as `512m` or `1g`. See [memory limits](#memory-limits). |
+| `memory_swap` | twice `memory` | Memory plus swap, such as `1536m`; `-1` for unlimited swap. |
 | `proxy` | none | Makes the service blue/green. See [Zero-downtime]({% link deploying/zero-downtime.md %}). |
 | `health` | none | A readiness check that gates the release. |
 
@@ -68,6 +70,31 @@ handler: the kernel gives PID 1 no default handlers, so the signal is ignored.
 `init = true` runs a minimal init as PID 1 in front of your process (Docker's
 `--init`), which forwards the signal so the default action applies. An app that
 handles SIGTERM itself does not need it.
+
+## Memory limits
+
+A container with no limit can take the whole server into swap, and its
+neighbours with it. `memory` caps one:
+
+```toml
+[services.app]
+image       = "app"
+memory      = "1g"
+memory_swap = "1536m"    # 1g of memory plus 512m of swap
+```
+
+Both are Docker's `--memory` and `--memory-swap`, set when the container is
+created, so it never runs unlimited. A size is a whole number with `b`, `k`,
+`m` or `g`, and at least `6m`. `memory_swap` is the total of memory and swap,
+not the swap alone: set it equal to `memory` to allow no swap, or to `-1` to
+allow as much as the server has. Left out, Docker allows as much swap again as
+`memory`.
+
+A process that exceeds its limit is killed by the kernel, and the container's
+`restart` policy starts it again. A changed limit shows in `shunt plan` and
+applies on the next deploy; a rollback restores the limits of the release it
+returns to. On an [accessory]({% link manifest/accessories.md %}#changing-one) a
+changed limit needs `shunt boot`, like any other change to one.
 
 ## Dependencies
 

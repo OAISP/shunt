@@ -178,6 +178,12 @@ func startContainer(spec *release.Spec, name string, svc release.Service, envFil
 	if svc.Init {
 		args = append(args, "--init")
 	}
+	if svc.Memory != "" {
+		args = append(args, "--memory", svc.Memory)
+	}
+	if svc.MemorySwap != "" {
+		args = append(args, "--memory-swap", svc.MemorySwap)
+	}
 	if spec.Network != "" {
 		args = append(args, "--network", spec.Network, "--network-alias", name)
 	}

@@ -548,6 +548,22 @@ func TestEstimateTransferCountsWhatTheStoreLacks(t *testing.T) {
 	}
 }
 
+func TestMemoryChangeIsAServiceChange(t *testing.T) {
+	plain := release.Service{Image: "app"}
+	limited := release.Service{Image: "app", Memory: "1g", MemorySwap: "1536m"}
+	if r := diffService(plain, limited); len(r) != 2 {
+		t.Errorf("reasons = %v, want both limits reported", r)
+	}
+	if release.HashService(plain) == release.HashService(limited) {
+		t.Error("a limit did not change the hash, so plan would not see it")
+	}
+	// Containers created before limits existed carry this hash in a label; if it
+	// moved, upgrading shunt alone would read as drift on every service.
+	if got := release.HashService(plain); got != "h:0496518af39e0f84" {
+		t.Errorf("hash of a service with no limits = %s; it must not move", got)
+	}
+}
+
 func TestInitChangeIsAServiceChange(t *testing.T) {
 	if r := diffService(release.Service{Image: "app"}, release.Service{Image: "app", Init: true}); len(r) != 1 {
 		t.Errorf("reasons = %v, want the init change reported", r)

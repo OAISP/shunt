@@ -430,6 +430,9 @@ func convertServices(in map[string]manifest.Service) (map[string]release.Service
 			Expose:   s.Expose,
 			Drain:    s.Drain.String(),
 			Init:     s.Init,
+
+			Memory:     s.Memory,
+			MemorySwap: s.MemorySwap,
 		}
 		if s.Proxy != nil {
 			rs.Proxy = &release.Proxy{

@@ -160,6 +160,12 @@ func diffService(old, nw release.Service) []string {
 	if old.Init != nw.Init {
 		r = append(r, fmt.Sprintf("init %v → %v", old.Init, nw.Init))
 	}
+	if old.Memory != nw.Memory {
+		r = append(r, fmt.Sprintf("memory %s → %s", orUnset(old.Memory), orUnset(nw.Memory)))
+	}
+	if old.MemorySwap != nw.MemorySwap {
+		r = append(r, fmt.Sprintf("memory_swap %s → %s", orUnset(old.MemorySwap), orUnset(nw.MemorySwap)))
+	}
 	if !reflect.DeepEqual(old.Proxy, nw.Proxy) {
 		switch {
 		case old.Proxy == nil:
@@ -187,6 +193,13 @@ func diffService(old, nw release.Service) []string {
 		}
 	}
 	return r
+}
+
+func orUnset(s string) string {
+	if s == "" {
+		return "unset"
+	}
+	return s
 }
 
 // diffRelease reports settings that apply to the whole release rather than to

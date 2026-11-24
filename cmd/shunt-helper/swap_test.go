@@ -545,3 +545,20 @@ func TestRollbackIgnoresUnlabelledContainers(t *testing.T) {
 		t.Fatal("an unattributable container was removed")
 	}
 }
+
+// Passed to create rather than applied afterwards, so the container never runs
+// without its limit.
+func TestMemoryLimitsAreSetAtCreate(t *testing.T) {
+	f := newFake()
+	withFake(t, f)
+
+	spec := svcSpec(map[string]release.Service{
+		"app": {Image: "app", Restart: "always", Memory: "1g", MemorySwap: "1536m"},
+	}, "app")
+	if _, _, err := swapServices(spec, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	if !f.did("docker create", "--memory 1g", "--memory-swap 1536m") {
+		t.Errorf("create did not carry the limits:\n%s", strings.Join(f.calls, "\n"))
+	}
+}

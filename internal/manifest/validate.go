@@ -2,14 +2,60 @@ package manifest
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 )
 
-var nameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
+var (
+	nameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
+	sizeRE = regexp.MustCompile(`^([0-9]+)([bkmg]?)$`)
+)
+
+// sizeBytes parses a docker memory size: an integer with an optional b, k, m or g.
+func sizeBytes(s string) (int64, bool) {
+	m := sizeRE.FindStringSubmatch(strings.ToLower(s))
+	if m == nil {
+		return 0, false
+	}
+	shift := 10 * strings.Index("bkmg", m[2])
+	n, err := strconv.ParseInt(m[1], 10, 64)
+	if err != nil || n > math.MaxInt64>>shift {
+		return 0, false
+	}
+	return n << shift, true
+}
+
+// memoryProblems catches at validate time what docker would only reject on the
+// host, at create.
+func memoryProblems(svc Service) []string {
+	var out []string
+	mem, memOK := sizeBytes(svc.Memory)
+	switch {
+	case svc.Memory == "":
+	case !memOK:
+		out = append(out, fmt.Sprintf("memory %q is not a size such as 512m or 1g", svc.Memory))
+	case mem < 6<<20:
+		out = append(out, fmt.Sprintf("memory %q is below docker's 6m minimum", svc.Memory))
+	}
+	if svc.MemorySwap == "" || svc.MemorySwap == "-1" {
+		return out
+	}
+	swap, ok := sizeBytes(svc.MemorySwap)
+	switch {
+	case !ok:
+		out = append(out, fmt.Sprintf("memory_swap %q is not a size such as 1536m, or -1 for unlimited swap", svc.MemorySwap))
+	case svc.Memory == "":
+		out = append(out, "memory_swap is memory plus swap, so it needs memory set as well")
+	case memOK && swap < mem:
+		out = append(out, fmt.Sprintf("memory_swap %q is memory plus swap, so it cannot be less than memory %q", svc.MemorySwap, svc.Memory))
+	}
+	return out
+}
 
 func (m *Manifest) Validate() error {
 	var errs []string
@@ -62,6 +108,9 @@ func (m *Manifest) Validate() error {
 			svc.Expose == 0 && svc.ProxyPort() == 0 && !svc.HasPublishedPort() {
 			add("service %q: health url %q is a path, so the service needs `expose` or a `publish` mapping with a host port",
 				name, svc.Health.URL)
+		}
+		for _, problem := range memoryProblems(svc) {
+			add("service %q: %s", name, problem)
 		}
 		if p := svc.Proxy; p != nil {
 			switch p.Kind {

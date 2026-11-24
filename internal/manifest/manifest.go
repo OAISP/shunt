@@ -127,6 +127,11 @@ type Service struct {
 	// sits out the whole drain before it is killed; under an init it exits.
 	Init bool `toml:"init"`
 
+	// Memory and MemorySwap cap the container, in docker's own syntax.
+	// MemorySwap is memory plus swap; left unset, docker allows twice Memory.
+	Memory     string `toml:"memory"`
+	MemorySwap string `toml:"memory_swap"`
+
 	// Proxy turns this service blue/green: each release runs under its own
 	// container name and an external proxy is told about it via labels.
 	Proxy *Proxy `toml:"proxy"`

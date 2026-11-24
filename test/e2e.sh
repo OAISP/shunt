@@ -110,9 +110,11 @@ retries = 20
 image   = "app"
 command = ["sh", "-c", "while true; do echo tick; sleep 5; done"]
 init    = true
+memory  = "64m"
 EOF
 
 served() { ssh -o BatchMode=yes "$HOST" "curl -sS --max-time 5 http://127.0.0.1:$PORT/index.html"; }
+memory() { ssh -o BatchMode=yes "$HOST" "docker inspect -f '{{.HostConfig.Memory}}' $PROJECT-worker"; }
 current() { "$SHUNT" status --json </dev/null 2>/dev/null | grep -o '"current":"[^"]*"' | head -1 | cut -d'"' -f4; }
 
 # ------------------------------------------------------------- offline ----
@@ -126,6 +128,7 @@ step "first deploy"
 eq "the app serves v1" "$(served)" "v1"
 R1="$(current)"
 neq "a release was recorded" "$R1" ""
+eq "a container starts with its memory limit" "$(memory)" "$((64 << 20))"
 
 # ------------------------------------------------------------------- no-op ---
 step "no-op"
@@ -178,9 +181,11 @@ else
 fi
 
 mv shunt.toml.bak shunt.toml
+python3 -c 'import pathlib; p = pathlib.Path("shunt.toml"); p.write_text(p.read_text().replace("64m", "96m"))'
 echo "v3" > index.html
 "$SHUNT" up -y </dev/null >/dev/null
 R3="$(current)"
+eq "a changed memory limit is applied" "$(memory)" "$((96 << 20))"
 neq "the host recovers once the stage is fixed" "$R3" "$R2"
 eq "the recovered release serves v3" "$(served)" "v3"
 
@@ -189,6 +194,7 @@ step "rollback"
 "$SHUNT" rollback "$R2" -y </dev/null >/dev/null
 eq "rollback restored v2" "$(served)" "v2"
 eq "the ledger points at the restored release" "$(current)" "$R2"
+eq "rollback restored that release's memory limit" "$(memory)" "$((64 << 20))"
 
 # ------------------------------------------------------------------- drift ---
 # A plan built from the ledger alone would call this "unchanged".

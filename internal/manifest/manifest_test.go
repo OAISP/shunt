@@ -723,3 +723,28 @@ func TestLayoutNeedNotExistToValidate(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 }
+
+// Docker rejects these only on the host, at create; validate is where a typo
+// should stop.
+func TestMemoryLimitsAreValidated(t *testing.T) {
+	for _, tc := range []struct{ keys, want string }{
+		{`memory = "1g"`, ""},
+		{`memory = "512M"` + "\n" + `memory_swap = "1536m"`, ""},
+		{`memory = "1g"` + "\n" + `memory_swap = "-1"`, ""},
+		{`memory_swap = "-1"`, ""},
+		{`memory = "1gb"`, "not a size"},
+		{`memory = "1.5g"`, "not a size"},
+		{`memory = "4m"`, "6m minimum"},
+		{`memory_swap = "1g"`, "needs memory"},
+		{`memory = "1g"` + "\n" + `memory_swap = "512m"`, "cannot be less than memory"},
+		{`memory = "1g"` + "\n" + `memory_swap = "lots"`, "-1 for unlimited swap"},
+	} {
+		_, err := Load(write(t, minimal+tc.keys+"\n"))
+		switch {
+		case tc.want == "" && err != nil:
+			t.Errorf("%s: unexpected error: %v", tc.keys, err)
+		case tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)):
+			t.Errorf("%s: err = %v, want %q", tc.keys, err, tc.want)
+		}
+	}
+}

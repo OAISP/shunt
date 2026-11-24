@@ -143,6 +143,9 @@ type Service struct {
 	Init   bool   `json:"init,omitempty"`
 	Proxy  *Proxy `json:"proxy,omitempty"`
 
+	Memory     string `json:"memory,omitempty"`
+	MemorySwap string `json:"memory_swap,omitempty"`
+
 	// Secrets narrows which of the release's secrets this service receives.
 	// Empty means all of them.
 	Secrets []string `json:"secrets,omitempty"`
