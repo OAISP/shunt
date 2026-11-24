@@ -45,7 +45,7 @@ gh_edit_branch: main
 gh_edit_source: docs
 gh_edit_view_mode: tree
 
-color_scheme: light
+color_scheme: dark
 
 callouts:
   note:
