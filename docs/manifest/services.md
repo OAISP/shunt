@@ -62,6 +62,20 @@ because a container keeps the file or directory it mounted, not the one swapped
 into its place. `shunt plan` lists each service as `unchanged` or with the
 reasons it will be replaced, and `shunt up` does what the plan said.
 
+Two things override that, because matching what the release asks for is not the
+same as working:
+
+- A service with a `health` check is probed once before its container is kept.
+  If the probe fails, the container is replaced and the new one has to pass the
+  check like any other, so a release is never reported active over a service
+  that is down.
+- After a deploy or rollback that did not end cleanly — it failed after
+  replacing a container, or was cut off by a reboot or a killed process — the
+  next one replaces every service. A container the failed attempt started looks
+  exactly like a healthy one, and a service it never reached may still hold an
+  artifact that was replaced under it. `shunt status` and `shunt plan` both say
+  when this applies.
+
 {: .note }
 A service on an image the server pulls is also replaced when the pull brings a
 different image under the same tag, which a plan cannot know in advance. And the
