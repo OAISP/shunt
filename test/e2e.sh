@@ -26,6 +26,7 @@ cleanup() {
     docker rm -f \$(docker ps -aq --filter label=shunt.project=$PROJECT) 2>/dev/null
     docker rmi -f \$(docker images -q --filter reference='shunt/$PROJECT-*') 2>/dev/null
     docker network rm $PROJECT-net 2>/dev/null
+    docker volume rm $PROJECT-state 2>/dev/null
     rm -rf ~/.shunt/$PROJECT
   " >/dev/null 2>&1 || true
   rm -rf "$WORK"
@@ -111,15 +112,23 @@ init    = true
 url     = "/index.html"
 retries = 20
 
+# The worker records the SIGTERM it is stopped with on a volume its replacement
+# also mounts, which is the only way to see that a stop was graceful.
 [services.worker]
 image   = "app"
-command = ["sh", "-c", "while true; do echo tick; sleep 5; done"]
-init    = true
+command = ["sh", "-c", "trap 'echo term >> /state/stops; exit 0' TERM; while true; do echo tick; sleep 5 & wait \$!; done"]
+volumes = ["$PROJECT-state:/state"]
 memory  = "64m"
+pids_limit = 100
+read_only  = true
+cap_drop   = ["ALL"]
+log_opts   = { max-size = "1m", max-file = "2" }
 EOF
 
 served() { ssh -o BatchMode=yes "$HOST" "curl -sS --max-time 5 http://127.0.0.1:$PORT/index.html"; }
-memory() { ssh -o BatchMode=yes "$HOST" "docker inspect -f '{{.HostConfig.Memory}}' $PROJECT-worker"; }
+limits() { ssh -o BatchMode=yes "$HOST" "docker inspect -f '{{.HostConfig.Memory}} {{.HostConfig.PidsLimit}} {{.HostConfig.ReadonlyRootfs}} {{.HostConfig.CapDrop}} {{index .HostConfig.LogConfig.Config \"max-size\"}}' $PROJECT-worker"; }
+memory() { limits | cut -d' ' -f1; }
+cid() { ssh -o BatchMode=yes "$HOST" "docker inspect -f '{{.Id}}' $PROJECT-$1"; }
 current() { "$SHUNT" status --json </dev/null 2>/dev/null | grep -o '"current":"[^"]*"' | head -1 | cut -d'"' -f4; }
 
 # ------------------------------------------------------------- offline ----
@@ -133,7 +142,7 @@ step "first deploy"
 eq "the app serves v1" "$(served)" "v1"
 R1="$(current)"
 neq "a release was recorded" "$R1" ""
-eq "a container starts with its memory limit" "$(memory)" "$((64 << 20))"
+eq "a container starts with its limits" "$(limits)" "$((64 << 20)) 100 true [ALL] 1m"
 
 # ------------------------------------------------------------------- no-op ---
 step "no-op"
@@ -149,17 +158,42 @@ step "code change"
 echo "v2" > index.html
 "$SHUNT" up -y </dev/null >"$WORK/v2.log" 2>&1
 eq "the app serves v2" "$(served)" "v2"
-# Neither process installs a SIGTERM handler; as PID 1 they would each sit out
-# the whole drain. Under init = true they exit on stop.
-if grep -q "ignored SIGTERM" "$WORK/v2.log"; then
+# httpd installs no SIGTERM handler; as PID 1 it would sit out the whole drain.
+# Under init = true it exits on stop.
+if grep -q "was killed" "$WORK/v2.log"; then
   bad "init = true lets a process with no SIGTERM handler exit on stop"
 else
   ok "init = true lets a process with no SIGTERM handler exit on stop"
 fi
+# An exit code cannot show this: a stop that fails is followed by a kill, and
+# the deploy succeeds either way.
+eq "the replaced container was sent SIGTERM" \
+  "$(ssh -o BatchMode=yes "$HOST" "docker exec $PROJECT-worker cat /state/stops")" "term"
 R2="$(current)"
 neq "a new release was recorded" "$R2" "$R1"
 
 exits "plan is clean again after deploying" 0 "$SHUNT" plan --detailed-exitcode
+
+# ------------------------------------------------------ only what changed ----
+# Replacing a container that would come out the same is a gap for nothing.
+step "a deploy replaces only what changed"
+APP_BEFORE="$(cid app)"
+WORKER_BEFORE="$(cid worker)"
+python3 - <<'PY'
+import pathlib
+p = pathlib.Path("shunt.toml")
+p.write_text(p.read_text().replace("[services.app]\n", '[services.app]\nenv = { BUMP = "1" }\n'))
+PY
+says "plan reports the untouched service as unchanged" '"name":"worker","action":"unchanged"' "$SHUNT" plan --json
+"$SHUNT" up -y </dev/null >/dev/null
+neq "the changed service was replaced" "$(cid app)" "$APP_BEFORE"
+eq "the unchanged service kept its container" "$(cid worker)" "$WORKER_BEFORE"
+
+# CI stamps the commit into every image, which changes its digest and nothing
+# that runs.
+echo 'LABEL revision="two"' >> Dockerfile
+exits "an image that differs only in its labels is not a change" 0 "$SHUNT" plan --detailed-exitcode
+R2="$(current)"
 
 # ------------------------------------------------------------ failed stage ---
 # The safety invariant of the whole tool: a stage that fails must leave the
@@ -268,6 +302,58 @@ fails "the failed release's own container was not left behind" \
 mv shunt.toml.bak shunt.toml
 echo "v3" > index.html
 "$SHUNT" up -y </dev/null >/dev/null 2>&1 || true
+
+# ------------------------------------------------------------ crash loop ----
+# A service with no health check has nothing to probe, but one that cannot stay
+# up is not a release that started.
+step "a service that keeps restarting fails the deploy"
+BEFORE="$(current)"
+cp shunt.toml shunt.toml.bak
+cat >> shunt.toml <<'TOML'
+
+[services.crash]
+image   = "app"
+command = ["sh", "-c", "echo boom-from-crash; exit 1"]
+TOML
+if "$SHUNT" up -y --rollback-on-failure </dev/null >"$WORK/crash.log" 2>&1; then
+  bad "the deploy failed"
+else
+  ok "the deploy failed"
+fi
+if grep -q "boom-from-crash" "$WORK/crash.log"; then
+  ok "the failure shows the container's last log lines"
+else
+  bad "the failure shows the container's last log lines"
+fi
+eq "the previous release was restored" "$(current)" "$BEFORE"
+
+# ------------------------------------------------------ irreversible stage ---
+# Rolling back automatically is right until a stage has changed the data: the
+# old code would then run against a schema it has never seen.
+step "an irreversible stage stops the automatic rollback"
+cat >> shunt.toml <<'TOML'
+
+[[stages]]
+name    = "migrate"
+image   = "app"
+command = ["sh", "-c", "echo irreversible=true >> $SHUNT_STAGE_OUTPUT"]
+TOML
+fails "the deploy failed" "$SHUNT" up -y --rollback-on-failure
+neq "the host was not rolled back" "$(current)" "$BEFORE"
+if "$SHUNT" status </dev/null 2>&1 | grep -q "irreversible"; then
+  ok "status says the release changed something a rollback cannot undo"
+else
+  bad "status says the release changed something a rollback cannot undo"
+fi
+mv shunt.toml.bak shunt.toml
+# Into a file first: grep -q would close the pipe on the rollback mid-run.
+"$SHUNT" rollback -y </dev/null >"$WORK/irreversible.log" 2>&1 || true
+if grep -q "irreversible change" "$WORK/irreversible.log"; then
+  ok "rollback warns before leaving that release"
+else
+  bad "rollback warns before leaving that release"
+fi
+eq "an explicit rollback still works" "$(current)" "$BEFORE"
 
 # ------------------------------------------------------ cancelled deploy ----
 # CI cancels jobs all the time: a newer push, a timeout. Once the release has
@@ -394,8 +480,17 @@ exits "a rotated secret is reported as work" 2 "$SHUNT" plan --detailed-exitcode
 "$SHUNT" up -y </dev/null >/dev/null
 eq "the container reads the rotated secret" "$(secret_seen)" "$ROTATED"
 
-succeeds "rollback accepts a release whose services all scoped their secrets" \
-  "$SHUNT" rollback "$R_SEC" -y
+if "$SHUNT" rollback "$R_SEC" -y </dev/null >"$WORK/rollback.log" 2>&1; then
+  ok "rollback accepts a release whose services all scoped their secrets"
+else
+  bad "rollback accepts a release whose services all scoped their secrets"
+fi
+# The trap after a rotation: the value being restored may have been revoked.
+if grep -q "older values of APP_TOKEN" "$WORK/rollback.log" && ! grep -q "$TOKEN" "$WORK/rollback.log"; then
+  ok "rollback names the secret it restores an older value of, and not the value"
+else
+  bad "rollback names the secret it restores an older value of, and not the value"
+fi
 eq "the restored release serves its own content" "$(served)" "v6"
 eq "the restored container still holds the real secret" "$(secret_seen)" "$TOKEN"
 
