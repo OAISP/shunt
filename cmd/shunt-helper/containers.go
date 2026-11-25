@@ -210,6 +210,19 @@ func upToDate(spec *release.Spec, name string, svc release.Service, inputs strin
 	return ""
 }
 
+// stillHealthy probes a container that is about to be left running. It passed
+// its gate when it started, which says nothing about now: a release must not be
+// reported active, or a dependent started, over a service that is down. One
+// attempt, since a container that has been up for a while has no startup to
+// wait out.
+func stillHealthy(spec *release.Spec, container string, svc release.Service) bool {
+	if svc.Health == nil {
+		return true
+	}
+	_, err := probe(spec, container, svc, svc.Health)
+	return err == nil
+}
+
 // containerExists reports whether a container of that name is present in any
 // state, running or stopped.
 func containerExists(name string) bool {
@@ -418,9 +431,11 @@ func dependedOn(spec *release.Spec) map[string]bool {
 // rest are stopped gracefully and restarted, which does have a gap — a published
 // host port can only belong to one container at a time.
 //
-// A service whose running container already matches is left alone, unless
-// replaceAll says the data under it changed: a container goes on holding the
-// file or directory it mounted, not the one swapped into its place.
+// A service whose running container already matches and still passes its health
+// check is left alone, unless replaceAll says otherwise. That is when the data
+// under it changed — a container goes on holding the file or directory it
+// mounted, not the one swapped into its place — and when an earlier attempt did
+// not end cleanly, so a matching container proves nothing.
 //
 // The second return value separates "the deploy failed and production is
 // exactly as it was" from "it failed halfway and the host is running a mix" —
@@ -442,7 +457,15 @@ func swapServices(spec, prev *release.Spec, envFile, salt string, replaceAll boo
 		if err != nil {
 			return started, mutated, fmt.Errorf("service %s: %w", name, err)
 		}
-		if keep := upToDate(spec, name, svc, inputs); keep != "" && !replaceAll {
+		keep := ""
+		if !replaceAll {
+			keep = upToDate(spec, name, svc, inputs)
+		}
+		if keep != "" && !stillHealthy(spec, keep, svc) {
+			info(keep + " is unchanged but failing its health check — replacing it")
+			keep = ""
+		}
+		if keep != "" {
 			// Written for this release all the same: a rollback to it, and
 			// `shunt run`, read its secrets by release id.
 			if _, err := secretArgs(spec, name, svc, envFile); err != nil {

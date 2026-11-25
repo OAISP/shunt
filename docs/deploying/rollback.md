@@ -20,10 +20,11 @@ shunt rollback 20260726-225110-3fa9c1  # a specific release
 `degraded` is never picked as "previous" — rolling onto it would repeat the
 problem.
 
-A container that already matches the target release is left alone, as in a
-deploy. After a deploy that failed partway, a rollback therefore replaces only
-what that deploy replaced, and a proxied service the deploy never got to keeps
-serving throughout.
+A container that already matches the target release and passes its health check
+is left alone, as in a deploy. The exception is the rollback you run after a
+deploy that failed partway: it replaces every service, because nothing on a
+host in that state can be told apart from what the failed deploy left behind.
+Proxied services are still swapped blue/green; the others restart in place.
 
 Before asking you to confirm, `shunt rollback` says what the rollback does that
 you may not expect:

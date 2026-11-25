@@ -114,6 +114,10 @@ func apply(spec *release.Spec) error {
 	// dataChanged records whether an artifact was swapped in, which is the one
 	// change no container's own inputs show.
 	dataChanged := false
+	// unsettled is an earlier attempt that did not end cleanly: a container it
+	// started may have failed its gate, or never reached it, and looks no
+	// different for that. Every service is replaced until one attempt succeeds.
+	unsettled := ledger.Unsettled()
 
 	// finish records the outcome no matter which step failed, so `shunt status`
 	// always reflects reality rather than the last success.
@@ -123,18 +127,24 @@ func apply(spec *release.Spec) error {
 		// attempted when asked, because it is the wrong move for a release whose
 		// stages already migrated a database — the code would go back and the
 		// schema would not.
+		restored := false
 		if runErr != nil && mutated && spec.RollbackOnFailure {
 			if entry.Irreversible != "" {
 				runErr = fmt.Errorf("%w\n  not rolled back automatically: stage %q reported an irreversible change, "+
 					"and the previous release would run against it", runErr, entry.Irreversible)
-			} else if rbErr := autoRollback(spec, ledger, dataChanged); rbErr != nil {
+			} else if rbErr := autoRollback(spec, ledger, unsettled || dataChanged); rbErr != nil {
 				runErr = fmt.Errorf("%w\n  automatic rollback also failed: %v", runErr, rbErr)
 			} else {
 				runErr = fmt.Errorf("%w\n  the previous release was restored automatically", runErr)
 				// The host is back on the previous release, so this attempt did not
 				// take anything over after all.
-				mutated = false
+				mutated, restored = false, true
 			}
+		}
+		// Settled when every container is one a passed gate vouches for: this
+		// release's, the restored one's, or the ones nothing here touched.
+		if runErr == nil || restored || (!unsettled && !mutated && !dataChanged) {
+			ledger.Changing = ""
 		}
 		recordOutcome(ledger, &entry, mutated, runErr, spec.Retain)
 		if err := saveLedger(ledger); err != nil {
@@ -173,15 +183,22 @@ func apply(spec *release.Spec) error {
 		return finish(fmt.Errorf("%w\n  no containers were replaced — production is untouched", err))
 	}
 
+	// On record before the first change, so an attempt that dies partway, with
+	// nobody left to write its outcome, is not mistaken for one that never began.
+	ledger.Changing = spec.ID
+	if err := saveLedger(ledger); err != nil {
+		return finish(err)
+	}
+
 	// Data lands after stages and before services, so the swap is as late as it
 	// can be while the old container still holds the old inode.
 	promoted, err := swapArtifacts(spec)
+	dataChanged = len(promoted) > 0
 	if err != nil {
 		return finish(fmt.Errorf("%w\n  no services were replaced — production is untouched", err))
 	}
 
-	dataChanged = len(promoted) > 0
-	started, swapped, err := swapServices(spec, previousSpec(ledger), envFile, ledger.Salt, dataChanged)
+	started, swapped, err := swapServices(spec, previousSpec(ledger), envFile, ledger.Salt, unsettled || dataChanged)
 	mutated = mutated || swapped
 	entry.Services = started
 	if err != nil {
@@ -189,7 +206,9 @@ func apply(spec *release.Spec) error {
 			err = fmt.Errorf("%w\n  this host is now running a mix of releases — `shunt rollback` restores the previous one%s",
 				err, artifactRecovery(spec))
 		} else {
-			err = fmt.Errorf("%w%s", err, undoPromotions(promoted))
+			undone, clean := undoPromotions(promoted)
+			dataChanged = !clean
+			err = fmt.Errorf("%w%s", err, undone)
 		}
 		return finish(err)
 	}

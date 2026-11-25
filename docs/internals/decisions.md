@@ -60,10 +60,18 @@ work rather than read as unchanged.
 A second label carries a keyed digest of everything else a container is created
 from: what its image runs, the deploy network, how secrets are delivered and
 the values of the secrets it receives. A deploy leaves alone any running
-container whose two labels match what it would create, which is also how a
-rollback knows what a failed deploy never got to. The decision is read off the
-container rather than the release history, so it holds however many releases
-the container has outlived.
+container whose two labels match what it would create. The decision is read off
+the container rather than the release history, so it holds however many
+releases the container has outlived.
+
+Labels say what a container was created from, not that it passed its gate, and
+a container whose release failed its health check carries the same ones. So
+the ledger records that an attempt is changing the server before its first
+change, and clears the mark only once the attempt ends with every container
+proven. While it is set — after a degraded release, or after a helper that was
+killed before it could record anything — nothing is kept and every service is
+replaced. A kept container with a health check is also probed once, since
+passing when it started says nothing about now.
 
 The image half of that digest is a fingerprint of the layers and runtime
 settings, not the manifest digest: CI stamps the commit and build time into

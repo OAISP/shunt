@@ -137,3 +137,66 @@ func TestASilentClientLosesTheLock(t *testing.T) {
 		t.Fatalf("err = %v, want the session given up", err)
 	}
 }
+
+// A container started by an attempt that failed its gate, or died before it,
+// carries the same labels as one that passed. The ledger is what tells them
+// apart, so it has to say an attempt is under way before the first change and
+// go on saying so until one ends cleanly.
+func TestAnAttemptThatDidNotEndCleanlyIsNotTrusted(t *testing.T) {
+	t.Setenv("SHUNT_ROOT", t.TempDir())
+	captureEvents(t)
+	attempt := func(id string) (*release.Ledger, error) {
+		t.Helper()
+		err := apply(&release.Spec{
+			Protocol: release.Protocol, Project: "demo", ID: id, Network: "demo-net",
+			Images:   map[string]release.ImageRef{"app": {Ref: "shunt/demo-app:" + id}},
+			Services: map[string]release.Service{"app": {Image: "app", Restart: "always"}},
+			Order:    []string{"app"},
+		})
+		l, lerr := loadLedger("demo")
+		if lerr != nil {
+			t.Fatal(lerr)
+		}
+		return l, err
+	}
+
+	var during string
+	creates, deployed, crashing := 0, false, true
+	prev := docker
+	t.Cleanup(func() { docker = prev })
+	docker = runnerFunc(func(_ string, args ...string) (string, error) {
+		line := strings.Join(args, " ")
+		switch {
+		case strings.HasPrefix(line, "create"):
+			creates++
+			l, _ := loadLedger("demo")
+			during = l.Changing
+		// Once deployed, what is running matches: so does the container a failed
+		// attempt left behind.
+		case strings.Contains(line, "label=shunt.inputs=") && deployed:
+			return "demo-app\n", nil
+		case strings.Contains(line, "label=shunt.release="):
+			return "app\n", nil
+		case strings.Contains(line, "RestartCount") && crashing:
+			return "restarting 3 1\n", nil
+		}
+		return "", nil
+	})
+
+	l, err := attempt("r1")
+	if err == nil || during != "r1" || l.Changing != "r1" {
+		t.Fatalf("err = %v, marked %q while changing and %q after; want a failure on record as r1 throughout",
+			err, during, l.Changing)
+	}
+	deployed = true
+	if _, err = attempt("r2"); err == nil || creates != 2 {
+		t.Fatalf("err = %v after %d creates; want the retry to replace the container and fail on it again", err, creates)
+	}
+	crashing = false
+	if l, err = attempt("r3"); err != nil || creates != 3 || l.Changing != "" {
+		t.Fatalf("err = %v, %d creates, still marked %q; want a clean deploy to settle the host", err, creates, l.Changing)
+	}
+	if _, err = attempt("r4"); err != nil || creates != 3 {
+		t.Fatalf("err = %v, %d creates; want an unchanged container left running", err, creates)
+	}
+}

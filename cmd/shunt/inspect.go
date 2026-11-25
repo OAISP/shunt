@@ -83,6 +83,13 @@ func printCurrent(l *release.Ledger, s ui.Style) {
 		fmt.Printf("  %s\n", s.Amber("this host is running a mix of releases — `shunt rollback` restores the previous one"))
 	}
 
+	// An attempt nobody recorded the end of: the helper was killed, or the host
+	// went down under it.
+	if l.Changing != "" && l.Changing != l.Current {
+		fmt.Printf("  %s\n", s.Amber(fmt.Sprintf("the move to %s did not finish cleanly — "+
+			"the next deploy or rollback replaces every service", l.Changing)))
+	}
+
 	// A last attempt that differs from the serving release means the most recent
 	// deploy failed without taking over. Saying so here is the whole point of
 	// tracking the two separately.
