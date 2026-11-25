@@ -31,17 +31,21 @@ Two scripts exercise what unit tests cannot, and CI runs both:
 ```sh
 make build && test/e2e.sh deploy@vps.example.com   # any host you can ssh to
 test/compat.sh                                     # needs local docker
+test/compat.sh docker 27                           # the e2e suite on that Docker
 ```
 
 - **`test/e2e.sh`** deploys a small project to the host and checks the result:
-  first deploy, no-op, code change, a failing stage leaving production serving,
-  memory limits, rollback, drift after a container deleted or an accessory
-  stopped by hand, exec and logs, automatic rollback, a deploy cancelled midway,
-  a deploy queued behind another, bundles, a rotated secret, secrets surviving a
-  rollback, retire, and `down`. It cleans up after itself. CI points it at the
-  runner itself.
+  first deploy, no-op, code change, a replaced container receiving SIGTERM, an
+  unchanged service keeping its container, a failing stage leaving production
+  serving, limits, rollback, drift after a container deleted or an accessory
+  stopped by hand, exec and logs, automatic rollback, a service that cannot stay
+  up, an irreversible stage, a deploy cancelled midway, a deploy queued behind
+  another, bundles, a rotated secret, secrets surviving a rollback, retire, and
+  `down`. It cleans up after itself. CI points it at the runner itself.
 - **`test/compat.sh`** builds a throwaway server in a container with rsync 3.1.3
-  and neither `curl` nor `tar`, and deploys to it.
+  and neither `curl` nor `tar`, and deploys to it. With `docker <version>` it
+  instead starts a server running that Docker release and runs the whole e2e
+  suite against it; CI does so for each supported major.
 
 ## Changes to the deploy path
 
@@ -55,8 +59,8 @@ ran against a real server.
 
 ## Releases
 
-Pushing a `v*` tag runs the same jobs as a push to `main` — tests, `e2e` and
-`compat` — and publishes the release only if they pass.
+Pushing a `v*` tag runs the same jobs as a push to `main` — tests, `e2e`,
+`compat` and the Docker versions — and publishes the release only if they pass.
 
 ## Documentation
 

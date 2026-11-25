@@ -26,8 +26,10 @@ ship to services. Where they are declared, the order is the safety property:
 4. **Artifacts** are checked and swapped in only after the stages pass, because
    that swap is the point of no return for data. If the release then fails
    before any service is replaced, they are put back.
-5. **Services** are replaced in dependency order.
-6. **Health** gates the release: a service that never becomes healthy fails it.
+5. **Services** that the release changes are replaced in dependency order; the
+   rest [keep their containers]({% link manifest/services.md %}#how-a-service-is-replaced).
+6. **Health** gates the release: a replaced service that never becomes healthy,
+   or cannot stay up, fails it.
 
 ## Change detection
 
@@ -35,8 +37,11 @@ ship to services. Where they are declared, the order is the safety property:
 with `--json` and `--no-plan`, which is how CI runs it. A deploy happens when
 the plan finds any of these:
 
-- an image whose digest changed, or a service, stage or release-wide setting
-  (network, secret delivery mode) whose definition changed;
+- an image that would run differently — new layers or runtime settings; a
+  rebuild that only changes labels or timestamps is not a change, so a commit
+  that touches nothing in the image deploys nothing;
+- a service, stage or release-wide setting (network, secret delivery mode)
+  whose definition changed;
 - an artifact whose size or modification time differs from the server's copy;
 - a secret that was added, removed or given a new value;
 - an accessory that does not exist, or exists but is not running;

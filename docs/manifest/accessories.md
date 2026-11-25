@@ -27,7 +27,7 @@ is always one container under one name.
 
 ## Booted once, then left alone
 
-A service is replaced on every release. An accessory is created on the first
+A service is replaced whenever a release changes it. An accessory is created on the first
 deploy that declares it and never replaced by a deploy afterwards: shipping a
 CSS fix must not restart Postgres. If the container exists but is stopped — a
 server reboot leaves it that way — a deploy starts it, and one that has been

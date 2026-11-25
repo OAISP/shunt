@@ -53,7 +53,8 @@ make install    # builds ./shunt with the helpers embedded, installs to ~/.local
 rsync and ssh. Docker is only needed for images shunt builds; a
 [prebuilt image]({% link manifest/images.md %}#prebuilt-images) needs none.
 
-**The server:** docker, rsync, and an ssh user that can reach the docker socket.
+**The server:** docker 20.10 or newer, rsync, and an ssh user that can reach the
+docker socket.
 Nothing else — shunt uploads its own helper, which does the health probes and
 builds the load archive itself.
 

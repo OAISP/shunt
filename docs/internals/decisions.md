@@ -55,6 +55,21 @@ compares the manifest against those labels, not only against what shunt last
 recorded, so a container deleted, stopped or replaced by hand is reported as
 work rather than read as unchanged.
 
+## A container is replaced only when it would come out different
+
+A second label carries a keyed digest of everything else a container is created
+from: what its image runs, the deploy network, how secrets are delivered and
+the values of the secrets it receives. A deploy leaves alone any running
+container whose two labels match what it would create, which is also how a
+rollback knows what a failed deploy never got to. The decision is read off the
+container rather than the release history, so it holds however many releases
+the container has outlived.
+
+The image half of that digest is a fingerprint of the layers and runtime
+settings, not the manifest digest: CI stamps the commit and build time into
+every image, and a digest that changes on every commit would replace every
+container on every deploy.
+
 ## Only the delta is loaded
 
 The helper rehashes exactly the blobs rsync rewrote, and those are precisely the

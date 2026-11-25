@@ -31,6 +31,12 @@ Stages run in order, after accessories are up and before anything is replaced,
 on the deploy network and with every secret. If one fails, production is
 exactly as it was.
 
+A stage that changes data in a way the previous release cannot run against can
+say so, by writing `irreversible=true` to the file named in
+`SHUNT_STAGE_OUTPUT`. That stops `shunt up --rollback-on-failure` from putting
+the old code back on top of it; see
+[stages that cannot be undone]({% link deploying/rollback.md %}#stages-that-cannot-be-undone).
+
 Stages run on every deploy, not only when they change — a migration that has
 nothing to do should exit 0. Adding or changing a stage counts as a change, so
 a manifest whose only edit is a new migration still deploys.

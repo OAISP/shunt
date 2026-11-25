@@ -54,6 +54,12 @@ dest = "/opt/acme/models/embed"
 
 ## How the swap works
 
+An artifact whose size and modification time already match the server's copy is
+neither sent nor swapped: the file in place stays in place, along with the
+containers reading it. One that differs replaces every service, since a
+container keeps the file or directory it mounted rather than the one swapped
+into its place.
+
 The new copy is transferred next to the old one, as `<dest>.new.<release-id>`.
 After the stages have run, every artifact in the release is checked — exact
 size, non-empty, and `magic` if set — and only when all of them pass are they
