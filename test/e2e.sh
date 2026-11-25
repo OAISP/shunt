@@ -299,9 +299,18 @@ eq "it serves the previous content" "$(served)" "v3"
 fails "the failed release's own container was not left behind" \
   ssh -o BatchMode=yes "$HOST" "docker ps -aq --filter name=$PROJECT-broken | grep -q ."
 
+# ------------------------------------------------------------------ retry ----
+# Without the rollback, the container that failed is still running when the
+# deploy is retried, under every label a healthy one would carry.
+step "a retry does not pass over a container that failed its gate"
+fails "the deploy failed" "$SHUNT" up -y
+fails "the retry fails on it again" "$SHUNT" up -y
+succeeds "rollback restores the previous release" "$SHUNT" rollback -y
+eq "the previous release is serving again" "$(current)" "$BEFORE"
+
 mv shunt.toml.bak shunt.toml
 echo "v3" > index.html
-"$SHUNT" up -y </dev/null >/dev/null 2>&1 || true
+exits "the host is settled once restored" 0 "$SHUNT" plan --detailed-exitcode
 
 # ------------------------------------------------------------ crash loop ----
 # A service with no health check has nothing to probe, but one that cannot stay

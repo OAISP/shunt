@@ -24,7 +24,7 @@ import (
 //
 // The promotions are returned so the caller can undo them too: a release whose
 // services then fail to replace anything must not leave the old code running on
-// the new data.
+// the new data. Alongside an error they are the ones that could not be put back.
 func swapArtifacts(spec *release.Spec) ([]promotion, error) {
 	// One already in place is left there. Swapping in an identical copy would
 	// take the file out from under a container that is being left running.
@@ -47,7 +47,11 @@ func swapArtifacts(spec *release.Spec) ([]promotion, error) {
 		step("artifact:"+a.Name, "swapping in "+a.Dest)
 		p, err := promote(spec, a)
 		if err != nil {
-			return nil, fmt.Errorf("artifact %q: %w%s", a.Name, err, undoPromotions(done))
+			undone, clean := undoPromotions(done)
+			if clean {
+				done = nil
+			}
+			return done, fmt.Errorf("artifact %q: %w%s", a.Name, err, undone)
 		}
 		done = append(done, p)
 		ok("artifact:"+a.Name, fmt.Sprintf("%s in place (%s)", a.Dest, ui.Bytes(p.bytes)))
@@ -56,10 +60,9 @@ func swapArtifacts(spec *release.Spec) ([]promotion, error) {
 }
 
 // undoPromotions puts back what the swaps replaced and says so, as a suffix for
-// the error that made it necessary.
-func undoPromotions(done []promotion) string {
+// the error that made it necessary. clean is false when something stayed swapped.
+func undoPromotions(done []promotion) (msg string, clean bool) {
 	restored, failed := rollbackPromotions(done)
-	var msg string
 	if restored > 0 {
 		msg = fmt.Sprintf("\n  %d artifact(s) were restored to their previous contents", restored)
 	}
@@ -67,7 +70,7 @@ func undoPromotions(done []promotion) string {
 		msg += fmt.Sprintf("\n  COULD NOT restore: %s — recover these by hand before restarting the app",
 			strings.Join(failed, ", "))
 	}
-	return msg
+	return msg, len(failed) == 0
 }
 
 // settleArtifacts applies retention and clears stale fragments. Only a release

@@ -23,8 +23,8 @@ import (
 // merely redundant — a `grace` is a sleep, so a required service with a 30s
 // grace made the deploy wait a full minute for one container.
 func healthCheck(spec *release.Spec) error {
-	// Only what this release started. A container it left running was gated by
-	// the release that did start it, and has nothing new to prove.
+	// Only what this release started. A container it left running was probed
+	// when the swap decided to keep it.
 	out, _ := docker.Run("docker", "ps", "-a",
 		"--filter", "label=shunt.project="+spec.Project,
 		"--filter", "label=shunt.release="+spec.ID,

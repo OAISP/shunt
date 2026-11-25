@@ -291,6 +291,16 @@ func (e *Engine) BuildPlan(ctx context.Context, spec *release.Spec, built map[st
 		}
 		p.Services = append(p.Services, sc)
 	}
+	// The helper trusts no container's labels after an attempt that did not end
+	// cleanly, and replaces them all.
+	if state != nil && state.Ledger != nil && state.Ledger.Unsettled() {
+		for i := range p.Services {
+			if sc := &p.Services[i]; sc.Action == "unchanged" {
+				sc.Action = "update"
+				sc.Reasons = []string{"the last attempt did not finish cleanly — every service is replaced"}
+			}
+		}
+	}
 	// From the containers as well as the last release: one deploy after a
 	// service is dropped, the last release no longer mentions it either, while
 	// its container is still running.

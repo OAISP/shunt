@@ -607,6 +607,30 @@ func TestSwapServicesLeavesAnUnchangedContainerRunning(t *testing.T) {
 	}
 }
 
+// Matching labels say what a container was created from, not that it works. Kept
+// regardless, a service that is down passes a deploy it was never asked about,
+// and its dependents start against it.
+func TestSwapServicesReplacesAnUnchangedContainerThatIsUnhealthy(t *testing.T) {
+	svc := release.Service{
+		Image: "app", Restart: "always",
+		Health: &release.Health{Command: []string{"check"}, Retries: 1, Interval: "1ms"},
+	}
+	spec := svcSpec(map[string]release.Service{"app": svc}, "app")
+	failing := errors.New("exit status 1")
+	f := newFake().
+		on("label=shunt.inputs=", "demo-app\n", nil).
+		on("exec demo-app check", "", failing)
+	withFake(t, f)
+
+	_, mutated, err := swapServices(spec, nil, "", "", false)
+	if err != nil || !mutated {
+		t.Fatalf("mutated = %v, err = %v; want the unhealthy container replaced", mutated, err)
+	}
+	if !f.did("docker create", "--name demo-app") {
+		t.Errorf("a container failing its health check was left running:\n%s", strings.Join(f.calls, "\n"))
+	}
+}
+
 // The label that decides whether a container is left alone has to move with
 // everything the container is created from and with nothing else.
 func TestInputsDigestFollowsWhatAContainerIsCreatedFrom(t *testing.T) {

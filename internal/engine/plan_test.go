@@ -712,6 +712,12 @@ func TestPlanSaysWhichServicesADeployReplaces(t *testing.T) {
 	check("an older container, nothing to do", actions(next(), state("")), "unchanged", "unchanged", "false")
 	check("an older container, riding a deploy", actions(rotated, state("")), "update", "update", "true")
 
+	// An attempt that died partway recorded no outcome, so the serving release
+	// still reads as active while its containers may be the ones that failed.
+	interrupted := state("i")
+	interrupted.Ledger.Changing = "r1b"
+	check("an interrupted attempt", actions(next(), interrupted), "update", "update", "true")
+
 	// A bundle planned where its secrets cannot be resolved has none to compare,
 	// which must not read as every one of them having been removed.
 	blind := next()

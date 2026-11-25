@@ -292,6 +292,12 @@ type Ledger struct {
 	// from Current exactly when the last deploy failed without taking over.
 	LastAttempt string `json:"last_attempt,omitempty"`
 
+	// Changing is the release an attempt began moving the host onto, written
+	// before its first change and cleared once every container it touched has
+	// passed its gate. Left behind, it marks containers whose labels say more
+	// than was ever proven about them.
+	Changing string `json:"changing,omitempty"`
+
 	// Accessories records the definition hash of each accessory as it was
 	// actually applied — when its container was created or recreated — keyed by
 	// name.
@@ -488,6 +494,17 @@ func (l *Ledger) Trim(retain int) {
 		}
 	}
 	l.Releases = out
+}
+
+// Unsettled reports whether the last attempt to change the host did not end
+// cleanly, in which case no running container can be taken at its labels. A
+// degraded release counts on its own, for ledgers written before Changing.
+func (l *Ledger) Unsettled() bool {
+	if l.Changing != "" {
+		return true
+	}
+	cur := l.Find(l.Current)
+	return cur != nil && cur.Status == StatusDegraded
 }
 
 // Previous returns the most recent successfully-activated release before the
