@@ -40,8 +40,8 @@ terminal to ask at — in CI — they proceed without asking, except `down --pur
 | Command | |
 |:--|:--|
 | `shunt plan` | Build, then show what a deploy would change. |
-| `shunt up` | Build, ship, run stages, swap containers, health-check. Does nothing when the server already matches. |
-| `shunt rollback [release]` | Restore the release before the serving one, or the one named. |
+| `shunt up` | Build, ship, run stages, replace the containers the release changes, health-check. Does nothing when the server already matches. |
+| `shunt rollback [release]` | Restore the release before the serving one, or the one named. Before asking, it names any secret it would restore an older value of. |
 
 | Flag | On | |
 |:--|:--|:--|
@@ -54,7 +54,7 @@ terminal to ask at — in CI — they proceed without asking, except `down --pur
 
 | Command | |
 |:--|:--|
-| `shunt status` | The serving release, its containers, the last attempt if it failed, and the history. |
+| `shunt status` | The serving release, its containers with the release that started each, the last attempt if it failed, and the history. |
 | `shunt logs [service]` | Logs of every container, or one service's. `--follow` streams; `--tail N` (default 100). |
 | `shunt exec <service> -- <cmd>` | Run a command in the container serving that service. |
 | `shunt run <service> -- <cmd>` | Run a command in a new container from the serving release's image, then remove it. `--image <name>` picks another image of that release. |

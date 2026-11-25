@@ -90,3 +90,36 @@ full outage, not a blip. So a deploy that changes the `proxy` block, or the path
 of the health check the proxy polls, stops the old container before starting
 the new one, once. `shunt plan` says so, and the next deploy overlaps normally
 again.
+
+## Behind a proxy that is not Traefik or caddy
+
+Blue/green needs a proxy that finds containers by their labels, and a proxy
+configured from a file — a host nginx, HAProxy, a cloud load balancer — cannot.
+You do not have to replace it. Keep it, and put one of the two label-driven
+proxies between it and your services, as an accessory:
+
+```toml
+[accessories.edge]
+image   = "traefik:v3"
+command = ["--providers.docker=true", "--providers.docker.exposedbydefault=false",
+           "--entrypoints.web.address=:80"]
+publish = ["127.0.0.1:8080:80"]
+volumes = ["/var/run/docker.sock:/var/run/docker.sock:ro"]
+
+[services.app]
+image  = "app"
+expose = 3000
+
+[services.app.proxy]
+host        = "app.example.com"
+entrypoints = ["web"]
+
+[services.app.health]
+url = "/health"
+```
+
+The existing proxy keeps its TLS and its configuration and points at one
+upstream that never changes, `127.0.0.1:8080`; make sure it passes the `Host`
+header through. The accessory is booted once and left alone by deploys, and the
+switchover happens behind it. Nothing has to reload the host proxy, so the
+deploy user needs no extra privileges.

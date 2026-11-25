@@ -44,7 +44,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends shellcheck > /dev/null
           shellcheck install.sh
           sh -n install.sh
-          shellcheck test/e2e.sh
+          shellcheck test/e2e.sh test/compat.sh
 
       - name: test
         run: go test -race ./...
@@ -147,3 +147,30 @@ jobs:
 
       - name: compat
         run: test/compat.sh
+
+  # The e2e suite again, on the Docker releases servers actually run. The e2e
+  # job above deploys to the runner's own daemon, which is whatever GitHub ships
+  # this month and says nothing about a server installed two years ago.
+  docker:
+    name: docker ${{ matrix.docker }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        docker: ["20.10", "23", "24", "25", "26", "27", "28"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build
+        run: make build
+
+      - name: builder that can export an OCI layout
+        run: docker buildx create --use --name shunt --driver docker-container
+
+      - name: e2e
+        run: test/compat.sh docker ${{ matrix.docker }}

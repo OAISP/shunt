@@ -20,10 +20,27 @@ shunt rollback 20260726-225110-3fa9c1  # a specific release
 `degraded` is never picked as "previous" — rolling onto it would repeat the
 problem.
 
-A container already running the target release is left alone. After a deploy
-that failed partway, a rollback therefore replaces only what that deploy
-replaced, and a proxied service the deploy never got to keeps serving
-throughout.
+A container that already matches the target release is left alone, as in a
+deploy. After a deploy that failed partway, a rollback therefore replaces only
+what that deploy replaced, and a proxied service the deploy never got to keeps
+serving throughout.
+
+Before asking you to confirm, `shunt rollback` says what the rollback does that
+you may not expect:
+
+```
+  roll back 20260728-093012-a1b2c3 → 20260727-224510-9c2b18
+  restores the older values of DATABASE_URL, STRIPE_KEY — if those were revoked,
+  deploy that commit with `shunt up` instead
+  stage "migrate" of 20260728-093012-a1b2c3 reported an irreversible change — the
+  older code will run against it
+```
+
+The first line appears when a secret differs between the two releases. A
+rollback hands containers the values their release was deployed with, so after a
+rotation it brings back a value you may have revoked since; only the keys are
+named, never the values. The second appears when the release being left
+[said so itself](#stages-that-cannot-be-undone).
 
 If a rollback itself fails after replacing a container, the serving release is
 marked `degraded`, like a deploy that failed the same way.
@@ -45,6 +62,27 @@ lock, so nothing can land in between.
 This is opt-in on purpose. It is right for a stateless app and wrong for a
 release whose stages already migrated a database: the code goes back, the
 schema does not.
+
+### Stages that cannot be undone
+
+Most deploys migrate nothing, so the flag is worth having on; the deploy that
+drops a column is the one where it must not act. A stage can say which kind this
+one was. Every stage gets `SHUNT_STAGE_OUTPUT`, the path of a file it may write
+to, and a line `irreversible=true` there turns automatic rollback off for that
+deploy:
+
+```sh
+#!/bin/sh
+# migrate.sh, run by a stage
+pending=$(npm run --silent migrate:pending)
+npm run migrate
+case "$pending" in *drop*|*rename*) echo irreversible=true >> "$SHUNT_STAGE_OUTPUT" ;; esac
+```
+
+If that deploy then fails after replacing a container, it is left `degraded`
+with the reason, as if the flag were absent. `shunt status` shows that the
+release changed something a rollback cannot undo, and `shunt rollback` says so
+before it asks. A stage that writes nothing behaves as before.
 
 ## What rollback restores
 

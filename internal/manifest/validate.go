@@ -9,6 +9,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/OAISP/shunt/internal/release"
 )
 
 var (
@@ -61,10 +63,36 @@ func secretsProblems(s *Secrets) []string {
 	return out
 }
 
-// memoryProblems catches at validate time what docker would only reject on the
-// host, at create.
-func memoryProblems(svc Service) []string {
+var (
+	tmpfsRE = regexp.MustCompile(`^/[^:]*(:.+)?$`)
+	capRE   = regexp.MustCompile(`^[A-Za-z_]+$`)
+)
+
+// limitProblems catches at validate time what docker would only reject on the
+// host, at create — which is after stages have run.
+func limitProblems(svc release.Limits) []string {
 	var out []string
+	if svc.CPUs != 0 && svc.CPUs < 0.01 {
+		out = append(out, fmt.Sprintf("cpus %v must be at least 0.01", svc.CPUs))
+	}
+	if svc.PidsLimit < -1 {
+		out = append(out, fmt.Sprintf("pids_limit %d must be a count, or -1 for unlimited", svc.PidsLimit))
+	}
+	for _, t := range svc.Tmpfs {
+		if !tmpfsRE.MatchString(t) {
+			out = append(out, fmt.Sprintf("tmpfs %q must be an absolute path, optionally followed by :options", t))
+		}
+	}
+	for _, c := range slices.Concat(svc.CapDrop, svc.CapAdd) {
+		if !capRE.MatchString(c) {
+			out = append(out, fmt.Sprintf("%q is not a capability name such as ALL or NET_BIND_SERVICE", c))
+		}
+	}
+	for k := range svc.LogOpts {
+		if k == "" || strings.Contains(k, "=") {
+			out = append(out, fmt.Sprintf("log_opts key %q is not an option name such as max-size", k))
+		}
+	}
 	mem, memOK := sizeBytes(svc.Memory)
 	switch {
 	case svc.Memory == "":
@@ -143,7 +171,7 @@ func (m *Manifest) Validate() error {
 		if !restartRE.MatchString(svc.Restart) {
 			add("service %q: restart %q is not a docker restart policy (no, always, unless-stopped, on-failure[:N])", name, svc.Restart)
 		}
-		for _, problem := range memoryProblems(svc) {
+		for _, problem := range limitProblems(svc.Limits) {
 			add("service %q: %s", name, problem)
 		}
 		if p := svc.Proxy; p != nil {

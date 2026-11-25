@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
+	"strings"
 
 	"github.com/OAISP/shunt/internal/release"
 )
@@ -128,6 +129,26 @@ func driftReasons(oldSpec *release.Spec, name string, acc release.Service) []str
 	return diffService(old, acc)
 }
 
+// inheritedReasons lists the changes outside a service's own definition that
+// still replace its container: a secret it is handed, a release-wide setting,
+// or data swapped in under it. The helper keys the same things into the
+// container's inputs label, which is what keeps `plan` and `up` in agreement.
+func inheritedReasons(p *Plan, svc release.Service) []string {
+	var r []string
+	for _, k := range slices.Concat(p.Secrets.Added, p.Secrets.Removed, p.Secrets.Changed) {
+		if len(svc.Secrets) == 0 || slices.Contains(svc.Secrets, k) {
+			r = append(r, "secret "+k+" changed")
+		}
+	}
+	r = append(r, p.Release...)
+	for _, a := range p.Artifacts {
+		if a.Differs() {
+			r = append(r, "artifact "+a.Name+" replaced")
+		}
+	}
+	return r
+}
+
 func imgChanged(imgs []ImageChange, name string) bool {
 	for _, i := range imgs {
 		if i.Name == name {
@@ -160,11 +181,13 @@ func diffService(old, nw release.Service) []string {
 	if old.Init != nw.Init {
 		r = append(r, fmt.Sprintf("init %v → %v", old.Init, nw.Init))
 	}
-	if old.Memory != nw.Memory {
-		r = append(r, fmt.Sprintf("memory %s → %s", orUnset(old.Memory), orUnset(nw.Memory)))
-	}
-	if old.MemorySwap != nw.MemorySwap {
-		r = append(r, fmt.Sprintf("memory_swap %s → %s", orUnset(old.MemorySwap), orUnset(nw.MemorySwap)))
+	// Walked rather than listed, so a limit added to the struct is reported
+	// without anyone remembering to add it here.
+	ol, nl := reflect.ValueOf(old.Limits), reflect.ValueOf(nw.Limits)
+	for i := range ol.NumField() {
+		if a, b := ol.Field(i), nl.Field(i); !reflect.DeepEqual(a.Interface(), b.Interface()) {
+			r = append(r, fmt.Sprintf("%s %s → %s", ol.Type().Field(i).Tag.Get("toml"), orUnset(a), orUnset(b)))
+		}
 	}
 	if !reflect.DeepEqual(old.Proxy, nw.Proxy) {
 		switch {
@@ -204,11 +227,11 @@ func diffService(old, nw release.Service) []string {
 	return r
 }
 
-func orUnset(s string) string {
-	if s == "" {
+func orUnset(v reflect.Value) string {
+	if v.IsZero() {
 		return "unset"
 	}
-	return s
+	return fmt.Sprint(v.Interface())
 }
 
 // diffRelease reports settings that apply to the whole release rather than to
@@ -284,5 +307,35 @@ func mapKeys(a, b map[string]string) []string {
 		out = append(out, k)
 	}
 	slices.Sort(out)
+	return out
+}
+
+// RollbackCautions lists what a rollback from cur to target does that the
+// operator may not expect, for showing before they confirm it.
+//
+// A rollback restores containers with the secrets their release was deployed
+// with, which is a trap once those values have been rotated and revoked; and it
+// restores code only, which is a trap once a stage has changed the data.
+func RollbackCautions(cur, target *release.Entry) []string {
+	if cur == nil || target == nil {
+		return nil
+	}
+	var out []string
+	if cur.Spec != nil && target.Spec != nil {
+		var older []string
+		for k, v := range target.Spec.Secrets {
+			if cur.Spec.Secrets[k] != v {
+				older = append(older, k)
+			}
+		}
+		if slices.Sort(older); len(older) > 0 {
+			out = append(out, fmt.Sprintf("restores the older values of %s — if those were revoked, deploy that commit with `shunt up` instead",
+				strings.Join(older, ", ")))
+		}
+	}
+	if cur.Irreversible != "" {
+		out = append(out, fmt.Sprintf("stage %q of %s reported an irreversible change — the older code will run against it",
+			cur.Irreversible, cur.ID))
+	}
 	return out
 }

@@ -2,8 +2,11 @@
 # Exercises the host-compatibility paths against hosts that actually have the
 # problem, rather than reasoning about them.
 #
-# Two cases, neither of which a healthy modern host can reproduce, exercised
-# together on one host:
+#   test/compat.sh                     the minimal host, below
+#   test/compat.sh docker <version>    the whole e2e suite against that Docker
+#
+# The minimal host is two cases, neither of which a healthy modern host can
+# reproduce, exercised together:
 #
 #   old-rsync   Ubuntu 20.04 ships rsync 3.1.3, which has no --compress-choice
 #               at all. Sending it fails the transfer outright, so shunt has to
@@ -14,10 +17,15 @@
 #               for url health checks, tar for streaming the layout into `docker
 #               load` — and the helper now does both itself.
 #
-# Each host is a container running sshd with the daemon's socket mounted, and its
-# ssh port published. Deliberately not --network host: that shares a namespace
-# only when the daemon is local, and on Docker Desktop the daemon lives in its
-# own VM, so the harness would be unrunnable on a developer machine. The fixture
+# A Docker version is its own host because servers run old ones for years, and
+# the daemon a CI runner ships says nothing about them: `docker stop --timeout`
+# reached production unnoticed because only Docker 28 accepts it.
+#
+# Each host is a container running sshd, with its ssh port published. The
+# minimal one mounts this machine's docker socket; a versioned one runs its own
+# daemon. Deliberately not --network host: that shares a namespace only when
+# the daemon is local, and on Docker Desktop the daemon lives in its own VM, so
+# the harness would be unrunnable on a developer machine. The minimal fixture
 # health-checks via `docker exec` for the same reason — it needs no agreement
 # about what 127.0.0.1 means.
 set -euo pipefail
@@ -35,9 +43,11 @@ bad()  { printf '  \033[31m✗\033[0m %s\n' "$1"; fail=$((fail + 1)); }
 step() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 
 cleanup() {
-  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-  docker rm -f "$(docker ps -aq --filter label=shunt.project=compat 2>/dev/null)" >/dev/null 2>&1 || true
-  docker rmi -f "$(docker images -q --filter 'reference=shunt/compat-*' 2>/dev/null)" >/dev/null 2>&1 || true
+  # -v: a versioned host keeps its whole daemon in an anonymous volume.
+  docker rm -fv "$CONTAINER" >/dev/null 2>&1 || true
+  # Through xargs: more than one id in a single quoted argument removes nothing.
+  docker ps -aq --filter label=shunt.project=compat 2>/dev/null | xargs -r docker rm -f >/dev/null 2>&1 || true
+  docker images -q --filter 'reference=shunt/compat-*' 2>/dev/null | xargs -r docker rmi -f >/dev/null 2>&1 || true
   docker network rm compat-net >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
@@ -46,13 +56,13 @@ trap cleanup EXIT
 ssh_host() { ssh -i "$KEY" -p "$SSH_PORT" -o BatchMode=yes -o StrictHostKeyChecking=no \
   -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR "root@127.0.0.1" "$@"; }
 
-# start_host <base-image> <extra-packages-command>
+# start_host <base-image> <extra-packages-command> <command> <docker-run-flags...>
 #
-# Brings up an sshd container on the host network with docker access, and waits
-# for it to accept a key-based login.
+# Builds and starts a container that can run sshd and reach a docker daemon.
 start_host() {
-  local base="$1" setup="$2"
-  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  local base="$1" setup="$2" cmd="$3"
+  shift 3
+  docker rm -fv "$CONTAINER" >/dev/null 2>&1 || true
 
   cat > "$WORK/Dockerfile.host" <<EOF
 FROM $base
@@ -63,7 +73,7 @@ RUN mkdir -p /var/run/sshd /root/.ssh && \\
     sed -i 's/^#*Port .*/Port 22/' /etc/ssh/sshd_config
 COPY id_ed25519.pub /root/.ssh/authorized_keys
 RUN chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys
-CMD ["/usr/sbin/sshd", "-D", "-e"]
+CMD $cmd
 EOF
   # --load, because this image has to end up in the daemon for `docker run`
   # below to find it. With a docker-container builder selected — which is what
@@ -74,15 +84,17 @@ EOF
   # `docker run` quietly got a stale image or none at all.
   docker build -q --load -f "$WORK/Dockerfile.host" -t shunt-compat-host-img "$WORK" >/dev/null
 
-  docker run -d --name "$CONTAINER" -p "127.0.0.1:$SSH_PORT:22" \
-    -v /var/run/docker.sock:/var/run/docker.sock \
-    shunt-compat-host-img >/dev/null
+  docker run -d --name "$CONTAINER" -p "127.0.0.1:$SSH_PORT:22" "$@" shunt-compat-host-img >/dev/null
+}
 
-  for _ in $(seq 1 40); do
-    if ssh_host true >/dev/null 2>&1; then return 0; fi
+# await <description> <command...>: polls until the command succeeds.
+await() {
+  local what="$1"; shift
+  for _ in $(seq 1 120); do
+    if "$@" >/dev/null 2>&1; then return 0; fi
     sleep 0.5
   done
-  echo "the compat host never accepted an ssh connection" >&2
+  echo "the compat host never $what" >&2
   docker logs "$CONTAINER" >&2 || true
   return 1
 }
@@ -144,10 +156,37 @@ EOF
 chmod +x "$WORK/bin/ssh"
 export PATH="$WORK/bin:$PATH"
 
+# -------------------------------------------------------- a docker version ----
+if [ "${1:-}" = "docker" ]; then
+  version="${2:?usage: test/compat.sh docker <version>}"
+  step "the e2e suite against Docker $version"
+  # --upgrade: the image pins an older openssh client that the server package
+  # will not install beside.
+  start_host "docker:$version-dind" \
+    "apk add --no-cache --upgrade openssh rsync curl >/dev/null && ssh-keygen -A >/dev/null" \
+    '[]' --privileged
+  # Nothing may run in the container until the daemon is up, sshd included: the
+  # image's entrypoint rearranges cgroups first, and any process started beside
+  # it in that moment makes it give up. So readiness is read off the log. Not
+  # grep -q, which would close the pipe on `docker logs` under pipefail.
+  for _ in $(seq 1 120); do
+    docker logs "$CONTAINER" 2>&1 | grep "API listen on" >/dev/null && break
+    sleep 0.5
+  done
+  docker exec -d "$CONTAINER" /usr/sbin/sshd -e
+  await "accepted an ssh connection" ssh_host docker version
+  echo "  host runs Docker $(ssh_host docker version --format '{{.Server.Version}}')"
+  SHUNT="$SHUNT" "$(dirname "$0")/e2e.sh" compat
+  exit
+fi
+
 # ------------------------------------------------------------- old rsync ------
 step "a host with rsync 3.1.3, no curl and no tar still deploys"
 start_host "ubuntu:20.04" \
-  "apt-get update -qq && apt-get install -y -qq openssh-server rsync docker.io >/dev/null && (apt-get remove -y -qq curl >/dev/null 2>&1 || true) && rm -f /bin/tar /usr/bin/tar"
+  "apt-get update -qq && apt-get install -y -qq openssh-server rsync docker.io >/dev/null && (apt-get remove -y -qq curl >/dev/null 2>&1 || true) && rm -f /bin/tar /usr/bin/tar" \
+  '["/usr/sbin/sshd", "-D", "-e"]' \
+  -v /var/run/docker.sock:/var/run/docker.sock
+await "accepted an ssh connection" ssh_host docker version
 
 fixture "$WORK/app"
 

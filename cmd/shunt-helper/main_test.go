@@ -530,6 +530,32 @@ func TestPromoteBacksUpByHardLink(t *testing.T) {
 	}
 }
 
+// A container left running keeps the file it mounted, so a destination that
+// already holds this release's copy must not be swapped for an identical one.
+func TestSwapArtifactsLeavesAnUnchangedDestinationInPlace(t *testing.T) {
+	a := artifactFixture(t, t.TempDir(), "data", "SAME", "SAME")
+	before, err := os.Stat(a.Dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.MTime = before.ModTime().Unix()
+
+	done, err := swapArtifacts(&release.Spec{ID: testRelease, Artifacts: []release.Artifact{a}})
+	if err != nil || len(done) != 0 {
+		t.Fatalf("promotions = %v, err = %v; want none", done, err)
+	}
+	if after, _ := os.Stat(a.Dest); !os.SameFile(before, after) {
+		t.Error("an unchanged destination was replaced")
+	}
+	// The CLI does not stage a copy the host already has, so there may be none.
+	if _, err := os.Stat(a.Staged); !os.IsNotExist(err) {
+		t.Errorf("the staged copy was left behind, stat err = %v", err)
+	}
+	if _, err := swapArtifacts(&release.Spec{ID: testRelease, Artifacts: []release.Artifact{a}}); err != nil {
+		t.Errorf("an unchanged destination with nothing staged failed: %v", err)
+	}
+}
+
 // Fragments from abandoned deploys must not accumulate beside the destination.
 func TestSettleArtifactsClearsStaleStagedFiles(t *testing.T) {
 	dir := t.TempDir()

@@ -9,6 +9,8 @@ package build
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -27,6 +29,8 @@ type Result struct {
 	Dir    string // local OCI layout directory
 	Digest string // OCI manifest digest, e.g. sha256:73c1...
 	Bytes  int64  // on-disk size of the layout
+
+	Fingerprint string // see Fingerprint
 }
 
 type Options struct {
@@ -218,6 +222,38 @@ func LayoutPlatform(dir, platform string) (string, error) {
 		return "", fmt.Errorf("parse image config: %w", err)
 	}
 	return cfg.String(), nil
+}
+
+// Fingerprint hashes the parts of an image config a container actually runs
+// from: platform, layers and runtime settings. Labels, timestamps and history
+// are left out, so stamping a commit into an otherwise identical image does not
+// read as a change. An allowlist, because configs also carry builder-specific
+// fields that differ between two builds of the same thing.
+func Fingerprint(dir string) (string, error) {
+	_, man, err := selectImage(dir, "")
+	if err != nil {
+		return "", err
+	}
+	b, err := os.ReadFile(filepath.Join(dir, blobPath(man.Config.Digest)))
+	if err != nil {
+		return "", fmt.Errorf("read image config: %w", err)
+	}
+	var cfg, run map[string]json.RawMessage
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		return "", fmt.Errorf("parse image config: %w", err)
+	}
+	json.Unmarshal(cfg["config"], &run)
+	delete(run, "Labels")
+	kept := map[string]any{"config": run}
+	for _, k := range []string{"architecture", "os", "os.version", "variant", "rootfs"} {
+		kept[k] = cfg[k]
+	}
+	out, err := json.Marshal(kept)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(out)
+	return hex.EncodeToString(sum[:])[:16], nil
 }
 
 type descriptor struct {

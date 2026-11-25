@@ -63,7 +63,7 @@ func cmdRollback(args []string) error {
 			}
 		}
 		outgoing := previousSpec(ledger)
-		_, mutated, err := swapServices(spec, outgoing, envFile)
+		_, mutated, err := swapServices(spec, outgoing, envFile, ledger.Salt, false)
 		if err == nil {
 			err = healthCheck(spec)
 			mutated = mutated || err != nil
@@ -194,7 +194,7 @@ func cmdBoot(in io.Reader, args []string) error {
 			}
 		}
 		step("boot:"+name, "recreating "+containerName(spec.Project, name))
-		if _, err := startContainer(&spec, name, acc, envFile, "accessory"); err != nil {
+		if _, err := startContainer(&spec, name, acc, envFile, "accessory", ""); err != nil {
 			return err
 		}
 		ok("boot:"+name, containerName(spec.Project, name)+" recreated")
@@ -252,7 +252,7 @@ func fileExists(p string) bool {
 // restores containers only, exactly as `shunt rollback` does, and says so —
 // data that stages or artifacts already changed is not reverted, and pretending
 // otherwise is how a "helpful" rollback loses a database.
-func autoRollback(spec *release.Spec, ledger *release.Ledger) error {
+func autoRollback(spec *release.Spec, ledger *release.Ledger, replaceAll bool) error {
 	// The release to restore is the one that was *serving* when this deploy
 	// started — which is still ledger.Current, because the failing attempt is
 	// only appended to the ledger afterwards.
@@ -290,7 +290,7 @@ func autoRollback(spec *release.Spec, ledger *release.Ledger) error {
 			prevEnv = p
 		}
 	}
-	if _, _, err := swapServices(prev, spec, prevEnv); err != nil {
+	if _, _, err := swapServices(prev, spec, prevEnv, ledger.Salt, replaceAll); err != nil {
 		return err
 	}
 	if err := healthCheck(prev); err != nil {

@@ -26,15 +26,24 @@ import (
 // services then fail to replace anything must not leave the old code running on
 // the new data.
 func swapArtifacts(spec *release.Spec) ([]promotion, error) {
+	// One already in place is left there. Swapping in an identical copy would
+	// take the file out from under a container that is being left running.
+	var changed []release.Artifact
 	for _, a := range spec.Artifacts {
+		if st := statPath(a.Dest); st.Size == a.Bytes && st.MTime == a.MTime {
+			os.RemoveAll(a.Staged)
+			ok("artifact:"+a.Name, a.Dest+" unchanged")
+			continue
+		}
 		step("artifact:"+a.Name, "checking "+filepath.Base(a.Staged))
 		if err := validateStaged(a); err != nil {
 			return nil, fmt.Errorf("artifact %q: %w", a.Name, err)
 		}
+		changed = append(changed, a)
 	}
 
 	var done []promotion
-	for _, a := range spec.Artifacts {
+	for _, a := range changed {
 		step("artifact:"+a.Name, "swapping in "+a.Dest)
 		p, err := promote(spec, a)
 		if err != nil {

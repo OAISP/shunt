@@ -38,6 +38,10 @@ type Engine struct {
 	// bundle supplies its own extracted paths, having no manifest to resolve
 	// them against.
 	artifactSrc map[string]string
+
+	// SecretsUnknown says the spec being planned carries no secret values
+	// because they could not be resolved here, so a plan must not diff them.
+	SecretsUnknown bool
 }
 
 func New(m *manifest.Manifest) *Engine {
@@ -204,6 +208,11 @@ func (e *Engine) buildOne(ctx context.Context, name, id string, o build.Options)
 	if err := build.WriteDockerArchiveManifest(r.Dir, ref); err != nil {
 		return nil, fmt.Errorf("image %s: %w", name, err)
 	}
+	fp, err := build.Fingerprint(r.Dir)
+	if err != nil {
+		return nil, fmt.Errorf("image %s: %w", name, err)
+	}
+	r.Fingerprint = fp
 	return r, nil
 }
 
@@ -261,7 +270,7 @@ func (e *Engine) Spec(ctx context.Context, id string, built map[string]*build.Re
 func (e *Engine) SpecWith(id string, built map[string]*build.Result, sec map[string]string) (*release.Spec, error) {
 	images := map[string]release.ImageRef{}
 	for name, r := range built {
-		images[name] = release.ImageRef{Ref: e.ImageRef(name, id), Digest: r.Digest}
+		images[name] = release.ImageRef{Ref: e.ImageRef(name, id), Digest: r.Digest, Fingerprint: r.Fingerprint}
 	}
 	// Services and accessories may reference images shunt does not build; those
 	// are pulled on the host.
@@ -399,7 +408,7 @@ func (e *Engine) BootSpec(ctx context.Context, state *RemoteState) (*release.Spe
 			return nil, fmt.Errorf("image %q is built locally but release %s did not record it — run `shunt up` first",
 				name, current.ID)
 		}
-		spec.Images[name] = release.ImageRef{Ref: deployed.Ref, Digest: deployed.Digest}
+		spec.Images[name] = deployed
 	}
 	return spec, nil
 }
@@ -431,8 +440,7 @@ func convertServices(in map[string]manifest.Service) (map[string]release.Service
 			Drain:    s.Drain.String(),
 			Init:     s.Init,
 
-			Memory:     s.Memory,
-			MemorySwap: s.MemorySwap,
+			Limits: s.Limits,
 		}
 		if s.Proxy != nil {
 			rs.Proxy = &release.Proxy{
@@ -492,6 +500,11 @@ type Container struct {
 	// missing value never counts as drift.
 	Config string `json:"config"`
 	State  string `json:"state"`
+
+	// Inputs is the digest of what the container was created from besides its
+	// definition. Empty on one started before shunt recorded it, which a deploy
+	// therefore cannot recognise as unchanged.
+	Inputs string `json:"inputs"`
 }
 
 // Running reports whether docker considers this container up.

@@ -46,6 +46,7 @@ type containerInfo struct {
 	Kind    string `json:"kind"`
 	Config  string `json:"config"`
 	State   string `json:"state"`
+	Inputs  string `json:"inputs"`
 }
 
 func cmdStatus(args []string) error {
@@ -89,14 +90,15 @@ func projectStatus(project string) (*hostStatus, error) {
 	out, _ := docker.Run("docker", "ps", "-a",
 		"--filter", "label=shunt.project="+project,
 		"--format", "{{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Label \"shunt.release\"}}\t"+
-			"{{.Label \"shunt.service\"}}\t{{.Label \"shunt.kind\"}}\t{{.Label \"shunt.config\"}}\t{{.State}}")
+			"{{.Label \"shunt.service\"}}\t{{.Label \"shunt.kind\"}}\t{{.Label \"shunt.config\"}}\t{{.State}}\t"+
+			"{{.Label \"shunt.inputs\"}}")
 	st := &hostStatus{Ledger: ledger}
 	for _, ln := range splitLines(out) {
 		f := strings.Split(ln, "\t")
-		if len(f) < 8 {
+		if len(f) < 9 {
 			continue
 		}
-		st.Containers = append(st.Containers, containerInfo{f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]})
+		st.Containers = append(st.Containers, containerInfo{f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8]})
 	}
 	return st, nil
 }

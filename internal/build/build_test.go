@@ -514,3 +514,50 @@ func TestImportRejectsADigestThatIsNotOne(t *testing.T) {
 		t.Fatalf("err = %v, want the digest refused", err)
 	}
 }
+
+// CI stamps the commit into every image, so each build has a new digest even
+// when it would run exactly as the last one did.
+func TestFingerprintIgnoresWhatDoesNotRun(t *testing.T) {
+	config := func(change func(cfg, run map[string]any)) string {
+		run := map[string]any{"Cmd": []string{"serve"}, "Env": []string{"A=1"}, "Labels": map[string]string{"rev": "one"}}
+		cfg := map[string]any{
+			"os": "linux", "architecture": "amd64", "created": "2026-01-01T00:00:00Z",
+			"history": []any{map[string]any{"created_by": "RUN make"}},
+			"rootfs":  map[string]any{"type": "layers", "diff_ids": []string{"sha256:l1"}},
+			"config":  run,
+		}
+		change(cfg, run)
+		l := newLayout(t)
+		digest := l.image("app", "amd64")
+		l.blob("sha256:cfg-app", cfg)
+		fp, err := Fingerprint(l.top(digest))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fp
+	}
+	want := config(func(_, _ map[string]any) {})
+
+	same := map[string]func(cfg, run map[string]any){
+		"labels":  func(_, run map[string]any) { run["Labels"] = map[string]string{"rev": "two"} },
+		"created": func(cfg, _ map[string]any) { cfg["created"] = "2026-02-02T00:00:00Z" },
+		"history": func(cfg, _ map[string]any) { cfg["history"] = []any{} },
+	}
+	for name, change := range same {
+		if config(change) != want {
+			t.Errorf("a change to %s alone moved the fingerprint", name)
+		}
+	}
+	differs := map[string]func(cfg, run map[string]any){
+		"a layer": func(cfg, _ map[string]any) {
+			cfg["rootfs"] = map[string]any{"type": "layers", "diff_ids": []string{"sha256:l2"}}
+		},
+		"the command": func(_, run map[string]any) { run["Cmd"] = []string{"work"} },
+		"the env":     func(_, run map[string]any) { run["Env"] = []string{"A=2"} },
+	}
+	for name, change := range differs {
+		if config(change) == want {
+			t.Errorf("a change to %s did not move the fingerprint", name)
+		}
+	}
+}

@@ -135,6 +135,10 @@ type ImageRef struct {
 	Digest string `json:"digest"`
 	// External images are pulled on the host instead of loaded from the store.
 	External bool `json:"external"`
+	// Fingerprint identifies what a built image runs as: its layers and runtime
+	// configuration, without the labels and timestamps that give every CI build
+	// a new digest. Equal fingerprints mean a container need not be replaced.
+	Fingerprint string `json:"fingerprint,omitempty"`
 }
 
 type Service struct {
@@ -152,12 +156,37 @@ type Service struct {
 	Init   bool   `json:"init,omitempty"`
 	Proxy  *Proxy `json:"proxy,omitempty"`
 
-	Memory     string `json:"memory,omitempty"`
-	MemorySwap string `json:"memory_swap,omitempty"`
+	// Embedded where memory first sat: the hash of a service is the hash of its
+	// JSON, so the fields existing containers were labelled with keep their place.
+	Limits
 
 	// Secrets narrows which of the release's secrets this service receives.
 	// Empty means all of them.
 	Secrets []string `json:"secrets,omitempty"`
+}
+
+// Limits are the resource caps and hardening a container is created with, each
+// handed to docker as written. The manifest and the wire share this one struct,
+// so a new limit is declared once; all are omitted when unset, so adding one
+// never moves the hash of a service that does not use it.
+type Limits struct {
+	// MemorySwap is memory plus swap; left unset, docker allows twice Memory.
+	Memory     string `toml:"memory" json:"memory,omitempty"`
+	MemorySwap string `toml:"memory_swap" json:"memory_swap,omitempty"`
+
+	CPUs      float64 `toml:"cpus" json:"cpus,omitempty"`
+	PidsLimit int     `toml:"pids_limit" json:"pids_limit,omitempty"`
+
+	ReadOnly        bool     `toml:"read_only" json:"read_only,omitempty"`
+	Tmpfs           []string `toml:"tmpfs" json:"tmpfs,omitempty"`
+	CapDrop         []string `toml:"cap_drop" json:"cap_drop,omitempty"`
+	CapAdd          []string `toml:"cap_add" json:"cap_add,omitempty"`
+	NoNewPrivileges bool     `toml:"no_new_privileges" json:"no_new_privileges,omitempty"`
+
+	// Docker's default json-file driver never rotates, so a chatty service
+	// fills the disk unless LogOpts caps it.
+	LogDriver string            `toml:"log_driver" json:"log_driver,omitempty"`
+	LogOpts   map[string]string `toml:"log_opts" json:"log_opts,omitempty"`
 }
 
 // Proxy carries what the helper needs to emit discovery labels for an external
@@ -349,6 +378,11 @@ type Entry struct {
 	// Provenance is lifted out of the spec so `status` and the JSON contract can
 	// read it without unpacking a whole release.
 	Provenance Provenance `json:"provenance,omitzero"`
+
+	// Irreversible names the stage that reported a change a rollback cannot
+	// undo, such as a destructive migration. Leaving this release then puts
+	// older code on newer data, so it is never done automatically.
+	Irreversible string `json:"irreversible,omitempty"`
 }
 
 // HashSecret is the one-way form a secret value takes once it is written to the

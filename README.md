@@ -100,8 +100,10 @@ All optional, and each a block in the same file:
   in atomically.
 - **Secrets** — from a dotenv file, your environment or sops; delivered as
   environment variables or as files.
-- **Memory limits** — per service, set when the container is created, so a
-  runaway process cannot take the server down with it.
+- **Limits** — memory, CPU, processes, log rotation and privileges per
+  service, set when the container is created.
+- **Minimal restarts** — a deploy replaces only the services it changes; a
+  rebuild that only restamps labels deploys nothing.
 - **Zero-downtime** — blue/green through Traefik or caddy-docker-proxy labels.
 - **Rollback** — to any retained release in seconds, optionally automatic.
 - **Targets and bundles** — staging and production from one manifest; build

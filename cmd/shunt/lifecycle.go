@@ -45,6 +45,9 @@ func cmdRollback(ctx context.Context, args []string) error {
 
 	s := c.err()
 	fmt.Fprintf(os.Stderr, "\n  roll back %s → %s\n", st.Ledger.Current, s.Bold(want))
+	for _, caution := range engine.RollbackCautions(st.Ledger.Find(st.Ledger.Current), st.Ledger.Find(want)) {
+		fmt.Fprintf(os.Stderr, "  %s\n", s.Amber(caution))
+	}
 	ok, err := confirmed(yes, "  proceed?")
 	if err != nil || !ok {
 		return err
