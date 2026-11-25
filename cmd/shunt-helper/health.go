@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -22,10 +23,19 @@ import (
 // merely redundant — a `grace` is a sleep, so a required service with a 30s
 // grace made the deploy wait a full minute for one container.
 func healthCheck(spec *release.Spec) error {
+	// Only what this release started. A container it left running was gated by
+	// the release that did start it, and has nothing new to prove.
+	out, _ := docker.Run("docker", "ps", "-a",
+		"--filter", "label=shunt.project="+spec.Project,
+		"--filter", "label=shunt.release="+spec.ID,
+		"--format", `{{.Label "shunt.service"}}`)
+	fresh := splitLines(out)
+
 	gated := dependedOn(spec)
 	var pending []string
 	for _, name := range spec.Order {
-		if svc, present := spec.Services[name]; present && !svc.Proxied() && !gated[name] {
+		svc, present := spec.Services[name]
+		if present && !svc.Proxied() && !gated[name] && slices.Contains(fresh, name) {
 			pending = append(pending, name)
 		}
 	}
@@ -33,11 +43,17 @@ func healthCheck(spec *release.Spec) error {
 }
 
 // waitHealthy probes the named containers in order and fails the deploy on the
-// first one that never comes up.
+// first one that never comes up. The ones with no health check are held to the
+// weaker gate afterwards: see waitStable.
 func waitHealthy(spec *release.Spec, order []string, set map[string]release.Service) error {
+	var unprobed []string
 	for _, name := range order {
 		svc, present := set[name]
-		if !present || svc.Health == nil {
+		if !present {
+			continue
+		}
+		if svc.Health == nil {
+			unprobed = append(unprobed, name)
 			continue
 		}
 		h := svc.Health
@@ -82,6 +98,42 @@ func waitHealthy(spec *release.Spec, order []string, set map[string]release.Serv
 				container, retries, last, tailLogs(container, 20))
 		}
 		ok("health:"+name, name+" healthy")
+	}
+	return waitStable(spec, unprobed, set)
+}
+
+// settle is how long a container with no health check has to stay up.
+var settle = 5 * time.Second
+
+// lastStart is when the helper last started a container, so time spent since
+// then, probing other services, counts toward the settle.
+var lastStart time.Time
+
+// waitStable holds freshly started containers that have no health check to the
+// one thing that can be asked of them: staying up. Without it a worker that
+// dies on startup is restarted by docker forever under a release reported
+// active. One shared wait, however many there are.
+func waitStable(spec *release.Spec, names []string, set map[string]release.Service) error {
+	if len(names) == 0 {
+		return nil
+	}
+	time.Sleep(settle - time.Since(lastStart))
+	for _, name := range names {
+		container := serviceContainer(spec, name, set[name])
+		out, err := docker.Run("docker", "inspect", "-f",
+			"{{.State.Status}} {{.RestartCount}} {{.State.ExitCode}}", container)
+		if err != nil {
+			return fmt.Errorf("%s is gone: %s", container, strings.TrimSpace(out))
+		}
+		var status string
+		var restarts, code int
+		fmt.Sscan(out, &status, &restarts, &code)
+		// Exiting 0 and staying exited is a one-shot doing its job; docker
+		// restarting it, or a non-zero exit, is not.
+		if restarts > 0 || status == "restarting" || code != 0 {
+			return fmt.Errorf("%s is not staying up (%s, exit code %d, restarted %d times):\n%s",
+				container, status, code, restarts, tailLogs(container, 20))
+		}
 	}
 	return nil
 }

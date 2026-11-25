@@ -20,6 +20,9 @@ type fakeReply struct {
 	err error
 }
 
+// No test should spend real time waiting for a container to settle.
+func init() { settle = 0 }
+
 func newFake() *fakeRunner { return &fakeRunner{replies: map[string]fakeReply{}} }
 
 // on scripts a reply for any command whose line contains match.

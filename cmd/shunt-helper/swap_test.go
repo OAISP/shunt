@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/OAISP/shunt/internal/release"
 )
@@ -37,7 +38,7 @@ func TestSwapServicesReportsMutationOnceTheOldContainerIsStopped(t *testing.T) {
 	withFake(t, f)
 
 	spec := svcSpec(map[string]release.Service{"app": {Image: "app", Restart: "always"}}, "app")
-	started, mutated, err := swapServices(spec, nil, "")
+	started, mutated, err := swapServices(spec, nil, "", "", false)
 
 	if err == nil {
 		t.Fatal("swapServices succeeded despite docker start failing")
@@ -59,7 +60,7 @@ func TestSwapServicesLeavesTheOldContainerWhenTheReplacementCannotBeCreated(t *t
 	withFake(t, f)
 
 	spec := svcSpec(map[string]release.Service{"app": {Image: "app", Restart: "always"}}, "app")
-	_, mutated, err := swapServices(spec, nil, "")
+	_, mutated, err := swapServices(spec, nil, "", "", false)
 
 	if err == nil || !strings.Contains(err.Error(), "invalid mount config") {
 		t.Fatalf("err = %v, want docker's own reason", err)
@@ -93,7 +94,7 @@ func TestSwapServicesReportsNoMutationWhenABlueGreenReleaseIsRejected(t *testing
 	// The health command runs through docker exec and must fail.
 	f.on("docker exec", "", errors.New("exit status 1"))
 
-	started, mutated, err := swapServices(spec, nil, "")
+	started, mutated, err := swapServices(spec, nil, "", "", false)
 	if err == nil {
 		t.Fatal("an unhealthy blue/green release was accepted")
 	}
@@ -121,7 +122,7 @@ func TestSwapServicesStopsAtTheFirstFailureAndReportsWhatTookOver(t *testing.T) 
 		"worker": {Image: "app", Restart: "always"},
 	}, "app", "worker")
 
-	started, mutated, err := swapServices(spec, nil, "")
+	started, mutated, err := swapServices(spec, nil, "", "", false)
 	if err == nil {
 		t.Fatal("swapServices succeeded despite the second service failing")
 	}
@@ -246,7 +247,7 @@ func TestSwapServicesWaitsForADependencyToBecomeHealthy(t *testing.T) {
 		"web": {Image: "app", Restart: "always", Requires: []string{"db"}},
 	}, "db", "web")
 
-	started, _, err := swapServices(spec, nil, "")
+	started, _, err := swapServices(spec, nil, "", "", false)
 	if err == nil {
 		t.Fatal("swapServices started a dependent service despite its dependency being unhealthy")
 	}
@@ -274,7 +275,7 @@ func TestSwapServicesDoesNotGateAServiceNothingRequires(t *testing.T) {
 		"worker": {Image: "app", Restart: "always"},
 	}, "web", "worker")
 
-	started, _, err := swapServices(spec, nil, "")
+	started, _, err := swapServices(spec, nil, "", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -292,7 +293,7 @@ func TestSwapServicesDoesNotGateAServiceNothingRequires(t *testing.T) {
 // required service with a 30s grace cost the deploy a full extra minute waiting
 // on a container it had already proven healthy.
 func TestHealthCheckSkipsWhatTheSwapAlreadyGated(t *testing.T) {
-	f := newFake()
+	f := newFake().on("label=shunt.release="+testRelease, "db\nweb\n", nil)
 	withFake(t, f)
 
 	probe := &release.Health{Command: []string{"pg_isready"}, Retries: 1, Interval: "1ms"}
@@ -301,7 +302,7 @@ func TestHealthCheckSkipsWhatTheSwapAlreadyGated(t *testing.T) {
 		"web": {Image: "app", Restart: "always", Requires: []string{"db"}, Health: probe},
 	}, "db", "web")
 
-	if _, _, err := swapServices(spec, nil, ""); err != nil {
+	if _, _, err := swapServices(spec, nil, "", "", false); err != nil {
 		t.Fatal(err)
 	}
 	during := len(f.calls)
@@ -373,7 +374,7 @@ func TestAutoRollbackRestoresTheReleaseThatWasServing(t *testing.T) {
 	}
 
 	failing := &release.Spec{ID: "r3", Project: "demo", Network: "demo-net"}
-	if err := autoRollback(failing, ledger); err != nil {
+	if err := autoRollback(failing, ledger, false); err != nil {
 		t.Fatal(err)
 	}
 	if ledger.Current != "r2" {
@@ -401,7 +402,7 @@ func TestAutoRollbackFallsBackWhenCurrentIsNotHealthy(t *testing.T) {
 				Images: map[string]release.ImageRef{"app": {Ref: "shunt/demo-app:r2"}}},
 		},
 	}
-	if err := autoRollback(&release.Spec{ID: "r3", Project: "demo"}, ledger); err != nil {
+	if err := autoRollback(&release.Spec{ID: "r3", Project: "demo"}, ledger, false); err != nil {
 		t.Fatal(err)
 	}
 	if ledger.Current != "r1" {
@@ -548,39 +549,183 @@ func TestRollbackIgnoresUnlabelledContainers(t *testing.T) {
 }
 
 // Passed to create rather than applied afterwards, so the container never runs
-// without its limit.
-func TestMemoryLimitsAreSetAtCreate(t *testing.T) {
+// without its limits.
+func TestLimitsAreSetAtCreate(t *testing.T) {
 	f := newFake()
 	withFake(t, f)
 
 	spec := svcSpec(map[string]release.Service{
-		"app": {Image: "app", Restart: "always", Memory: "1g", MemorySwap: "1536m"},
+		"app": {Image: "app", Restart: "always", Limits: release.Limits{
+			Memory: "1g", MemorySwap: "1536m", CPUs: 1.5, PidsLimit: 200,
+			ReadOnly: true, Tmpfs: []string{"/tmp"}, CapDrop: []string{"ALL"}, CapAdd: []string{"NET_BIND_SERVICE"},
+			NoNewPrivileges: true, LogDriver: "local", LogOpts: map[string]string{"max-size": "10m", "max-file": "3"},
+		}},
 	}, "app")
-	if _, _, err := swapServices(spec, nil, ""); err != nil {
+	if _, _, err := swapServices(spec, nil, "", "", false); err != nil {
 		t.Fatal(err)
 	}
-	if !f.did("docker create", "--memory 1g", "--memory-swap 1536m") {
+	if !f.did("docker create", "--memory 1g --memory-swap 1536m --cpus 1.5 --pids-limit 200 --read-only --tmpfs /tmp "+
+		"--cap-drop ALL --cap-add NET_BIND_SERVICE --security-opt no-new-privileges "+
+		"--log-driver local --log-opt max-file=3 --log-opt max-size=10m") {
 		t.Errorf("create did not carry the limits:\n%s", strings.Join(f.calls, "\n"))
 	}
 }
 
-// A rollback returns to a release whose container a failed deploy may never
-// have replaced. Stopping it to start the same thing again is a gap for nothing
-// — and for a proxied service, the outage blue/green exists to avoid.
-func TestSwapServicesLeavesAContainerAlreadyOnTheRelease(t *testing.T) {
+// Stopping a container to start the same thing again is a gap for nothing, and
+// for a proxied service the outage blue/green exists to avoid. It is found by
+// label, because a proxied container carries the id of the release that
+// started it, not this one's.
+func TestSwapServicesLeavesAnUnchangedContainerRunning(t *testing.T) {
 	svc := release.Service{
 		Image: "app", Restart: "always", Expose: 3000,
 		Proxy: &release.Proxy{Kind: "traefik", Host: "x.example.com", Port: 3000},
 	}
-	f := newFake().on("{{.State.Running}}", "true "+testRelease+" "+release.HashService(svc)+"\n", nil)
+	spec := svcSpec(map[string]release.Service{"app": svc}, "app")
+	f := newFake().
+		on("label=shunt.config="+release.HashService(svc)+" --filter label=shunt.inputs=", "demo-app-older\n", nil).
+		on("ps -a --filter label=shunt.project=demo --filter label=shunt.service=app", "demo-app-older\tr0\ndemo-app-stray\tr1\n", nil).
+		on("ps -aq --filter name=", "cid\n", nil)
 	withFake(t, f)
 
-	started, mutated, err := swapServices(svcSpec(map[string]release.Service{"app": svc}, "app"), nil, "")
+	started, mutated, err := swapServices(spec, nil, "", "", false)
 	if err != nil || mutated || len(started) != 1 {
 		t.Fatalf("started = %v, mutated = %v, err = %v; want the service counted and nothing changed", started, mutated, err)
 	}
-	if f.did("docker create") || f.did("docker stop") {
-		t.Errorf("a container already on the release was replaced:\n%s", strings.Join(f.calls, "\n"))
+	if f.did("docker create") || f.did("docker stop", "demo-app-older") {
+		t.Errorf("an unchanged container was replaced:\n%s", strings.Join(f.calls, "\n"))
+	}
+	if !f.did("docker stop", "demo-app-stray") {
+		t.Error("what a newer release left beside the kept container was not retired")
+	}
+
+	// Data swapped in under it is the one change its labels cannot show.
+	if _, _, err := swapServices(spec, nil, "", "", true); err != nil {
+		t.Fatal(err)
+	}
+	if !f.did("docker create", "--name demo-app-"+testRelease) {
+		t.Error("a container was left running over an artifact that had been replaced")
+	}
+}
+
+// The label that decides whether a container is left alone has to move with
+// everything the container is created from and with nothing else.
+func TestInputsDigestFollowsWhatAContainerIsCreatedFrom(t *testing.T) {
+	withFake(t, newFake())
+	base := func() *release.Spec {
+		s := svcSpec(nil)
+		s.Images["app"] = release.ImageRef{Ref: "shunt/demo-app:r1", Digest: "sha256:a", Fingerprint: "f1"}
+		s.Secrets = map[string]string{"DB": "one", "STRIPE": "two"}
+		return s
+	}
+	scoped := release.Service{Image: "app", Secrets: []string{"DB"}}
+	digest := func(s *release.Spec) string {
+		t.Helper()
+		d, err := inputsDigest(s, scoped, "salt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	want := digest(base())
+
+	same := map[string]func(*release.Spec){
+		"a relabelled image": func(s *release.Spec) {
+			s.Images["app"] = release.ImageRef{Ref: "shunt/demo-app:r2", Digest: "sha256:b", Fingerprint: "f1"}
+		},
+		"a secret it is not sent": func(s *release.Spec) { s.Secrets["STRIPE"] = "rotated" },
+		"a new release id":        func(s *release.Spec) { s.ID = "r2" },
+	}
+	for name, change := range same {
+		s := base()
+		change(s)
+		if digest(s) != want {
+			t.Errorf("%s changed the digest", name)
+		}
+	}
+	differs := map[string]func(*release.Spec){
+		"a rebuilt image":     func(s *release.Spec) { s.Images["app"] = release.ImageRef{Ref: "shunt/demo-app:r2", Fingerprint: "f2"} },
+		"a secret it is sent": func(s *release.Spec) { s.Secrets["DB"] = "rotated" },
+		"the network":         func(s *release.Spec) { s.Network = "other" },
+		"secret delivery":     func(s *release.Spec) { s.SecretMode = "file" },
+	}
+	for name, change := range differs {
+		s := base()
+		change(s)
+		if digest(s) == want {
+			t.Errorf("%s did not change the digest", name)
+		}
+	}
+}
+
+// A stop that fails is followed by a kill, and a deploy that never drains must
+// not look like one that does.
+func TestStopAndRemoveReportsAStopThatFailed(t *testing.T) {
+	events := captureEvents(t)
+	withFake(t, newFake().
+		on("ps -aq --filter name=", "cid\n", nil).
+		on("docker stop -t 10 demo-app", "unknown flag: --timeout\n", errors.New("exit status 125")).
+		on("docker stop -t 10 demo-gone", "Error response from daemon: No such container: demo-gone\n", errors.New("exit status 1")))
+
+	stopAndRemove("demo-app", 10)
+	if !strings.Contains(events.String(), "killed without draining: unknown flag: --timeout") {
+		t.Errorf("a failed stop went unreported: %s", events)
+	}
+	events.Reset()
+	stopAndRemove("demo-gone", 10)
+	if events.Len() != 0 {
+		t.Errorf("a container that vanished by itself was reported: %s", events)
+	}
+}
+
+// Only a container docker had to kill is reported as killed: one that exits by
+// itself right at the deadline took just as long.
+func TestStopAndRemoveReportsAKillOnlyWhenDockerKilled(t *testing.T) {
+	for code, wantReport := range map[string]bool{"137": true, "0": false} {
+		events := captureEvents(t)
+		prev := docker
+		docker = runnerFunc(func(_ string, args ...string) (string, error) {
+			switch args[0] {
+			case "ps":
+				return "cid\n", nil
+			case "stop":
+				time.Sleep(time.Second)
+			case "inspect":
+				return code + "\n", nil
+			}
+			return "", nil
+		})
+		stopAndRemove("demo-app", 1)
+		docker = prev
+		if got := strings.Contains(events.String(), "was killed"); got != wantReport {
+			t.Errorf("exit code %s: reported killed = %v, want %v (%s)", code, got, wantReport, events)
+		}
+		if strings.Contains(events.String(), "ignored SIGTERM") {
+			t.Errorf("the report claims to know why it was still running: %s", events)
+		}
+	}
+}
+
+// A service with no health check can still be held to staying up: without
+// that, a worker that dies on startup restarts forever under an active release.
+func TestWaitHealthyFailsAContainerThatKeepsRestarting(t *testing.T) {
+	spec := svcSpec(map[string]release.Service{"worker": {Image: "app", Restart: "always"}}, "worker")
+	for state, healthy := range map[string]bool{
+		"running 0 0":    true,
+		"exited 0 0":     true, // a one-shot that finished
+		"restarting 3 1": false,
+		"running 2 0":    false, // caught between two crashes
+		"exited 0 1":     false,
+	} {
+		withFake(t, newFake().
+			on("{{.State.Status}} {{.RestartCount}} {{.State.ExitCode}}", state+"\n", nil).
+			on("docker logs", "panic: no DATABASE_URL\n", nil))
+		err := waitHealthy(spec, []string{"worker"}, spec.Services)
+		if (err == nil) != healthy {
+			t.Errorf("%q: err = %v, want healthy = %v", state, err, healthy)
+		}
+		if err != nil && !strings.Contains(err.Error(), "panic: no DATABASE_URL") {
+			t.Errorf("%q: the error should carry the container's logs, got %v", state, err)
+		}
 	}
 }
 

@@ -184,3 +184,18 @@ func TestParseArgsSeparatesUsageFromFailure(t *testing.T) {
 		t.Errorf("-h returned %v, want errHelp", err)
 	}
 }
+
+// A server older than anything CI deploys to is worth a warning before the
+// first deploy, not a surprise during it.
+func TestDockerCheckWarnsBelowTheTestedMinimum(t *testing.T) {
+	for version, want := range map[string]string{
+		"19.03.15": statusWarn,
+		"20.10.24": statusOK,
+		"29.7.2":   statusOK,
+		"":         statusOK, // unreadable is reported elsewhere
+	} {
+		if got := dockerCheck(version, "amd64").Status; got != want {
+			t.Errorf("docker %q: status = %s, want %s", version, got, want)
+		}
+	}
+}

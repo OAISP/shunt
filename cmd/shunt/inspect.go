@@ -76,6 +76,9 @@ func printCurrent(l *release.Ledger, s ui.Style) {
 	if cur.Error != "" {
 		fmt.Printf("  %s\n", s.Red(ui.FirstLine(cur.Error)))
 	}
+	if cur.Irreversible != "" {
+		fmt.Printf("  %s\n", s.Amber(fmt.Sprintf("stage %q reported an irreversible change — a rollback restores the code, not the data", cur.Irreversible)))
+	}
 	if cur.Status == release.StatusDegraded {
 		fmt.Printf("  %s\n", s.Amber("this host is running a mix of releases — `shunt rollback` restores the previous one"))
 	}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 
 	"github.com/OAISP/shunt/internal/build"
@@ -142,6 +143,19 @@ func rsyncZstdCheck() []check {
 		"install rsync 3.2+ for cheaper compression (macOS ships 2.6.9)"}}
 }
 
+// minDocker is the oldest Docker major CI runs the e2e suite against, as 20.10.
+// Older ones may well work; nothing checks that they do.
+const minDocker = 20
+
+func dockerCheck(version, arch string) check {
+	major, _, _ := strings.Cut(version, ".")
+	if n, err := strconv.Atoi(major); err == nil && n < minDocker {
+		return check{"host docker", statusWarn, version + " on " + arch,
+			fmt.Sprintf("shunt is tested against Docker %d.10 and newer; upgrade the server's Docker", minDocker)}
+	}
+	return check{"host docker", statusOK, version + " on " + arch, ""}
+}
+
 // hostChecks cover the deploy target. They reuse the probe the deploy itself
 // runs, so audit cannot drift from what a deploy actually requires.
 func hostChecks(ctx context.Context, m *manifest.Manifest) []check {
@@ -155,7 +169,7 @@ func hostChecks(ctx context.Context, m *manifest.Manifest) []check {
 	f := e.Facts()
 	out := []check{
 		{"host ssh", statusOK, "connected to " + m.Host, ""},
-		{"host docker", statusOK, f.DockerVersion + " on " + f.Arch, ""},
+		dockerCheck(f.DockerVersion, f.Arch),
 		{"host rsync", statusOK, versionOr(f.RsyncVersion), ""},
 	}
 	// Connect fails outright when rsync is missing, so reaching here means it is

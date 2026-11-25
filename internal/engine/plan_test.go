@@ -1,8 +1,10 @@
 package engine
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -612,9 +614,13 @@ func TestEstimateTransferCountsWhatTheStoreLacks(t *testing.T) {
 
 func TestMemoryChangeIsAServiceChange(t *testing.T) {
 	plain := release.Service{Image: "app"}
-	limited := release.Service{Image: "app", Memory: "1g", MemorySwap: "1536m"}
-	if r := diffService(plain, limited); len(r) != 2 {
+	limited := release.Service{Image: "app", Limits: release.Limits{Memory: "1g", MemorySwap: "1536m"}}
+	if r := diffService(plain, limited); !slices.Equal(r, []string{"memory unset → 1g", "memory_swap unset → 1536m"}) {
 		t.Errorf("reasons = %v, want both limits reported", r)
+	}
+	logged := release.Service{Image: "app", Limits: release.Limits{LogOpts: map[string]string{"max-size": "10m"}, PidsLimit: 100}}
+	if r := diffService(plain, logged); !slices.Equal(r, []string{"pids_limit unset → 100", "log_opts unset → map[max-size:10m]"}) {
+		t.Errorf("reasons = %v, want every limit reported under its manifest key", r)
 	}
 	if release.HashService(plain) == release.HashService(limited) {
 		t.Error("a limit did not change the hash, so plan would not see it")
@@ -633,5 +639,105 @@ func TestInitChangeIsAServiceChange(t *testing.T) {
 	// Absent from an older spec's hash, so existing containers are not drifted.
 	if release.HashService(release.Service{Image: "app"}) != release.HashService(release.Service{Image: "app", Init: false}) {
 		t.Error("init = false changed the hash of an existing service")
+	}
+}
+
+// What `up` does to a service has to be what `plan` said: a container is left
+// running unless its definition, its image, a secret it is handed or the data
+// under it changed.
+func TestPlanSaysWhichServicesADeployReplaces(t *testing.T) {
+	web := release.Service{Image: "app", Secrets: []string{"DATABASE_URL"}}
+	side := release.Service{Image: "app", Secrets: []string{"QUEUE_URL"}}
+	images := func(digest string) map[string]release.ImageRef {
+		return map[string]release.ImageRef{"app": {Ref: "r", Digest: digest, Fingerprint: "f1"}}
+	}
+	old := &release.Spec{
+		Images:   images("sha256:one"),
+		Services: map[string]release.Service{"web": web, "side": side},
+		Secrets: map[string]string{
+			"DATABASE_URL": release.HashSecret(testSalt, "db"),
+			"QUEUE_URL":    release.HashSecret(testSalt, "queue"),
+		},
+	}
+	state := func(inputs string) *RemoteState {
+		return &RemoteState{
+			Ledger: &release.Ledger{Current: "r1", Salt: testSalt, Releases: []release.Entry{
+				{ID: "r1", Status: release.StatusActive, Spec: old, Images: old.Images}}},
+			Containers: []Container{
+				{Name: "demo-web", Service: "web", Kind: "service", State: "running", Config: release.HashService(web), Inputs: inputs},
+				{Name: "demo-side", Service: "side", Kind: "service", State: "running", Config: release.HashService(side), Inputs: inputs},
+			},
+			Paths: map[string]release.PathState{"/srv/data.db": {Size: 10, MTime: 5}},
+		}
+	}
+	// A relabelled image: a new digest over the same fingerprint.
+	next := func() *release.Spec {
+		return &release.Spec{
+			ID: "r2", Images: images("sha256:two"), Services: old.Services,
+			Secrets:   map[string]string{"DATABASE_URL": "db", "QUEUE_URL": "queue"},
+			Artifacts: []release.Artifact{{Name: "data", Dest: "/srv/data.db", Bytes: 10, MTime: 5}},
+		}
+	}
+	actions := func(spec *release.Spec, st *RemoteState) map[string]string {
+		t.Helper()
+		p, err := (&Engine{}).BuildPlan(t.Context(), spec, nil, st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]string{"changed": fmt.Sprint(p.HasChanges)}
+		for _, s := range p.Services {
+			out[s.Name] = s.Action
+		}
+		return out
+	}
+	check := func(name string, got map[string]string, web, side, changed string) {
+		t.Helper()
+		if got["web"] != web || got["side"] != side || got["changed"] != changed {
+			t.Errorf("%s: web=%s side=%s changed=%s, want %s %s %s", name, got["web"], got["side"], got["changed"], web, side, changed)
+		}
+	}
+
+	check("a relabelled image", actions(next(), state("i")), "unchanged", "unchanged", "false")
+
+	rotated := next()
+	rotated.Secrets["DATABASE_URL"] = "rotated"
+	check("a secret only web is sent", actions(rotated, state("i")), "update", "unchanged", "true")
+
+	data := next()
+	data.Artifacts[0].MTime = 6
+	check("an artifact", actions(data, state("i")), "update", "update", "true")
+
+	// Started before inputs were recorded: replaced once, but only by a deploy
+	// that was happening anyway.
+	check("an older container, nothing to do", actions(next(), state("")), "unchanged", "unchanged", "false")
+	check("an older container, riding a deploy", actions(rotated, state("")), "update", "update", "true")
+
+	// A bundle planned where its secrets cannot be resolved has none to compare,
+	// which must not read as every one of them having been removed.
+	blind := next()
+	blind.Secrets = nil
+	p, err := (&Engine{SecretsUnknown: true}).BuildPlan(t.Context(), blind, nil, state("i"))
+	if err != nil || p.HasChanges || !p.SecretsUnknown {
+		t.Errorf("unresolved secrets: changes = %v, unknown = %v, err = %v; want a clean plan that says so", p.HasChanges, p.SecretsUnknown, err)
+	}
+}
+
+// Rollback is the safe choice until the release it leaves rotated a secret or
+// migrated a database, and neither shows unless it is said before the prompt.
+func TestRollbackCautions(t *testing.T) {
+	target := &release.Entry{ID: "r1", Spec: &release.Spec{Secrets: map[string]string{"DB": "h:old", "KEEP": "h:same"}}}
+	cur := &release.Entry{ID: "r2", Spec: &release.Spec{Secrets: map[string]string{"DB": "h:new", "KEEP": "h:same", "ADDED": "h:x"}}}
+
+	got := RollbackCautions(cur, target)
+	if len(got) != 1 || !strings.Contains(got[0], "DB") || strings.Contains(got[0], "KEEP") || strings.Contains(got[0], "h:") {
+		t.Errorf("cautions = %q, want one naming DB alone and no value", got)
+	}
+	cur.Irreversible = "migrate"
+	if got := RollbackCautions(cur, target); len(got) != 2 || !strings.Contains(got[1], "migrate") {
+		t.Errorf("cautions = %q, want the irreversible stage named too", got)
+	}
+	cur.Irreversible, cur.Spec.Secrets["DB"] = "", "h:old"
+	if got := RollbackCautions(cur, target); got != nil {
+		t.Errorf("cautions = %q for a rollback with nothing to warn about", got)
 	}
 }

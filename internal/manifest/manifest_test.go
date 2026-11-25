@@ -726,8 +726,16 @@ func TestLayoutNeedNotExistToValidate(t *testing.T) {
 
 // Docker rejects these only on the host, at create; validate is where a typo
 // should stop.
-func TestMemoryLimitsAreValidated(t *testing.T) {
+func TestLimitsAreValidated(t *testing.T) {
 	for _, tc := range []struct{ keys, want string }{
+		{`cpus = 1.5` + "\n" + `pids_limit = 200` + "\n" + `read_only = true` + "\n" + `tmpfs = ["/tmp", "/run:size=16m"]`, ""},
+		{`cap_drop = ["ALL"]` + "\n" + `cap_add = ["NET_BIND_SERVICE"]` + "\n" + `no_new_privileges = true`, ""},
+		{`log_driver = "local"` + "\n" + `log_opts = { max-size = "10m", max-file = "3" }`, ""},
+		{`cpus = 0.001`, "at least 0.01"},
+		{`pids_limit = -5`, "-1 for unlimited"},
+		{`tmpfs = ["tmp"]`, "absolute path"},
+		{`cap_drop = ["NET ADMIN"]`, "not a capability name"},
+		{`log_opts = { "max-size=10m" = "" }`, "not an option name"},
 		{`memory = "1g"`, ""},
 		{`memory = "512M"` + "\n" + `memory_swap = "1536m"`, ""},
 		{`memory = "1g"` + "\n" + `memory_swap = "-1"`, ""},

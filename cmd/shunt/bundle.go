@@ -272,14 +272,10 @@ func cmdApply(ctx context.Context, args []string) error {
 	spec.StorePath = e.StorePath()
 
 	if planOnly {
+		e.SecretsUnknown = !secretsKnown
 		p, err := e.BuildPlan(ctx, spec, built, state)
 		if err != nil {
 			return err
-		}
-		// An unresolved set would diff as every key removed, and count as work.
-		if !secretsKnown {
-			p.SecretsUnknown, p.Secrets = true, engine.SecretChange{}
-			p.HasChanges = p.Changed()
 		}
 		if c.asJSON {
 			if err := json.NewEncoder(os.Stdout).Encode(p); err != nil {

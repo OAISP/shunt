@@ -202,7 +202,10 @@ func (e *Engine) BuildPlan(ctx context.Context, spec *release.Spec, built map[st
 		if p.Current != nil {
 			if old, ok := p.Current.Images[name]; ok {
 				ic.OldDgst = old.Digest
-				if old.Digest == img.Digest {
+				// Same layers and runtime settings under a new digest is a
+				// relabelled build, which runs exactly as the old one does.
+				same := old.Fingerprint != "" && old.Fingerprint == img.Fingerprint
+				if same || old.Digest == img.Digest {
 					ic.Action = "unchanged"
 				} else {
 					ic.Action = "update"
@@ -215,6 +218,36 @@ func (e *Engine) BuildPlan(ctx context.Context, spec *release.Spec, built map[st
 	var oldSpec *release.Spec
 	if p.Current != nil {
 		oldSpec = p.Current.Spec
+	}
+
+	// Size and mtime are exactly the heuristic rsync itself uses to decide
+	// whether a file needs transferring. Hashing would be exact but means
+	// reading the whole file on both sides — most of the cost of shipping it.
+	for _, a := range spec.Artifacts {
+		host, ok := state.pathState(a.Dest)
+		if !ok {
+			host = release.PathState{Size: -1}
+		}
+		p.Artifacts = append(p.Artifacts, ArtifactChange{
+			Name:       a.Name,
+			Dest:       a.Dest,
+			LocalBytes: a.Bytes,
+			LocalMTime: a.MTime,
+			HostBytes:  host.Size,
+			HostMTime:  host.MTime,
+		})
+	}
+
+	p.Release = diffRelease(oldSpec, spec)
+
+	var salt string
+	if state != nil && state.Ledger != nil {
+		salt = state.Ledger.Salt
+	}
+	// An unresolved set would diff as every key removed, and replace every
+	// service that receives one.
+	if p.SecretsUnknown = e.SecretsUnknown; !p.SecretsUnknown {
+		p.Secrets = diffSecrets(oldSpec, spec, salt)
 	}
 
 	for _, name := range slices.Sorted(maps.Keys(spec.Services)) {
@@ -232,6 +265,7 @@ func (e *Engine) BuildPlan(ctx context.Context, spec *release.Spec, built map[st
 				if imgChanged(p.Images, svc.Image) {
 					sc.Reasons = append(sc.Reasons, "image "+svc.Image+" rebuilt")
 				}
+				sc.Reasons = append(sc.Reasons, inheritedReasons(p, svc)...)
 				if len(sc.Reasons) == 0 {
 					sc.Action = "unchanged"
 				} else {
@@ -281,33 +315,20 @@ func (e *Engine) BuildPlan(ctx context.Context, spec *release.Spec, built map[st
 
 	p.Accessories = e.planAccessories(p, spec, state, oldSpec)
 
-	// Size and mtime are exactly the heuristic rsync itself uses to decide
-	// whether a file needs transferring. Hashing would be exact but means
-	// reading the whole file on both sides — most of the cost of shipping it.
-	for _, a := range spec.Artifacts {
-		host, ok := state.pathState(a.Dest)
-		if !ok {
-			host = release.PathState{Size: -1}
-		}
-		p.Artifacts = append(p.Artifacts, ArtifactChange{
-			Name:       a.Name,
-			Dest:       a.Dest,
-			LocalBytes: a.Bytes,
-			LocalMTime: a.MTime,
-			HostBytes:  host.Size,
-			HostMTime:  host.MTime,
-		})
-	}
-
 	p.Stages = diffStages(oldSpec, spec)
 
-	p.Release = diffRelease(oldSpec, spec)
-
-	var salt string
-	if state != nil && state.Ledger != nil {
-		salt = state.Ledger.Salt
+	// A container from before shunt recorded its inputs cannot be recognised as
+	// unchanged, so the next deploy replaces it. That is not work in itself, so
+	// it is only said when there is a deploy for it to ride on.
+	if p.Changed() && state != nil {
+		for i := range p.Services {
+			sc := &p.Services[i]
+			if found := state.ServiceContainers(sc.Name); sc.Action == "unchanged" && len(found) > 0 && found[0].Inputs == "" {
+				sc.Action = "update"
+				sc.Reasons = []string{"started by an older shunt — replaced this once, then left running while unchanged"}
+			}
+		}
 	}
-	p.Secrets = diffSecrets(oldSpec, spec, salt)
 
 	defer func() { p.HasChanges = p.Changed() }()
 

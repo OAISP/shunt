@@ -111,6 +111,9 @@ func apply(spec *release.Spec) error {
 	// separates a failure that left the host exactly as it was from one that
 	// left it running a mix of two releases.
 	mutated := false
+	// dataChanged records whether an artifact was swapped in, which is the one
+	// change no container's own inputs show.
+	dataChanged := false
 
 	// finish records the outcome no matter which step failed, so `shunt status`
 	// always reflects reality rather than the last success.
@@ -121,7 +124,10 @@ func apply(spec *release.Spec) error {
 		// stages already migrated a database — the code would go back and the
 		// schema would not.
 		if runErr != nil && mutated && spec.RollbackOnFailure {
-			if rbErr := autoRollback(spec, ledger); rbErr != nil {
+			if entry.Irreversible != "" {
+				runErr = fmt.Errorf("%w\n  not rolled back automatically: stage %q reported an irreversible change, "+
+					"and the previous release would run against it", runErr, entry.Irreversible)
+			} else if rbErr := autoRollback(spec, ledger, dataChanged); rbErr != nil {
 				runErr = fmt.Errorf("%w\n  automatic rollback also failed: %v", runErr, rbErr)
 			} else {
 				runErr = fmt.Errorf("%w\n  the previous release was restored automatically", runErr)
@@ -162,7 +168,8 @@ func apply(spec *release.Spec) error {
 	// Stages run BEFORE any running service container is touched. This is the
 	// safety invariant of the whole tool: a failed backup or migration must
 	// leave production exactly as it was.
-	if err := runStages(spec, envFile); err != nil {
+	entry.Irreversible, err = runStages(spec, envFile)
+	if err != nil {
 		return finish(fmt.Errorf("%w\n  no containers were replaced — production is untouched", err))
 	}
 
@@ -173,7 +180,8 @@ func apply(spec *release.Spec) error {
 		return finish(fmt.Errorf("%w\n  no services were replaced — production is untouched", err))
 	}
 
-	started, swapped, err := swapServices(spec, previousSpec(ledger), envFile)
+	dataChanged = len(promoted) > 0
+	started, swapped, err := swapServices(spec, previousSpec(ledger), envFile, ledger.Salt, dataChanged)
 	mutated = mutated || swapped
 	entry.Services = started
 	if err != nil {

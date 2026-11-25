@@ -16,25 +16,48 @@ import (
 	"github.com/OAISP/shunt/internal/ui"
 )
 
-func runStages(spec *release.Spec, envFile string) error {
+// stageOutput is where a stage finds the file it can report back through, the
+// way a CI step does with GITHUB_OUTPUT.
+const stageOutput = "/run/shunt/output"
+
+// runStages runs the pipeline in order and names the last stage that reported
+// an irreversible change, which is what tells a failed deploy not to put the
+// old code back on top of it.
+func runStages(spec *release.Spec, envFile string) (irreversible string, err error) {
 	for _, st := range spec.Stages {
 		step("stage:"+st.Name, "running stage "+st.Name)
-		if err := runStage(spec, st, envFile); err != nil {
-			return fmt.Errorf("stage %q failed: %w", st.Name, err)
+		report, err := os.CreateTemp(projectDir(spec.Project), "stage-output-")
+		if err != nil {
+			return irreversible, err
+		}
+		report.Close()
+		// Written by whatever user the image runs as, not by the deploy user.
+		os.Chmod(report.Name(), 0o666)
+		runErr := runStage(spec, st, envFile, report.Name())
+		said, _ := os.ReadFile(report.Name())
+		os.Remove(report.Name())
+		// Read even when the stage failed: a migration that died halfway has
+		// still changed the schema.
+		if slices.Contains(splitLines(string(said)), "irreversible=true") {
+			irreversible = st.Name
+			info("stage " + st.Name + " reported an irreversible change — this release will not be rolled back automatically")
+		}
+		if runErr != nil {
+			return irreversible, fmt.Errorf("stage %q failed: %w", st.Name, runErr)
 		}
 		ok("stage:"+st.Name, "stage "+st.Name+" complete")
 	}
-	return nil
+	return irreversible, nil
 }
 
-func runStage(spec *release.Spec, st release.Stage, envFile string) error {
+func runStage(spec *release.Spec, st release.Stage, envFile, report string) error {
 	ref, err := imageRef(spec, st.Image)
 	if err != nil {
 		return err
 	}
 	// Guarded the same way startContainer guards it: `--network ""` is not "no
 	// network" to docker, it is an error naming the empty string.
-	args := []string{"run", "--rm"}
+	args := []string{"run", "--rm", "-v", report + ":" + stageOutput, "-e", "SHUNT_STAGE_OUTPUT=" + stageOutput}
 	if spec.Network != "" {
 		args = append(args, "--network", spec.Network)
 	}

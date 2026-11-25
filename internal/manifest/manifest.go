@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+
+	"github.com/OAISP/shunt/internal/release"
 )
 
 type Manifest struct {
@@ -127,10 +129,8 @@ type Service struct {
 	// sits out the whole drain before it is killed; under an init it exits.
 	Init bool `toml:"init"`
 
-	// Memory and MemorySwap cap the container, in docker's own syntax.
-	// MemorySwap is memory plus swap; left unset, docker allows twice Memory.
-	Memory     string `toml:"memory"`
-	MemorySwap string `toml:"memory_swap"`
+	// Resource caps and hardening, in docker's own syntax.
+	release.Limits
 
 	// Proxy turns this service blue/green: each release runs under its own
 	// container name and an external proxy is told about it via labels.

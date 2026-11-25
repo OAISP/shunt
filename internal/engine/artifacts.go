@@ -97,6 +97,11 @@ func (e *Engine) LocalArtifactPath(name string) string {
 func (e *Engine) PushArtifacts(ctx context.Context, spec *release.Spec, present map[string]release.PathState, verbose bool) (map[string]*transport.Stats, error) {
 	stats := map[string]*transport.Stats{}
 	for _, a := range spec.Artifacts {
+		// The helper leaves a destination that already matches alone, so there
+		// is nothing to stage for it.
+		if st, ok := present[a.Dest]; ok && st.Size == a.Bytes && st.MTime == a.MTime {
+			continue
+		}
 		st, err := transport.PushFile(ctx, transport.FileOptions{
 			Client:     e.Client,
 			LocalPath:  e.LocalArtifactPath(a.Name),
