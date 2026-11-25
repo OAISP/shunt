@@ -16,7 +16,7 @@ curl -sSL https://raw.githubusercontent.com/OAISP/shunt/main/install.sh | sh
 ```
 
 It never runs sudo. It installs to `/usr/local/bin` when that is writable and to
-`~/.local/bin` otherwise. `SHUNT_VERSION=v0.4.0` pins a release,
+`~/.local/bin` otherwise. `SHUNT_VERSION=v0.5.0` pins a release,
 `PREFIX=<dir>` chooses the directory, and `SHUNT_SKIP_VERIFY=1` installs without
 the checksum on a machine that has no `sha256sum` or `shasum`. Read the script first if you would rather
 not pipe one into a shell — a reasonable instinct for a tool that will hold ssh
